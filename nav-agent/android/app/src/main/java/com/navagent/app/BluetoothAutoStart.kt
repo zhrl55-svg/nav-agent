@@ -8,6 +8,7 @@ import android.app.PendingIntent
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothProfile
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -222,6 +223,80 @@ object BluetoothAutoStart {
 
         nm.notify(NOTIF_ID, notif)
         Dbg.log("蓝牙自动启动：已通知「已连接 $deviceName」")
+    }
+
+    /**
+     * 列出手机里的蓝牙设备：**已配对的 + 当前已连接的**。
+     *
+     * 设置页用它让用户直接点设备名填关键词，省得手打 MAC。
+     *
+     * @return 设备信息列表（已连接的排前面）
+     */
+    @SuppressLint("MissingPermission")
+    fun listDevices(context: Context): List<DeviceInfo> {
+        val adapter = BluetoothAdapter.getDefaultAdapter() ?: return emptyList()
+        if (!hasPermission(context)) {
+            Dbg.log("蓝牙自动启动：缺权限，列不了设备")
+            return emptyList()
+        }
+        val result = ArrayList<DeviceInfo>()
+
+        // ① 当前已连接的（最重要 —— 车机一般就在这里）
+        val connected = runCatching {
+            adapter.bondedDevices.orEmpty()
+                .filter { isConnected(context, it) }
+                .map { dev ->
+                    DeviceInfo(
+                        name = safeName(dev),
+                        address = dev.address,
+                        connected = true
+                    )
+                }
+        }.getOrDefault(emptyList())
+        result.addAll(connected)
+
+        // ② 其余已配对但当前没连的
+        val bonded = runCatching {
+            adapter.bondedDevices.orEmpty()
+                .filterNot { isConnected(context, it) }
+                .map { dev ->
+                    DeviceInfo(
+                        name = safeName(dev),
+                        address = dev.address,
+                        connected = false
+                    )
+                }
+        }.getOrDefault(emptyList())
+        result.addAll(bonded)
+
+        Dbg.log("蓝牙设备列表：已连接 ${connected.size} 个，已配对未连 ${bonded.size} 个")
+        return result
+    }
+
+    /** 读设备名。没权限时返回空串而不是抛异常 */
+    @SuppressLint("MissingPermission")
+    private fun safeName(dev: BluetoothDevice): String =
+        runCatching { dev.name }.getOrNull() ?: ""
+
+    /** 设备当前是否连接中 */
+    @SuppressLint("MissingPermission")
+    private fun isConnected(context: Context, dev: BluetoothDevice): Boolean = runCatching {
+        val mgr = context.getSystemService(BluetoothManager::class.java)
+        mgr?.getConnectedDevices(BluetoothProfile.GATT)
+            ?.any { it.address == dev.address } == true
+    }.getOrDefault(false)
+
+    /** 设备信息 */
+    data class DeviceInfo(
+        val name: String,
+        val address: String,
+        val connected: Boolean
+    ) {
+        /** 显示用：没名字就用 MAC 顶上 */
+        val display: String
+            get() = name.ifBlank { address }.let {
+                if (connected) "$it（已连接）" else it
+            }
     }
 
     /**

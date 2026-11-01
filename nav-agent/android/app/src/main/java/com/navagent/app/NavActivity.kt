@@ -286,7 +286,33 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
             (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager)
                 .hideSoftInputFromWindow(et.windowToken, 0)
         }
+        // 打字发出去了，上面的识别提示就没意义了
+        clearRecognized()
         app.submit(text)
+    }
+
+    /**
+     * 显示这次识别到的文字。
+     *
+     * 为什么需要：纯语音界面没有消息列表，用户看不到机器听成了什么。
+     * 识别错了（「西站」听成「西战」）用户根本无从发现，
+     * 只能眼睁睁看它导错地方。
+     */
+    private fun showRecognized(text: String) {
+        val tv = findViewById<TextView>(R.id.recognized) ?: return
+        if (text.isBlank()) {
+            tv.visibility = View.GONE
+            return
+        }
+        tv.text = text
+        tv.visibility = View.VISIBLE
+    }
+
+    /** 清掉识别提示（发送后、或模型开始回答时） */
+    private fun clearRecognized() {
+        val tv = findViewById<TextView>(R.id.recognized) ?: return
+        tv.text = ""
+        tv.visibility = View.GONE
     }
 
     /**
@@ -421,11 +447,13 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
      * 开车时看屏幕的注意力本来就不该被文字气泡拉走，导航界面要的是干净。
      * 聊天内容在聊天页看；导航页要问什么就直接说，回答靠 TTS 播报。
      *
-     * 这里保留空实现（接口必须实现），不往上屏任何东西。
-     * 「我：xxx」和「助手：xxx」都吞掉。
+     * ★ 但**识别到的原文要显示**（用户后续要求）：
+     *   输入框上方显示每次识别成功的文字，发送后自动消失。
+     *   这是唯一保留的文字 —— 它不是聊天内容，是「机器听成了什么」的确认，
+     *   识别错了用户能立刻发现并用输入框改掉。
      */
     override fun onUser(text: String) {
-        // 导航页不显示聊天内容
+        runOnUiThread { showRecognized(text) }
     }
 
     override fun onAssistantDelta(text: String) {
@@ -433,7 +461,9 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
     }
 
     override fun onAssistantDone(full: String) {
-        // 导航页不显示聊天内容，答案由 TTS 播报
+        // 导航页不显示聊天内容，答案由 TTS 播报。
+        // 模型开始回答了，识别提示就没用了。
+        runOnUiThread { clearRecognized() }
     }
 
     override fun onVoiceState(state: VoiceEngine.State, hint: String) {
@@ -446,6 +476,17 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
     /** 导航页的「语音」按钮也做同样的呼吸反馈 */
     private fun updateTalkIndicator(state: VoiceEngine.State) {
         val talk = findViewById<Button>(R.id.talk) ?: return
+        // ★ 播报中优先显示「播报中」。导航播报时这个提示特别有用 ——
+        //   用户能看出「现在是导航在说话」，喊话要等它说完或主动打断。
+        if (app.voice.isSpeaking) {
+            talk.text = getString(R.string.mic_speaking)
+            talk.alpha = 1f
+            talk.setBackgroundResource(R.drawable.bg_input)
+            // 播报中用喇叭图标：这时候是「它在说话」
+            talk.setCompoundDrawablesWithIntrinsicBounds(R.drawable.ic_mic, 0, 0, 0)
+            stopTalkPulse(talk)
+            return
+        }
         when (state) {
             VoiceEngine.State.LISTENING -> {
                 talk.text = getString(R.string.mic_listening)
@@ -454,18 +495,22 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
                 //   所以用 bg_btn_listening 那个双层蓝框 —— 它是描边样式，
                 //   不会破坏底色统一。
                 talk.setBackgroundResource(R.drawable.bg_btn_listening)
+                // 聆听中换成麦克风图标：这时候是「在听你说话」
+                talk.setCompoundDrawablesWithIntrinsicBounds(R.drawable.ic_mic_active, 0, 0, 0)
                 startTalkPulse(talk)
             }
 
             VoiceEngine.State.THINKING -> {
                 talk.text = getString(R.string.mic_thinking)
                 talk.setBackgroundResource(R.drawable.bg_input)
+                talk.setCompoundDrawablesWithIntrinsicBounds(R.drawable.ic_mic, 0, 0, 0)
                 stopTalkPulse(talk)
             }
 
             VoiceEngine.State.ASLEEP -> {
-                talk.text = "◉ 语音"
+                talk.text = "语音"
                 talk.setBackgroundResource(R.drawable.bg_input)
+                talk.setCompoundDrawablesWithIntrinsicBounds(R.drawable.ic_mic, 0, 0, 0)
                 stopTalkPulse(talk)
             }
         }
@@ -508,6 +553,11 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
         app.addChatUi(this)
         app.addVoiceUi(this)
         app.refreshVoiceUi(this)
+        // 订阅 TTS 播报状态：导航播报时语音按钮显示「播报中」
+        speakingListener = app.voice.addSpeakingListener {
+            val state = app.voiceStateSnapshotProvider?.invoke()?.first ?: VoiceEngine.State.ASLEEP
+            runOnUiThread { updateTalkIndicator(state) }
+        }
         // 从聊天页切回来时导航状态可能已经变了
         updateNavButton(nav.isNavigating)
     }
@@ -519,7 +569,12 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
         nav.pauseNavigation()
         app.removeChatUi(this)
         app.removeVoiceUi(this)
+        speakingListener?.invoke()
+        speakingListener = null
     }
+
+    /** TTS 播报状态订阅的注销函数 */
+    private var speakingListener: (() -> Unit)? = null
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)

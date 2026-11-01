@@ -344,18 +344,8 @@ class SettingsActivity : AppCompatActivity() {
             }
         }
 
-        row("蓝牙状态", BluetoothAutoStart.status(this), "查看权限、配对设备", chevron = false) {}
-
-        row("查看已配对设备", "", "看看车机蓝牙叫什么名字，方便填上面那一栏") {
-            val list = BluetoothAutoStart.bondedDevices()
-            AlertDialog.Builder(this)
-                .setTitle("已配对设备")
-                .setMessage(
-                    if (list.isEmpty()) "没有已配对的蓝牙设备（或缺蓝牙权限）"
-                    else list.joinToString("\n")
-                )
-                .setPositiveButton("知道了", null)
-                .show()
+        row("蓝牙设备列表", "", "列出手机里的蓝牙设备，点一下直接填进上面那栏") {
+            showBluetoothDevices()
         }
 
         section("联网搜索")
@@ -580,6 +570,56 @@ class SettingsActivity : AppCompatActivity() {
             .setTitle(title)
             .setView(input)
             .setPositiveButton("保存") { _, _ -> onDone(input.text.toString()) }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    /**
+     * 列出蓝牙设备，点一下直接把名字填进「目标设备名」。
+     *
+     * 为什么要能点选：车机蓝牙名用户往往不知道精确写法
+     * （「Ford Sync 3」「我的车机」这种），手打容易打错导致永远不触发。
+     */
+    private fun showBluetoothDevices() {
+        if (!BluetoothAutoStart.hasPermission(this)) {
+            AlertDialog.Builder(this)
+                .setTitle("需要蓝牙权限")
+                .setMessage("没拿到「附近的设备」权限，读不到蓝牙设备名。\n请到系统设置里给 nav-agent 授权，或先打开「蓝牙自动启动」开关。")
+                .setPositiveButton("知道了", null)
+                .show()
+            return
+        }
+        if (!BluetoothAutoStart.isBluetoothOn()) {
+            AlertDialog.Builder(this)
+                .setTitle("蓝牙未开启")
+                .setMessage("请先打开手机蓝牙。")
+                .setPositiveButton("知道了", null)
+                .show()
+            return
+        }
+
+        val devices = BluetoothAutoStart.listDevices(this)
+        if (devices.isEmpty()) {
+            AlertDialog.Builder(this)
+                .setTitle("蓝牙设备列表")
+                .setMessage("没有找到已配对或已连接的蓝牙设备。\n\n先在系统蓝牙设置里把车机连上，这里就会列出来。")
+                .setPositiveButton("知道了", null)
+                .show()
+            return
+        }
+
+        val labels = devices.map { it.display }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("蓝牙设备（点一下填入目标名）")
+            .setItems(labels) { _, which ->
+                val dev = devices[which]
+                // 用设备名（可能为空）作为关键词；没名字就用地址前段
+                val keyword = dev.name.ifBlank { dev.address }
+                Prefs.bluetoothTargetName = keyword
+                applied()
+                toast("已填入目标设备名：$keyword")
+                render()
+            }
             .setNegativeButton("取消", null)
             .show()
     }

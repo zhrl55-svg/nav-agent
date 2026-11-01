@@ -121,27 +121,67 @@ class EnergyVad(
      *      真人的发声是持续的
      *   3. **不动 noiseFloor** —— 否则 TTS 一播报就把底噪基线拉高，之后再也检测不到
      *
+     * ★ 2026-11-01：声纹前置到打断判定。
+     *   能量阈值分不出「主人在说话」和「麦克风把导航播报/收音机收进来了」。
+     *   所以这里不再直接返回 true，而是**持续攒音频**，
+     *   攒够 [BARGE_IN_CHECK_MS] 后交给声纹门禁判定（见 [bargeInCheck]）。
+     *   只有判定为主人的声音才真的打断播报。
+     *
      * @return true 表示确认用户在说话，该停播报了
      */
     fun feedBargeIn(frame: ShortArray, len: Int): Boolean {
         val rms = rms(frame, len)
         val threshold = maxOf(noiseFloor * 2.6, MIN_RMS) * BARGE_IN_FACTOR
+
+        // 攒音频：不管超没超阈值都攒，等攒够再判声纹。
+        // 为什么低阈值也攒 —— 主人在播报间隙小声说话，能量可能不够高，
+        // 但声纹能认出来是谁。
+        bargeBuffer.addAll(frame.take(len).toList())
+        while (bargeBuffer.size > bargeBufferCapacity) bargeBuffer.removeAt(0)
+
         if (rms > threshold) {
             bargeFrames++
-            if (bargeFrames >= BARGE_IN_FRAMES) {
-                bargeFrames = 0
-                return true
-            }
         } else {
             // 说话中间有换气停顿，掉一帧别直接清零；连续掉才放弃
             if (bargeFrames > 0) bargeFrames--
         }
+
+        val bargeMs = bargeBuffer.size * 1000 / AudioCapture.SAMPLE_RATE
+        if (bargeMs < BARGE_IN_CHECK_MS) return false
+
+        // 攒够了，交给声纹判定（阻塞调用，约 0.1s，在音频线程上）
+        val pcm = bargeBuffer.toShortArray()
+        val allowed = bargeInCheck?.invoke(pcm) ?: true
+        if (allowed) {
+            bargeFrames = 0
+            bargeBuffer.clear()
+            return true
+        }
+        // 不是主人 —— 清掉这段，继续攒下一段
+        bargeBuffer.clear()
+        bargeFrames = 0
         return false
     }
+
+    /**
+     * 声纹判定回调。返回 true = 主人，允许打断。
+     *
+     * 宿主注入（VoiceEngine 那边接 VoiceprintGate）。
+     * 为 null 时一律放行 —— 声纹没就绪时不能把打断功能整个废掉。
+     */
+    @Volatile
+    var bargeInCheck: ((ShortArray) -> Boolean)? = null
+
+    /** 攒音频的缓冲区上限（够声纹判定就行，别无限涨） */
+    private val bargeBufferCapacity = AudioCapture.SAMPLE_RATE * 2
+
+    /** 攒音频的缓冲 */
+    private val bargeBuffer = ArrayList<Short>()
 
     /** 打断检测的状态清零（会话休眠、开始新一轮时调用） */
     fun resetBargeIn() {
         bargeFrames = 0
+        bargeBuffer.clear()
     }
 
     private var bargeFrames = 0
@@ -168,5 +208,16 @@ class EnergyVad(
 
         /** 20ms 一帧，20 帧 = 400ms 持续发声才算打断 */
         const val BARGE_IN_FRAMES = 20
+
+        /**
+         * 攒够多少音频才去做声纹判定。
+         *
+         * 声纹判定需要 ≥0.5 秒（VoiceprintGate.MIN_CHECK_SECONDS），
+         * 这里给 0.6 秒留点余量 —— 太短算不准。
+         *
+         * 代价是打断的响应延迟：主人说话要攒 0.6 秒才确认。
+         * 但换来的是「麦克风串音不打断」，开车场景这笔交易划算。
+         */
+        const val BARGE_IN_CHECK_MS = 600
     }
 }

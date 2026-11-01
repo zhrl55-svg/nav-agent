@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  语音按钮的喇叭图标。
+
+  ★ 为什么用矢量图而不是「◉」这类字符：
+    Unicode 符号在不同 ROM/字体下长相差别很大（有的渲染成实心圆、有的成靶心），
+    尺寸和基线也不可控。矢量图在任何设备上都一致。
+
+  图标用白色（#E6EDF5），跟按钮上的浅色文字配套；
+  按钮底色是实心蓝或深色，浅色图标对比足够。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="18dp"
+    android:height="18dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24"
+    android:tint="#E6EDF5">
+
+    <!-- 喇叭主体 -->
+    <path
+        android:fillColor="#E6EDF5"
+        android:pathData="M3,9v6h4l5,5V4L7,9H3z" />
+
+    <!-- 声波：两道弧 -->
+    <path
+        android:fillColor="#E6EDF5"
+        android:pathData="M16.5,12c0,-1.77 -1.02,-3.29 -2.5,-4.03v8.05c1.48,-0.73 2.5,-2.25 2.5,-4.02zM14,3.23v2.06c2.89,0.86 5,3.54 5,6.71s-2.11,5.85 -5,6.71v2.06c4.01,-0.91 7,-4.49 7,-8.77s-2.99,-7.86 -7,-8.77z" />
+</vector>

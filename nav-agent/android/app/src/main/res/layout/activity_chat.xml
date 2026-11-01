@@ -114,13 +114,16 @@
 
         <Button
             android:id="@+id/mic"
-            android:layout_width="64dp"
+            android:layout_width="wrap_content"
             android:layout_height="46dp"
             android:layout_marginStart="8dp"
+            android:minWidth="72dp"
             android:background="@drawable/bg_btn_primary"
                     android:backgroundTint="@null"
                     android:stateListAnimator="@null"
-            android:text="◉ 语音"
+            android:drawableStart="@drawable/ic_mic"
+            android:drawablePadding="4dp"
+            android:text="语音"
             android:textColor="#0E1620"
             android:textSize="13sp" />
 

@@ -102,10 +102,14 @@ class VoiceEngine(private val context: Context) {
             ready = true
 
             if (vad == null) {
-                vad = EnergyVad(
+                val v = EnergyVad(
                     onSpeechStart = { lastActivityMs = System.currentTimeMillis() },
                     onSegment = { pcm -> onSegment(pcm) }
                 )
+                // ★ 声纹前置到打断判定：只有主人的声音能打断 AI 的播报。
+                //   麦克风把导航播报、收音机、乘客说话收进来，都不该打断。
+                v.bargeInCheck = { pcm -> isOwnerVoice(pcm) }
+                vad = v
             }
 
             val cap = AudioCapture { frame, len -> onFrame(frame, len) }
@@ -322,6 +326,24 @@ class VoiceEngine(private val context: Context) {
                 busyRecognizing = false
             }
         }
+    }
+
+    /**
+     * 这段音频是不是主人说的。
+     *
+     * 用在**打断播报**的判定上：只有主人的声音才打断 AI 的播报，
+     * 麦克风收进来的导航播报、收音机、乘客说话都不打断。
+     *
+     * ★ 失败一律放行（跟 [passVoiceprint] 同一个原则）：
+     *   声纹没注册、算不出、超时 —— 全部当"是主人"。
+     *   它是防误打断，不是身份认证，别把打断功能整个废掉。
+     */
+    private fun isOwnerVoice(pcm: ShortArray): Boolean {
+        if (!Prefs.voiceprint) return true
+        val gate = voiceprintProvider?.invoke() ?: return true
+        // 没注册模板时无法判定 —— 放行（第一句往往是主人自己说的）
+        if (!gate.enrolled) return true
+        return runCatching { gate.allow(pcm) }.getOrDefault(true)
     }
 
     /**

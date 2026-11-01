@@ -75,6 +75,33 @@ class VoiceGuide(
         private set
 
     /**
+     * 播报状态变化回调。
+     *
+     * 界面用它把语音按钮切成「播报中」——
+     * 用户能一眼看出 AI 正在说话，这时喊话是要打断的。
+     *
+     * 用 `CopyOnWriteArrayList` 而不是裸 List：回调在 TTS 线程触发，
+     * 而界面在主线程注册/注销，并发改会炸。
+     */
+    private val speakingListeners = java.util.concurrent.CopyOnWriteArrayList<(Boolean) -> Unit>()
+
+    /** 注册播报状态监听。返回的 lambda 用于注销。 */
+    fun addSpeakingListener(l: (Boolean) -> Unit): () -> Unit {
+        speakingListeners.add(l)
+        return { speakingListeners.remove(l) }
+    }
+
+    private fun notifySpeaking(speaking: Boolean) {
+        speakingListeners.forEach { runCatching { it(speaking) } }
+    }
+
+    private fun setSpeaking(speaking: Boolean) {
+        if (isSpeaking == speaking) return
+        isSpeaking = speaking
+        notifySpeaking(speaking)
+    }
+
+    /**
      * 上一次播报结束的时刻。
      *
      * 用来做「回声保护期」：外放的声音有混响尾巴，播报停了麦克风还会收到 200~400ms
@@ -168,7 +195,7 @@ class VoiceGuide(
         runCatching { tts?.shutdown() }
         tts = null
         ready = false
-        isSpeaking = false
+        setSpeaking(false)
         current = null
         queue.clear()
         startEngine()
@@ -215,7 +242,7 @@ class VoiceGuide(
         engine.setSpeechRate(rate)
         engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(utteranceId: String?) {
-                isSpeaking = true
+                setSpeaking(true)
             }
 
             override fun onDone(utteranceId: String?) {
@@ -248,7 +275,7 @@ class VoiceGuide(
     @Synchronized
     private fun finishCurrent() {
         current = null
-        isSpeaking = false
+        setSpeaking(false)
         lastSpokeEndMs = System.currentTimeMillis()
         drain()
     }
@@ -262,7 +289,7 @@ class VoiceGuide(
             val cloud = cloudTts ?: return
             val next = queue.poll() ?: return
             current = next
-            isSpeaking = true
+            setSpeaking(true)
             cloud.speak(
                 next.text,
                 onDone = { finishCurrent() },
@@ -291,7 +318,7 @@ class VoiceGuide(
             queue.removeAll { it.priority == Priority.CHAT }
             tts?.stop()
             current = null
-            isSpeaking = false
+            setSpeaking(false)
         }
         queue.offer(Utterance("u${++seq}", text, priority))
         drain()
@@ -301,7 +328,7 @@ class VoiceGuide(
     fun silence() {
         queue.clear()
         current = null
-        isSpeaking = false
+        setSpeaking(false)
         tts?.stop()
         cloudTts?.stop()
         lastSpokeEndMs = System.currentTimeMillis()

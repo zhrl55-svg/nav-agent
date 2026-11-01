@@ -85,6 +85,28 @@
             android:textColor="#E6EDF5"
             android:textSize="14sp" />
 
+        <!--
+          识别到的文字（临时提示）。
+
+          ★ 需求：输入框上方显示每次识别成功的文字，发送后自动消失。
+            纯语音界面没有消息列表，用户看不到「机器到底听成了什么」——
+            识别错了就无从发现（「导航去西站」被听成「导航去西战」，用户根本不知道）。
+            这里显示一次，让人能立刻确认或用输入框改。
+
+          生命周期：识别成功 → 显示 → 发送后清空。
+            不用聊天气泡那套（气泡会把整段历史都留在屏幕上，开车时干扰视线）。
+        -->
+        <TextView
+            android:id="@+id/recognized"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:maxLines="2"
+            android:ellipsize="end"
+            android:textColor="#7FB2DC"
+            android:textSize="14sp"
+            android:visibility="gone" />
+
         <!-- 打字发指令 -->
         <LinearLayout
             android:layout_width="match_parent"
@@ -140,7 +162,9 @@
                 android:background="@drawable/bg_input"
                     android:backgroundTint="@null"
                     android:stateListAnimator="@null"
-                android:text="◉ 语音"
+                android:drawableStart="@drawable/ic_mic"
+                android:drawablePadding="3dp"
+                android:text="语音"
                 android:textColor="#E6EDF5"
                 android:textSize="13sp" />
 

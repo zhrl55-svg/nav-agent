@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">小高</string>
+    <string name="app_name">AI导航</string>
     <string name="btn_talk">唤醒小高</string>
     <string name="hint_idle">说「小高」唤醒，或直接打字</string>
     <string name="hud_icon_desc">转向图标</string>
@@ -18,5 +18,6 @@
     <string name="voice">语音</string>
     <string name="mic_listening">聆听中</string>
     <string name="mic_thinking">识别中</string>
+    <string name="mic_speaking">播报中</string>
     <string name="chat_greeting">我在。想去哪儿、想问点什么，直接说；说「%1$s」就能叫我。</string>
 </resources>

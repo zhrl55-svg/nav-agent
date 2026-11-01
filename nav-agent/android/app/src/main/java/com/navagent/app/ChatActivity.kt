@@ -225,8 +225,21 @@ class ChatActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
      * 为什么要动：纯靠底下那行小字，开车时根本注意不到是不是在听。
      * 按钮自己会动，余光就能看见。
      */
-    private fun updateMicIndicator(state: VoiceEngine.State) {
+    private fun updateMicIndicator(state: VoiceEngine.State?) {
         val mic = findViewById<Button>(R.id.mic) ?: return
+        // ★ 播报中优先显示「播报中」。
+        //   AI 正在说话时用户喊话是要打断的，这个提示比「聆听中」有意义得多。
+        //   （而且此时是半双工，麦克风根本不拾音。）
+        if (app.voice.isSpeaking) {
+            mic.text = getString(R.string.mic_speaking)
+            mic.alpha = 1f
+            mic.setBackgroundResource(R.drawable.bg_btn_primary)
+            mic.setTextColor(android.graphics.Color.parseColor("#0E1620"))
+            // 播报中用喇叭图标：这时候是「它在说话」
+            mic.setCompoundDrawablesWithIntrinsicBounds(R.drawable.ic_mic, 0, 0, 0)
+            stopMicPulse(mic)
+            return
+        }
         when (state) {
             VoiceEngine.State.LISTENING -> {
                 mic.text = getString(R.string.mic_listening)
@@ -238,6 +251,8 @@ class ChatActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
                 mic.setBackgroundResource(R.drawable.bg_mic_listening)
                 // 亮底必须配深字，不然白字压在亮蓝上反而看不清
                 mic.setTextColor(android.graphics.Color.parseColor("#0E1620"))
+                // 聆听中换成麦克风图标：这时候是「在听你说话」
+                mic.setCompoundDrawablesWithIntrinsicBounds(R.drawable.ic_mic_active, 0, 0, 0)
                 startMicPulse(mic)
             }
 
@@ -245,13 +260,15 @@ class ChatActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
                 mic.text = getString(R.string.mic_thinking)
                 mic.setBackgroundResource(R.drawable.bg_btn_primary)
                 mic.setTextColor(android.graphics.Color.parseColor("#0E1620"))
+                mic.setCompoundDrawablesWithIntrinsicBounds(R.drawable.ic_mic, 0, 0, 0)
                 stopMicPulse(mic)
             }
 
-            VoiceEngine.State.ASLEEP -> {
-                mic.text = "◉ 语音"
+            VoiceEngine.State.ASLEEP, null -> {
+                mic.text = "语音"
                 mic.setBackgroundResource(R.drawable.bg_btn_primary)
                 mic.setTextColor(android.graphics.Color.parseColor("#0E1620"))
+                mic.setCompoundDrawablesWithIntrinsicBounds(R.drawable.ic_mic, 0, 0, 0)
                 stopMicPulse(mic)
             }
         }
@@ -286,6 +303,10 @@ class ChatActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
         app.addChatUi(this)
         app.addVoiceUi(this)
         app.refreshVoiceUi(this)
+        // 订阅 TTS 播报状态：播报时语音按钮显示「播报中」
+        speakingListener = app.voice.addSpeakingListener { speaking ->
+            runOnUiThread { updateMicIndicator(app.voiceStateSnapshotProvider?.invoke()?.first) }
+        }
         // 名字可在设置里改，回页面就刷成当前值
         findViewById<TextView>(R.id.ai_title).text = Prefs.aiName
         syncMessages()
@@ -301,7 +322,13 @@ class ChatActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
         super.onPause()
         app.removeChatUi(this)
         app.removeVoiceUi(this)
+        // 退订播报监听，别让 Activity 被 TTS 队列吊着不放
+        speakingListener?.invoke()
+        speakingListener = null
     }
+
+    /** TTS 播报状态订阅的注销函数 */
+    private var speakingListener: (() -> Unit)? = null
 
     private companion object {
         const val EXTRA_SAY = "say"
