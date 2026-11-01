@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  自适应图标（Android 8.0+ / API 26+）。
+
+  background = 带底色的方框（蓝灰渐变）
+  foreground = 导航箭头
+
+  系统会自己裁切成圆形/方形/水滴形，各家桌面表现一致。
+-->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@drawable/ic_launcher_background" />
+    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+</adaptive-icon>

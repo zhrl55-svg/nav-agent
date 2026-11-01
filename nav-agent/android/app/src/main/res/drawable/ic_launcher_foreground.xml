@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  应用图标的前景层：导航箭头。
+
+  自适应图标（Adaptive Icon）的结构：
+    背景层 = 纯色方框（ic_launcher_background）
+    前景层 = 这个箭头
+  系统会把前景缩放到中间 72/108 的安全区内，所以箭头要留够边距。
+
+  坐标按 108x108 设计，实际显示只有中间 66x66 左右。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- 导航箭头：经典的纸质地图折角造型 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,28 L76,38 L54,48 L32,38 Z" />
+
+    <!-- 箭头主体（向下的折角） -->
+    <path
+        android:fillColor="#E8F2FB"
+        android:pathData="M54,28 L54,48 L76,38 Z" />
+
+    <!-- 中间分隔线 -->
+    <path
+        android:fillColor="#4A7BA7"
+        android:pathData="M32,38 L54,48 L54,80 L32,70 Z" />
+
+    <path
+        android:fillColor="#B8D4EE"
+        android:pathData="M54,48 L76,38 L76,70 L54,80 Z" />
+</vector>
