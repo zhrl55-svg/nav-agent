@@ -167,7 +167,9 @@ object AmapSdkGeocoder {
                     isOnceLocation = true
                     setHttpTimeOut(timeoutMs)
                     isNeedAddress = true
-                    isWifiActiveScan = true
+                    // 新版 SDK（V11.3.100）把 setWifiActiveScan 移除了，
+                    // isWifiActiveScan 变成只读属性 —— 赋值会编译报错。
+                    // 不影响定位精度，只是少了「主动扫 WiFi」这个辅助手段。
                 }
             )
             client!!.setLocationListener(listener)

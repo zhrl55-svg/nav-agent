@@ -1,6 +1,7 @@
 package com.navagent.app
 
 import android.Manifest
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
@@ -88,19 +89,89 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
             )
             options.setCrossLocation(navArea, navArea)
 
-            // 夜间模式跟着系统走。
-            // 不开的话高德默认浅色地图，和本应用的深色蓝灰主题完全打架
-            // （浅底 + 我们的深色面板，中间那道交界特别难看）。
-            options.isAutoNaviViewNightMode = true
-            options.isNaviNight = isNightMode()
-            // 车道级导航：路口有车道箭头那种，官方才有，自己画不出来
-            options.isLaneInfoShow = true
-            // 路况条：显示前方拥堵情况
-            options.isTrafficBarEnabled = true
-            // 路线详情列表按钮：底部空间有限，让给我们的按钮栏
-            options.isRouteListButtonShow = false
+        // ★ 地图样式 / 图层 —— 全部按官方 V11.3.100 API Doc 来。
+        //
+        // 官方文档明确：
+        //   setNaviNight / setAutoNaviViewNightMode / setCustomMapStylePath
+        //   **全部已过时**，统一用 setMapStyle(MapStyle, customStylePath)。
+        //   MapStyle.AUTO = 昼夜自动切换，正好跟着系统走，不用自己判。
+        options.setMapStyle(com.amap.api.navi.enums.MapStyle.AUTO, "")
+        // 车道级导航：路口有车道箭头那种，官方才有，自己画不出来
+        options.isLaneInfoShow = true
+        // 路况条：显示前方拥堵情况
+        options.isTrafficBarEnabled = true
+        // ★ 路况图层 + 路况线 —— 拉近跟高德 App 观感的关键。
+        //   HiCar 里那张图上，路线是绿/红相间的，那是路况线。
+        //   之前只有顶部一条路况条，地图上路线始终是纯蓝，看着很"素"。
+        options.isTrafficLayerEnabled = true
+        options.isTrafficLine = true
+        // 路线详情列表按钮：底部空间有限，让给我们的按钮栏
+        options.isRouteListButtonShow = false
+        // 设置菜单按钮同理，让给我们的按钮栏
+        options.isSettingMenuEnabled = false
+            // ★ 车辆模型：换成俯视的汽车，别用 SDK 默认的蓝色三角箭头。
+            //   高德 App 本体画的是汽车模型，SDK 默认画的是定位针形状 ——
+            //   这是用户对比 HiCar 时觉得"不像"的主要来源之一。
+            //   ★ 必须在 setViewOptions 之前设，View 建好后就改不动了。
+            //   setCarBitmap 要的是 Bitmap，矢量图得先渲染一遍。
+            runCatching {
+                val d = androidx.core.content.ContextCompat.getDrawable(this, R.drawable.car_model)
+                if (d != null) {
+                    val size = (48 * resources.displayMetrics.density).toInt()
+                    val bmp = android.graphics.Bitmap.createBitmap(size, size, android.graphics.Bitmap.Config.ARGB_8888)
+                    val canvas = android.graphics.Canvas(bmp)
+                    d.setBounds(0, 0, size, size)
+                    d.draw(canvas)
+                    options.setCarBitmap(bmp)
+                }
+            }.onFailure { Dbg.log("车辆模型设置失败：${it.message}") }
         }
         naviView.viewOptions = options
+
+        // ★ 关掉地图原生缩放按钮 —— 它在右下角，被我们的底部面板压住了一半，
+        //   点不到也看不清（用户反馈）。
+        //   只关按钮，**保留手势缩放**（setZoomGesturesEnabled 默认开着），
+        //   双指缩放照常能用，比按按钮方便。
+        runCatching {
+            naviView.map.uiSettings.setZoomControlsEnabled(false)
+        }.onFailure { Dbg.log("缩放按钮关闭失败：${it.message}") }
+
+        // ★ 地图样式 / 图层要在**地图加载完成后**设。
+        //
+        //   官方文档给的入口是 `setOnMapLoadedListener(AMap.OnMapLoadedListener)`
+        //   ——「设置自定义导航view中地图的加载完成事件监听」。
+        //   之前在 onCreate 里直接设 mapType / setMapStyle，
+        //   那时地图还没初始化完，设置被吃掉了（实测地图一直是浅色）。
+        //
+        //   所以这里挂个监听，等地图真的加载好再设样式。
+        naviView.setOnMapLoadedListener {
+            Dbg.log("地图加载完成 → 应用夜间样式与图层")
+            runCatching {
+                naviView.map.mapType = if (isNightMode()) {
+                    com.amap.api.maps.AMap.MAP_TYPE_NAVI_NIGHT
+                } else {
+                    com.amap.api.maps.AMap.MAP_TYPE_NAVI
+                }
+                Dbg.log("地图类型已设 night=" + isNightMode())
+            }.onFailure { Dbg.log("地图类型设置失败：${it.message}") }
+        }
+
+        // ★ 路况线要在 View 上再设一次。
+        //   Options 里那遍只是初始值，AMapNaviView.setTrafficLine() 才是运行时开关。
+        //   HiCar 那张图里路线是绿/红相间的 —— 那是路况线，
+        //   没开的话路线始终纯蓝，地图看着很"素"。
+        runCatching { naviView.setTrafficLine(true) }
+            .onFailure { Dbg.log("路况线开关失败：${it.message}") }
+
+        // ★ 红绿灯。
+        //   HiCar 那张图路口有红绿灯倒计时，SDK 里对应这两个方法：
+        //     setTrafficLightsVisible    —— 地图上显示红绿灯图标
+        //     setShowTrafficLightView   —— 额外的红绿灯提示视图
+        //   不开的话路口只有转向箭头，看不出要等几个灯。
+        runCatching {
+            naviView.setTrafficLightsVisible(true)
+            naviView.setShowTrafficLightView(true)
+        }.onFailure { Dbg.log("红绿灯开关失败：${it.message}") }
 
         status = findViewById(R.id.status)
         hud = findViewById(R.id.hud)
@@ -182,6 +253,32 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
     private fun startVoiceService() {
         runCatching { VoiceService.start(this) }
             .onFailure { Dbg.log("语音服务启动失败：${it.message}") }
+    }
+
+    /**
+     * 写入高德 SDK 的昼夜模式偏好。
+     *
+     * ★ 这是新版 SDK 夜间样式的**关键前置**（反编译 AmapRouteActivity 得出）：
+     *   官方代码是
+     *     `MapStyle.getEnum(sp.getInt("DAY_NIGHT_MODE", MapStyle.AUTO.getValue()))`
+     *   —— 样式类型是从 SharedPreferences 读的，不是直接传常量。
+     *   偏好文件名叫 `NAVI_STRATEGY`（SDK 内部工具类 b7.c 里写死的）。
+     *
+     *   不写这个键，setMapStyle(NIGHT, "") 也不生效（实测地图仍是浅色）。
+     */
+    private fun writeDayNightPreference(context: Context, night: Boolean) {
+        runCatching {
+            val style = if (night) {
+                com.amap.api.navi.enums.MapStyle.NIGHT
+            } else {
+                com.amap.api.navi.enums.MapStyle.DAY
+            }
+            context.getSharedPreferences("NAVI_STRATEGY", Context.MODE_PRIVATE)
+                .edit()
+                .putInt("DAY_NIGHT_MODE", style.value)
+                .apply()
+            Dbg.log("高德昼夜模式偏好已写：DAY_NIGHT_MODE=${style.value} night=$night")
+        }.onFailure { Dbg.log("写高德昼夜偏好失败：${it.message}") }
     }
 
     /**

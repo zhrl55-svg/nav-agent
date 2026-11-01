@@ -200,6 +200,47 @@ app/
 4. **半双工兜底。** 播报期间点按钮是「打断播报」而不是「开始拾音」，避免把自己的声音收进去。
 5. **`NaviLatLng` 用无参构造 + setter**，避开 `NaviLatLng(double, double)` 参数顺序（lat/lon 还是 lon/lat）的歧义。
 
+### 高德 SDK 版本（★ 路线准确性的根因）
+
+**当前用 V11.3.100（2026-09-24），不是 Maven 上的 `navi-3dmap`。**
+
+```
+原因：com.amap.api:navi-3dmap 最新只到 10.0.800（2024-08 停更）。
+      它的算路数据是 4 年前的 —— 不认识「南门不通车」这类通行限制，
+      而高德 App（2026 版数据）认识，两边路线走向完全不同（实测）。
+      SDK 版：2671 米走「无名道路」直接向北
+      App 版：2.8 公里走「临泽北路」往东绕开
+官方新版：导航SDK V11.3.100，已拆成独立包 com.amap.api.navi。
+      ★ Maven 上没有（只有 1.9.4 / 2020 年），只能官网下载 ZIP 手动引入。
+
+获取：bash tools/fetch_amap_sdk.sh
+      下载到 android/libs/amap/（187MB，**不入 Git**，.gitignore 已排除）。
+```
+
+**车行限制**（官方文档给的正解，`AmapNavController.applyCarInfo()`）：
+
+```kotlin
+val carInfo = AMapCarInfo().apply {
+    setCarType("0")        // 0 = 轿车
+    setRestriction(true)   // 规避限行路段
+    Prefs.carNumber.takeIf { it.isNotBlank() }?.let { setCarNumber(it) }
+}
+navi.setCarInfo(carInfo)
+```
+
+官方原文：「路径规划时会躲避车辆限行区域和路线」「小客车算路**只考虑车牌因素**」
+→ 设置页要填车牌才能规避尾号限行。**每次算路前都要再设一遍**（它影响的是算路时的行为）。
+
+**界面相关（按官方 API Doc，别用已过时的接口）**：
+
+| 过时接口 | 替代 |
+|---|---|
+| `setNaviNight` / `setAutoNaviViewNightMode` | `setMapStyle(MapStyle.AUTO, "")` |
+| `setCustomMapStylePath` | 同上 |
+
+★ 地图样式**必须在 `setOnMapLoadedListener` 回调里设**（官方给这个回调就是「地图加载完成」）。
+在 `onCreate` 里直接设会被吃掉 —— 实测地图一直浅色就是这个原因。
+
 ## 踩过的坑（全部实测，别重犯）
 
 ### 构建

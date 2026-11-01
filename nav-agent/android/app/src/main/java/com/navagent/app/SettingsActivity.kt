@@ -321,6 +321,18 @@ class SettingsActivity : AppCompatActivity() {
             ) { Prefs.nearbyRadius = it; applied() }
         }
 
+        row(
+            "车牌号", Prefs.carNumber.ifBlank { "未填写" },
+            "算路时绕开限行路段。限行按车牌尾号算，填了才管用"
+        ) {
+            editText("车牌号", Prefs.carNumber, "如：甘G12345") {
+                Prefs.carNumber = it
+                applied()
+                toast(if (it.isBlank()) "已清空车牌" else "车牌已保存：${it.uppercase()}")
+                render()
+            }
+        }
+
         section("车载蓝牙")
         rowSwitch("蓝牙自动启动", Prefs.bluetoothAutoStart, "车机连上后自动唤醒语音助手") {
             Prefs.bluetoothAutoStart = it

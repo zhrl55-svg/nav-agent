@@ -47,6 +47,7 @@ object Prefs {
     private const val K_BT_TARGET = "bluetooth_target_name"
     private const val K_BT_AUTOSTART = "bluetooth_auto_start"
     private const val K_AMAP_BUILTIN_UI = "amap_builtin_ui"
+    private const val K_CAR_NUMBER = "car_number"
 
     /** MiniMax 默认音色：青涩青年 */
     const val DEFAULT_VOICE = "male-qn-qingse"
@@ -228,6 +229,19 @@ object Prefs {
     var amapBuiltinUi: Boolean
         get() = sp.getBoolean(K_AMAP_BUILTIN_UI, true)
         set(v) = sp.edit().putBoolean(K_AMAP_BUILTIN_UI, v).apply()
+
+    /**
+     * 车牌号（如「甘G12345」）。
+     *
+     * ★ 为什么要填：高德官方文档说「小客车算路**只考虑车牌因素**」——
+     *   限行是按车牌尾号算的（尾号限行、单双号限行）。
+     *   不填车牌只能规避「结构性禁行」（限高杆、限宽路、货车道）。
+     *
+     * 填了之后算路会主动绕开自己不能走的那天。
+     */
+    var carNumber: String
+        get() = sp.getString(K_CAR_NUMBER, "").orEmpty().trim()
+        set(v) = sp.edit().putString(K_CAR_NUMBER, v.trim().uppercase()).apply()
 
     // ------------------------------------------------------------ 联网
 

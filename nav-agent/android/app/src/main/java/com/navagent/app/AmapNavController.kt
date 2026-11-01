@@ -91,6 +91,9 @@ class AmapNavController(
                 Dbg.log("AMapNavi.getInstance 成功 ver=" + AMapNavi.getVersion())
                 // 关掉内置语音，否则会和我们自己的 TTS 双重播报
                 it.setUseInnerVoice(false)
+
+                // ★ 车辆信息：开启车行限制。详见 [applyCarInfo]。
+                applyCarInfo(it)
             }
         }.onFailure {
             Log.e(TAG, "AMapNavi 初始化失败", it)
@@ -136,7 +139,7 @@ class AmapNavController(
     }
 
     override fun navigateTo(destination: String) {
-        Dbg.log("navigateTo($destination) hasFix=$hasFix")
+        Dbg.log("navigateTo($destination) hasFix=$hasFix city=$currentCity")
         val n = navi
         if (n == null) {
             onState("导航引擎未就绪")
@@ -152,9 +155,50 @@ class AmapNavController(
         pendingPlace = null
         onState("正在解析「$destination」…")
 
-        // POI 搜索优先：口语地名（"高铁西站""火车站""加油站"）本质是 POI，
-        // geocode 会按字符串硬匹配，容易跨城市命中。搜不到再退回地理编码。
-        // 两步都是 SDK 异步回调，不需要自己开线程（也不会再抛 NetworkOnMainThreadException）。
+        // ★ 城市偏置要等城市名解析出来。
+        //   定位回调里坐标是先到的，`loc.city` 要靠 setNeedAddress(true) 反查地址，
+        //   慢一拍（实测差几百毫秒）。hasFix 一变 true 就去搜索的话，
+        //   currentCity 还是 null —— 城市偏置失效，跨城市地名会解析错
+        //   （「景泰县条山路金星家园」可能命中本市的「金星灯饰」）。
+        //   所以这里等一下城市，最长 3 秒。
+        if (currentCity.isNullOrBlank()) {
+            Dbg.log("坐标已就绪但城市未解析，等城市（最多 3 秒）")
+            waitForCityThenResolve(destination)
+            return
+        }
+        resolvePlace(destination)
+    }
+
+    /**
+     * 等城市名解析出来后继续解析目的地。
+     *
+     * 城市来自定位的地址反查，通常几百毫秒内就有；超时就不等了，
+     * 直接按无城市偏置解析（跟以前的行为一样，不会更糟）。
+     */
+    private fun waitForCityThenResolve(destination: String) {
+        val deadline = System.currentTimeMillis() + CITY_WAIT_MS
+        Thread {
+            while (System.currentTimeMillis() < deadline) {
+                if (!currentCity.isNullOrBlank()) {
+                    Dbg.log("城市已就绪：$currentCity")
+                    break
+                }
+                Thread.sleep(100)
+            }
+            if (currentCity.isNullOrBlank()) {
+                Dbg.log("等城市超时，按无城市偏置解析")
+            }
+            resolvePlace(destination)
+        }.apply { isDaemon = true; name = "wait-city" }.start()
+    }
+
+    /**
+     * 解析目的地并算路。
+     *
+     * POI 搜索优先（口语地名是 POI 不是门牌地址），搜不到再退回地理编码。
+     * 两步都是 SDK 异步回调，不会抛 NetworkOnMainThreadException。
+     */
+    private fun resolvePlace(destination: String) {
         val city = currentCity
         AmapSdkGeocoder.searchPoi(context, destination, city) { poi ->
             Dbg.log(
@@ -192,6 +236,10 @@ class AmapNavController(
     private fun onPlaceResolved(point: AmapSdkGeocoder.GeoPoint) {
         val n = navi ?: return
         pendingPlace = point
+        // ★ 算路**之前**再设一次车辆信息。
+        //   官方文档说 setCarInfo 影响的是「路径规划时会躲避车辆限行区域和路线」，
+        //   所以必须在 calculateDriveRoute 之前生效，不能只在 start() 里设一次。
+        applyCarInfo(n)
         // 用无参构造 + setter，避开 NaviLatLng(double,double) 参数顺序的歧义
         val start = NaviLatLng().apply {
             latitude = lastLat
@@ -250,6 +298,46 @@ class AmapNavController(
         seconds >= 60 -> "${seconds / 60}分钟"
         seconds > 0 -> "不到1分钟"
         else -> "时间不计"
+    }
+
+    /**
+     * 设置车辆信息，开启**车行限制**。
+     *
+     * ★ 官方文档（V11.3.100 API Doc · AMapNavi.setCarInfo）原文：
+     *   「设置车辆信息(包括车型，车牌，车高，车重等)，**路径规划时会躲避车辆限行区域和路线**」
+     *   「目前小客车算路只考虑车牌因素，货车算路会考虑车高、车重等信息，
+     *     其中 AMapCarInfo.setRestriction(boolean) 用于控制是否规避限行路段」
+     *
+     * ★ 为什么这是「南门不通车」那个问题的解法：
+     *   不设车辆信息 = 算路不知道这条路过不去（限高杆/限宽路/货车禁行），
+     *   直接给你规划过去。高德 App 会绕开，是因为它设了车辆信息。
+     *
+     * ★ 为什么要**每次算路前**都调：
+     *   官方说这个信息影响的是「路径规划时」的行为，
+     *   所以必须在 calculateDriveRoute 之前生效，不能只在初始化时设一次。
+     *
+     * 车牌：官方说小客车算路**只考虑车牌因素**（限行是按车牌尾号算的）。
+     * 没填车牌时只能规避「结构性禁行」（限高/限宽/货车道），
+     * 尾号限行那种要填车牌才管用 —— 设置项里留了入口（见 [Prefs]）。
+     */
+    private fun applyCarInfo(navi: AMapNavi) {
+        runCatching {
+            val carInfo = com.amap.api.navi.model.AMapCarInfo().apply {
+                // 0 = 轿车（AMapCarInfo.setCarType 内部是 Integer.parseInt）
+                setCarType("0")
+                // 规避限行路段
+                setRestriction(true)
+                // 车牌（小客车限行按尾号算，填了才能规避尾号限行）
+                Prefs.carNumber.takeIf { it.isNotBlank() }?.let { setCarNumber(it) }
+            }
+            navi.setCarInfo(carInfo)
+            Dbg.log(
+                "车辆信息已设：carType=${carInfo.carType} " +
+                    "restriction=${carInfo.isRestriction} carNumber=${carInfo.carNumber}"
+            )
+        }.onFailure { e ->
+            Dbg.log("设置车辆信息失败（算路可能不避限行路段）：${e.message}")
+        }
     }
 
     override fun stop() {
@@ -438,5 +526,13 @@ class AmapNavController(
 
         /** 高德对没有正式名称的道路统一返回这个字符串 */
         const val UNNAMED_ROAD = "无名道路"
+
+        /**
+         * 等城市名解析出来的最长时间（毫秒）。
+         *
+         * 定位回调里坐标先到，城市名要靠地址反查，慢一拍。
+         * 不等的话城市偏置是 null，跨城市地名会解析错。
+         */
+        const val CITY_WAIT_MS = 3_000L
     }
 }
