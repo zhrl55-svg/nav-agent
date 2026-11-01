@@ -52,6 +52,9 @@ hicar-analysis/jadx_da.log
 *.zip
 minis-phone-ops.zip
 
+# 工具脚本的输出目录（gen_icons.py 等会往 res/ 下写，别把生成物当源码提交）
+nav-agent/tools/android/
+
 # ---------------------------------------------------------------------------
 # 调试截图
 # nav-agent/shot*.png 是 80+ 张 UI 调试截图（单张最大 1MB），是过程产物不是源码。
