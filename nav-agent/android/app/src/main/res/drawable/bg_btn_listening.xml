@@ -1,18 +1,32 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+  聆听态按钮。
+
+  ★ 底色必须和输入框一致（#16222E），否则整排按钮颜色不统一。
+    所以这里不用实心蓝底（原来是 #5B8FC9），改成「同底色 + 蓝色描边 + 外圈」，
+    视觉上能看出在聆听，但底色还是统一的。
+
+  外圈用负 inset 撑出边框，不改变按钮本身的尺寸和位置。
+-->
 <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
-    <!-- 底层声波环，通过 alpha 呼吸，不改变按钮尺寸与位置 -->
-    <item android:left="-5dp" android:top="-5dp" android:right="-5dp" android:bottom="-5dp">
+    <!-- 外圈：淡蓝描边 + 半透明填充，做「声波环」的呼吸效果 -->
+    <item android:left="-4dp" android:top="-4dp" android:right="-4dp" android:bottom="-4dp">
         <shape android:shape="rectangle">
             <solid android:color="#224A7BA7" />
-            <corners android:radius="18dp" />
-            <stroke android:width="2dp" android:color="#6B9CC8" />
+            <corners android:radius="22dp" />
+            <stroke
+                android:width="2dp"
+                android:color="#6B9CC8" />
         </shape>
     </item>
-    <item android:left="3dp" android:top="3dp" android:right="3dp" android:bottom="3dp">
+    <!-- 底层：和输入框完全一样的底色 -->
+    <item>
         <shape android:shape="rectangle">
-            <solid android:color="#5B8FC9" />
-            <corners android:radius="12dp" />
-            <stroke android:width="1dp" android:color="#B7D8F3" />
+            <solid android:color="#16222E" />
+            <corners android:radius="22dp" />
+            <stroke
+                android:width="1.5dp"
+                android:color="#7FB2DC" />
         </shape>
     </item>
 </layer-list>

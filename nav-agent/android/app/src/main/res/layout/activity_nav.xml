@@ -63,9 +63,10 @@
         </LinearLayout>
     </LinearLayout>
 
-    <!-- 底部：聊天浮层 + 状态 + 输入框 + 按钮。
+    <!-- 底部：状态 + 输入框 + 按钮。
          导航中唤醒聊天，回答不切页面 —— 地图不能离开视野，开车时也不看屏，主要靠 TTS。
-         输入框是为了不用说话也能发指令（旁边有人、或者语音识别不准的时候）。 -->
+         输入框是为了不用说话也能发指令（旁边有人、或者语音识别不准的时候）。
+         ★ 导航页不显示聊天内容（气泡浮层已移除），只在状态行显示一行提示。 -->
     <LinearLayout
         android:id="@+id/bottom_panel"
         android:layout_width="match_parent"
@@ -75,14 +76,6 @@
         android:elevation="10dp"
         android:orientation="vertical"
         android:padding="14dp">
-
-        <LinearLayout
-            android:id="@+id/chat_overlay"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginBottom="8dp"
-            android:orientation="vertical"
-            android:visibility="gone" />
 
         <TextView
             android:id="@+id/status"
@@ -121,15 +114,18 @@
                 android:layout_width="64dp"
                 android:layout_height="46dp"
                 android:layout_marginStart="8dp"
-                android:background="@drawable/bg_btn_primary"
+                android:background="@drawable/bg_input"
                     android:backgroundTint="@null"
                     android:stateListAnimator="@null"
                 android:text="@string/send"
-                android:textColor="#0E1620"
+                android:textColor="#E6EDF5"
                 android:textSize="13sp" />
         </LinearLayout>
 
-        <!-- 三个按钮等宽，别让任何一个被挤掉 -->
+        <!-- 五个按钮等宽，别让任何一个被挤掉。
+             「对话」进隐藏的 ChatActivity（看历史消息用），
+             「设置」进设置页 —— 2026-11-01 起设置入口从聊天页搬到了这里，
+             因为聊天页不再是主界面。 -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -141,51 +137,64 @@
                 android:layout_width="0dp"
                 android:layout_height="48dp"
                 android:layout_weight="1"
-                android:background="@drawable/bg_btn_primary"
+                android:background="@drawable/bg_input"
                     android:backgroundTint="@null"
                     android:stateListAnimator="@null"
                 android:text="◉ 语音"
-                android:textColor="#0E1620"
-                android:textSize="14sp" />
+                android:textColor="#E6EDF5"
+                android:textSize="13sp" />
 
             <Button
                 android:id="@+id/stop_nav"
                 android:layout_width="0dp"
                 android:layout_height="48dp"
-                android:layout_marginStart="8dp"
+                android:layout_marginStart="6dp"
                 android:layout_weight="1"
-                android:background="@drawable/bg_btn_danger"
+                android:background="@drawable/bg_input"
                     android:backgroundTint="@null"
                     android:stateListAnimator="@null"
                 android:text="@string/nav_stop"
-                android:textColor="#F2E4E4"
-                android:textSize="14sp" />
+                android:textColor="#E6EDF5"
+                android:textSize="13sp" />
 
             <Button
                 android:id="@+id/history_nav"
                 android:layout_width="0dp"
                 android:layout_height="48dp"
-                android:layout_marginStart="8dp"
+                android:layout_marginStart="6dp"
                 android:layout_weight="1"
-                android:background="@drawable/bg_btn_ghost"
-                android:backgroundTint="@null"
-                android:stateListAnimator="@null"
-                android:text="历史目的地"
+                android:background="@drawable/bg_input"
+                    android:backgroundTint="@null"
+                    android:stateListAnimator="@null"
+                android:text="历史"
                 android:textColor="#E6EDF5"
-                android:textSize="14sp" />
+                android:textSize="13sp" />
 
             <Button
                 android:id="@+id/back_to_chat"
                 android:layout_width="0dp"
                 android:layout_height="48dp"
-                android:layout_marginStart="8dp"
+                android:layout_marginStart="6dp"
                 android:layout_weight="1"
-                android:background="@drawable/bg_btn_ghost"
-                android:backgroundTint="@null"
-                android:stateListAnimator="@null"
-                android:text="@string/nav_back"
+                android:background="@drawable/bg_input"
+                    android:backgroundTint="@null"
+                    android:stateListAnimator="@null"
+                android:text="对话"
                 android:textColor="#E6EDF5"
-                android:textSize="14sp" />
+                android:textSize="13sp" />
+
+            <Button
+                android:id="@+id/nav_settings"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
+                android:layout_marginStart="6dp"
+                android:layout_weight="1"
+                android:background="@drawable/bg_input"
+                    android:backgroundTint="@null"
+                    android:stateListAnimator="@null"
+                android:text="设置"
+                android:textColor="#E6EDF5"
+                android:textSize="13sp" />
         </LinearLayout>
     </LinearLayout>
 

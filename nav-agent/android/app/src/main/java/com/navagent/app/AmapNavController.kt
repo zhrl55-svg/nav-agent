@@ -262,6 +262,30 @@ class AmapNavController(
         onHud(NavHud(navigating = false))
     }
 
+    /**
+     * 页面切走时暂停导航（**不是停止**）。
+     *
+     * ★ 为什么必须区分 pause 和 stop：
+     *   切到设置页或对话页只是临时离开，路线要留着，回来必须能继续。
+     *   `stopNavi()` 会把路线和目的地都清掉 —— 用户反馈的
+     *   「从聊天界面返回导航后前面的导航会消失」就是误用了 stop。
+     *
+     *   `pauseNavi()` 暂停语音播报和定位刷新，但路线还在，
+     *   配合 `resumeNavi()` 回来就接着走。
+     */
+    fun pauseNavigation() {
+        if (!navigating) return
+        runCatching { navi?.pauseNavi() }
+        Dbg.log("导航已暂停（路线保留）")
+    }
+
+    /** 从其他页面回来，恢复导航播报和定位刷新 */
+    fun resumeNavigation() {
+        if (!navigating) return
+        runCatching { navi?.resumeNavi() }
+        Dbg.log("导航已恢复")
+    }
+
     override val isNavigating: Boolean
         get() = navigating
 

@@ -262,11 +262,22 @@ class NavApp : Application() {
         val controller = nav
         val navigating = controller?.isNavigating == true
         lastNearby = null
-        return if (navigating && controller != null) {
+        return if (controller != null) {
+            // ★ 导航页已经活着（它是主界面，几乎总是这样），
+            //   直接用它的控制器算路。
+            //   以前这里会 startActivity 起一个新 Intent，导航页是 singleTop
+            //   所以 onNewIntent 会带着新目的地过来 —— 但那条路径要把整页
+            //   重建一遍，路线和地图状态全丢（用户反馈「返回后导航消失」）。
+            //   直接调控制器就没有这个问题。
             controller.navigateTo(cleanDest)
             destination = cleanDest
-            "正在改道去${cleanDest}（重新算路中，几秒后地图会更新）"
+            if (navigating) {
+                "正在改道去${cleanDest}（重新算路中，几秒后地图会更新）"
+            } else {
+                "正在导航去${cleanDest}（正在算路）"
+            }
         } else {
+            // 导航页还没起来（极少见：语音服务在但 Activity 不在）
             openNavigation(cleanDest)
             destination = cleanDest
             "正在打开导航去${cleanDest}（正在算路）"

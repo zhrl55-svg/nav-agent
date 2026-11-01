@@ -121,11 +121,46 @@ class VoskWake(modelDir: File, private val wakeWords: List<String>) : WakeWord {
             // 加 grammar 之后它对任何语音都只吐 {"partial":"[unk]"}，
             // 等于把唤醒彻底废掉。必须自由解码，靠下面的模糊匹配兜。
             rec = Recognizer(model, AudioCapture.SAMPLE_RATE.toFloat())
+            warmup()
             ready = true
             Dbg.log("vosk 唤醒就绪（自由解码），唤醒词=$wakeWords")
         } catch (t: Throwable) {
             Dbg.log("vosk 加载失败 ${t.javaClass.simpleName}: ${t.message}")
             ready = false
+        }
+    }
+
+    /**
+     * ★ 热身：识别器建好后先喂一段静音。
+     *
+     * 为什么必须热身（实测踩过）：
+     *   vosk 的解码器刚 new 出来时内部状态是空的，前几秒解码质量极差 ——
+     *   实测首次进入应用后头几秒喊「小度」，日志里听到的是「和」「之」「有不对」
+     *   这种完全不相干的碎片；而点一下语音按钮就好了。
+     *
+     *   原因不是唤醒逻辑有问题，而是**解码器没进入稳定态**。
+     *   点按钮会走 `wakeManually()` → `wake.reset()`，reset 顺手把解码状态清了，
+     *   之后进入的是正常状态 —— 所以「点一下就好了」。
+     *
+     *   喂静音同样能触发 reset + 让解码器跑起来，达到同样的效果。
+     *   1 秒静音 = 50 帧，够解码器稳定。
+     */
+    private fun warmup() {
+        val r = rec ?: return
+        val silence = ShortArray(AudioCapture.FRAME_SAMPLES)
+        try {
+            for (i in 0 until WARMUP_FRAMES) {
+                r.acceptWaveForm(silence, silence.size)
+                // ★ Kotlin 属性语法，对应 Java 的 getPartialResult() / getResult()
+                r.partialResult
+                r.result
+            }
+            r.reset()
+            framesSinceReset = 0
+            resetWindow()
+            Dbg.log("vosk 热身完成（${WARMUP_FRAMES} 帧静音）")
+        } catch (t: Throwable) {
+            Dbg.log("vosk 热身异常 ${t.javaClass.simpleName}: ${t.message}")
         }
     }
 
@@ -275,6 +310,15 @@ class VoskWake(modelDir: File, private val wakeWords: List<String>) : WakeWord {
     /**
      * 连续无声调拼音的有界近似匹配：预期串必须至少 4 音素，允许最多 1 个编辑错误，
      * 且命中片段要与识别窗口末尾相邻。这样「小度」的度/都混淆可过，单个「小」不会误唤醒。
+     *
+     * ★ 首音节必须是「同声母或近似声母」，否则会误唤醒。
+     *   实测「角度 jiaodu」被当成「小度 xiaodu」命中 —— 两者只差首字母 j/x，
+     *   编辑距离 1 就过了。但 j- 和 x- 声母完全不同，
+     *   「角度」「加油」「街道」都会误触发。
+     *
+     *   规则：首音节的前两个字母（声母）必须相同，或属于常见的近似对
+     *   （zh/z、ch/c、sh/s、n/l、f/h、r/l）。这样 xiaodu 只有 x- 开头的词能匹配，
+     *   jiaodu 匹配不上。
      */
     private fun approximateMatch(actual: String, expected: String): String? {
         if (expected.length < MIN_WAKE_PHONEMES) return null
@@ -286,10 +330,37 @@ class VoskWake(modelDir: File, private val wakeWords: List<String>) : WakeWord {
             val start = endAt - length
             if (start < startAt) continue
             val sample = actual.substring(start, endAt)
+            // 声母检查放在编辑距离之前 —— 不合格就不用再比了
+            if (!sameInitials(sample, expected)) continue
             if (editDistanceAtMostOne(sample, expected)) return sample
         }
         return null
     }
+
+    /**
+     * 首音节声母是否相同或近似。
+     *
+     * 只看前两个字母（中文拼音的声母基本就是前 1~2 个字母）。
+     * 拿不到声母（比如以元音开头，单字母）就放宽为 true，
+     * 交给后面的编辑距离判断 —— 不能因为取不到就全拒。
+     */
+    private fun sameInitials(a: String, b: String): Boolean {
+        if (a.isEmpty() || b.isEmpty()) return true
+        val ia = initialOf(a)
+        val ib = initialOf(b)
+        if (ia.isEmpty() || ib.isEmpty()) return true
+        if (ia == ib) return true
+        // 近似声母对：这些混淆在中文语音识别里非常常见
+        return NEAR_INITIALS.any { pair ->
+            val x = pair.first
+            val y = pair.second
+            (ia == x && ib == y) || (ia == y && ib == x)
+        }
+    }
+
+    /** 取前两个字母当声母 */
+    private fun initialOf(pinyin: String): String =
+        if (pinyin.length >= 2) pinyin.substring(0, 2) else pinyin
 
     /** 两字符串编辑距离是否 ≤ 1；长度通常 8～12，直接线性检查即可 */
     private fun editDistanceAtMostOne(a: String, b: String): Boolean {
@@ -390,6 +461,25 @@ class VoskWake(modelDir: File, private val wakeWords: List<String>) : WakeWord {
     private companion object {
         /** 20ms 一帧，750 帧 = 15 秒 */
         const val RESET_EVERY_FRAMES = 750
+
+        /** 热身帧数：50 帧 × 20ms = 1 秒静音 */
+        const val WARMUP_FRAMES = 50
+
+        /**
+         * 近似声母对 —— 这些混淆在中文语音识别里很常见，
+         * 允许它们互相匹配（否则「小度」识别成「小杜」就匹配不上了）。
+         *
+         * 注意：j/x **不在**这个列表里。实测「角度 jiaodu」被当成「小度 xiaodu」
+         * 误唤醒，就是因为 j- 和 x- 被当成了近似。
+         */
+        val NEAR_INITIALS = listOf(
+            "zh" to "z",
+            "ch" to "c",
+            "sh" to "s",
+            "n" to "l",
+            "f" to "h",
+            "r" to "l"
+        )
 
         /** 窗口过期：3 秒没新内容就清空，避免老字残留造成误唤醒 */
         const val WINDOW_MS = 3_000L

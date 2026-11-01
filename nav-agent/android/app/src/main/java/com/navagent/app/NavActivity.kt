@@ -44,10 +44,8 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
     private lateinit var hudStep: TextView
     private lateinit var hudRoad: TextView
     private lateinit var hudRemain: TextView
-    private lateinit var overlay: LinearLayout
     private lateinit var nav: AmapNavController
 
-    private val bubbles = ArrayDeque<TextView>()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -110,7 +108,6 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
         hudStep = findViewById(R.id.hud_step)
         hudRoad = findViewById(R.id.hud_road)
         hudRemain = findViewById(R.id.hud_remain)
-        overlay = findViewById(R.id.chat_overlay)
 
         // TTS 是 Application 级单例，导航播报和聊天回复共用一条队列
         nav = AmapNavController(
@@ -139,6 +136,10 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
         }
         findViewById<Button>(R.id.stop_nav).setOnClickListener { toggleNavigation() }
         findViewById<Button>(R.id.history_nav).setOnClickListener { chooseNavigationHistory() }
+        // 设置入口：2026-11-01 从聊天页搬到这里（聊天页不再是主界面）
+        findViewById<Button>(R.id.nav_settings).setOnClickListener {
+            SettingsActivity.start(this)
+        }
 
         // 打字发指令：旁边有人、或者语音识别不准时用
         findViewById<Button>(R.id.send).setOnClickListener { submitInput() }
@@ -150,6 +151,7 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
 
         if (hasLocationPermission()) {
             nav.start()
+            startVoiceService()
             if (intent?.getStringExtra(EXTRA_DEST).isNullOrBlank()) {
                 status.text = "地图已打开 · 说个目的地就开始导航"
             } else {
@@ -166,6 +168,20 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
                 REQ_PERMS
             )
         }
+    }
+
+    /**
+     * 启动语音前台服务。
+     *
+     * ★ 2026-11-01 起导航页是主界面，所以语音服务由这里负责拉起
+     *   （以前是聊天页负责的）。唤醒词必须从一打开应用就能用。
+     *
+     * 缺 RECORD_AUDIO 权限时 startForeground 会失败，捕获掉即可 ——
+     * 定位和地图不受影响，用户点语音按钮时再申请。
+     */
+    private fun startVoiceService() {
+        runCatching { VoiceService.start(this) }
+            .onFailure { Dbg.log("语音服务启动失败：${it.message}") }
     }
 
     /**
@@ -305,9 +321,14 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
     private fun updateNavButton(navigating: Boolean) {
         val b = findViewById<Button>(R.id.stop_nav)
         b.text = getString(if (navigating) R.string.nav_stop else R.string.nav_start)
-        // 整块换 drawable，不能再用 backgroundTint —— 那样会把圆角盖掉
-        b.setBackgroundResource(
-            if (navigating) R.drawable.bg_btn_danger else R.drawable.bg_btn_primary
+        // ★ 底色统一用 bg_input（跟输入框和其他按钮一样）。
+        //   状态区分靠**文字颜色**：停止导航时用红色字，一眼能看出是「停止」；
+        //   开始导航时用普通浅色字。
+        //   整块换 drawable，不能用 backgroundTint —— 那样会把圆角盖掉。
+        b.setBackgroundResource(R.drawable.bg_input)
+        b.setTextColor(
+            if (navigating) android.graphics.Color.parseColor("#F09595")
+            else android.graphics.Color.parseColor("#E6EDF5")
         )
     }
 
@@ -339,6 +360,8 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
         if (requestCode != REQ_PERMS) return
         if (hasLocationPermission()) {
             nav.start()
+            // 语音服务也在这里补启动 —— 首次安装时权限是弹窗后才有的
+            startVoiceService()
             consumeDest(intent)
         } else {
             status.text = "没有定位权限，导航不可用"
@@ -392,16 +415,25 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
 
     // ---------------------------------------------------------------- 聊天浮层
 
+    /**
+     * 导航页**不显示聊天内容**（用户要求：导航界面只做语音播报）。
+     *
+     * 开车时看屏幕的注意力本来就不该被文字气泡拉走，导航界面要的是干净。
+     * 聊天内容在聊天页看；导航页要问什么就直接说，回答靠 TTS 播报。
+     *
+     * 这里保留空实现（接口必须实现），不往上屏任何东西。
+     * 「我：xxx」和「助手：xxx」都吞掉。
+     */
     override fun onUser(text: String) {
-        runOnUiThread { addBubble("我：$text", "#B8CDE0") }
+        // 导航页不显示聊天内容
     }
 
     override fun onAssistantDelta(text: String) {
-        // 流式增量不逐字刷浮层，等 onAssistantDone 一次到位，避免地图上跳字
+        // 导航页不显示聊天内容
     }
 
     override fun onAssistantDone(full: String) {
-        runOnUiThread { addBubble("${Prefs.aiName}：$full", "#E6EDF5") }
+        // 导航页不显示聊天内容，答案由 TTS 播报
     }
 
     override fun onVoiceState(state: VoiceEngine.State, hint: String) {
@@ -418,19 +450,22 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
             VoiceEngine.State.LISTENING -> {
                 talk.text = getString(R.string.mic_listening)
                 talk.alpha = 1f
+                // ★ 底色统一用 bg_input（跟输入框一致），但聆听态要能看出来，
+                //   所以用 bg_btn_listening 那个双层蓝框 —— 它是描边样式，
+                //   不会破坏底色统一。
                 talk.setBackgroundResource(R.drawable.bg_btn_listening)
                 startTalkPulse(talk)
             }
 
             VoiceEngine.State.THINKING -> {
                 talk.text = getString(R.string.mic_thinking)
-                talk.setBackgroundResource(R.drawable.bg_btn_primary)
+                talk.setBackgroundResource(R.drawable.bg_input)
                 stopTalkPulse(talk)
             }
 
             VoiceEngine.State.ASLEEP -> {
                 talk.text = "◉ 语音"
-                talk.setBackgroundResource(R.drawable.bg_btn_primary)
+                talk.setBackgroundResource(R.drawable.bg_input)
                 stopTalkPulse(talk)
             }
         }
@@ -461,30 +496,15 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
-    private fun addBubble(text: String, color: String) {
-        val tv = TextView(this).apply {
-            this.text = text
-            setTextColor(android.graphics.Color.parseColor(color))
-            textSize = 14f
-            setPadding(dp(10), dp(8), dp(10), dp(8))
-            background = android.graphics.drawable.GradientDrawable().apply {
-                shape = android.graphics.drawable.GradientDrawable.RECTANGLE
-                cornerRadius = dp(14).toFloat()
-                setColor(android.graphics.Color.parseColor("#CC1C2A38"))
-                setStroke(dp(1), android.graphics.Color.parseColor("#334A6B8F"))
-            }
-        }
-        overlay.addView(tv)
-        bubbles.addLast(tv)
-        while (bubbles.size > MAX_BUBBLES) {
-            overlay.removeView(bubbles.removeFirst())
-        }
-        overlay.visibility = View.VISIBLE
-    }
-
+    /**
+     * 设置页启动：返回后要刷新语音状态（设置里可能改了唤醒词等）。
+     */
     override fun onResume() {
         super.onResume()
         naviView.onResume()
+        // ★ 恢复导航：暂停期间高德会停止播报和定位刷新，
+        //   不 resume 的话回来是「有路线但不播报」的死状态。
+        nav.resumeNavigation()
         app.addChatUi(this)
         app.addVoiceUi(this)
         app.refreshVoiceUi(this)
@@ -495,6 +515,8 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
     override fun onPause() {
         super.onPause()
         naviView.onPause()
+        // ★ 只暂停，不 stop —— 路线要留着，回来才能接着走。
+        nav.pauseNavigation()
         app.removeChatUi(this)
         app.removeVoiceUi(this)
     }
@@ -519,6 +541,5 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
         const val EXTRA_SAY = "say"
         private const val REQ_PERMS = 1002
         private const val FIX_TIMEOUT_MS = 60_000L
-        private const val MAX_BUBBLES = 3
     }
 }

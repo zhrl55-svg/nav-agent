@@ -71,25 +71,42 @@
             android:enabled="true"
             android:exported="false" />
 
-        <!-- 主界面：AI 聊天。导航是从这里说一句话打开的页面，不是入口 -->
+        <!--
+          主界面：导航页。2026-11-01 起改为单界面架构 —— 全程语音，
+          不再有专门的聊天界面，导航页就是唯一的操作面。
+
+          为什么主界面是导航页而不是聊天页：
+          用户明确要求「直接不要聊天界面，聊天全程语音」。
+          导航页本来就有地图、语音按钮和输入框，功能是聊天页的超集。
+
+          LAUNCHER 只能有一个，所以 ChatActivity 那边移掉了 intent-filter。
+        -->
         <activity
-            android:name=".ChatActivity"
+            android:name=".NavActivity"
             android:exported="true"
             android:launchMode="singleTop"
-            android:screenOrientation="portrait"
-            android:windowSoftInputMode="adjustResize">
+            android:screenOrientation="portrait">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
 
-        <!-- 导航页 -->
+        <!--
+          聊天页：保留但不可见（2026-11-01 起不再是主界面）。
+
+          为什么留着不删：
+          万一用户想看历史对话、或者语音识别不准想打字核对，
+          还能从导航页进得来。纯语音模式出问题就没有退路了。
+
+          它没有 LAUNCHER intent-filter，所以桌面点图标不会进这个页面。
+        -->
         <activity
-            android:name=".NavActivity"
+            android:name=".ChatActivity"
             android:exported="true"
             android:launchMode="singleTop"
-            android:screenOrientation="portrait" />
+            android:screenOrientation="portrait"
+            android:windowSoftInputMode="adjustResize" />
 
         <!-- 设置页：唤醒词 / 模型 / 播报 / 诊断 -->
         <activity
