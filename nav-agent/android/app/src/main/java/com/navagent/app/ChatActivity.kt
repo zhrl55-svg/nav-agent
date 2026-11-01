@@ -231,19 +231,27 @@ class ChatActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
             VoiceEngine.State.LISTENING -> {
                 mic.text = getString(R.string.mic_listening)
                 mic.alpha = 1f
-                mic.setBackgroundResource(R.drawable.bg_btn_listening)
+                // ★ 用对话页专用的明亮聆听样式（bg_mic_listening）。
+                //   不能用导航页那个 bg_btn_listening —— 那个是「深底+描边」，
+                //   为了跟导航页统一后的输入框底色配套，套到对话页的深色背景上
+                //   几乎看不见（用户反馈「聆听中是暗色，显示不明显」）。
+                mic.setBackgroundResource(R.drawable.bg_mic_listening)
+                // 亮底必须配深字，不然白字压在亮蓝上反而看不清
+                mic.setTextColor(android.graphics.Color.parseColor("#0E1620"))
                 startMicPulse(mic)
             }
 
             VoiceEngine.State.THINKING -> {
                 mic.text = getString(R.string.mic_thinking)
                 mic.setBackgroundResource(R.drawable.bg_btn_primary)
+                mic.setTextColor(android.graphics.Color.parseColor("#0E1620"))
                 stopMicPulse(mic)
             }
 
             VoiceEngine.State.ASLEEP -> {
                 mic.text = "◉ 语音"
                 mic.setBackgroundResource(R.drawable.bg_btn_primary)
+                mic.setTextColor(android.graphics.Color.parseColor("#0E1620"))
                 stopMicPulse(mic)
             }
         }

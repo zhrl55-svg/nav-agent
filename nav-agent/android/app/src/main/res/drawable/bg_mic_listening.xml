@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  对话页的聆听态按钮（明亮版）。
+
+  ★ 为什么单独做一个，不复用 bg_btn_listening：
+    对话页的按钮平时是实心蓝底（bg_btn_primary，#4A7BA7），
+    而 bg_btn_listening 是给导航页用的「深底+描边」样式（跟统一后的输入框底色配套）。
+    套到对话页上，深底压在深背景里几乎看不见 —— 用户反馈过「聆听中是暗色，显示不明显」。
+
+  所以这里做成**亮底高对比**：亮蓝填充 + 白字 + 外圈白边，
+  在深色聊天背景上一眼就能看到。
+
+  外圈用负 inset 撑出，不改变按钮本身的尺寸和位置。
+-->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- 外圈：白色描边，做「声波环」的呼吸感 -->
+    <item android:left="-4dp" android:top="-4dp" android:right="-4dp" android:bottom="-4dp">
+        <shape android:shape="rectangle">
+            <solid android:color="#4D7FB2DC" />
+            <corners android:radius="16dp" />
+            <stroke
+                android:width="2dp"
+                android:color="#B7D8F3" />
+        </shape>
+    </item>
+    <!-- 主体：亮蓝实底，比平时的 #4A7BA7 更亮一档 -->
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="#6FA8DC" />
+            <corners android:radius="14dp" />
+        </shape>
+    </item>
+</layer-list>

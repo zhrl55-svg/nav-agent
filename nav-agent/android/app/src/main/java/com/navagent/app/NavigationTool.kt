@@ -24,18 +24,21 @@ class NavigationTool(
     private val stop: () -> String,
     private val openMap: () -> String,
     /** 模型没给目的地时，用上一次周边搜索的结果兜底 */
-    private val lastNearbyName: () -> String?
+    private val lastNearbyName: () -> String?,
+    /** 用户要求助手别打扰时，主动休眠 */
+    private val sleep: () -> String = { "当前不支持休眠" }
 ) : LlmTool {
 
     override val name = "navigate"
 
     override val description =
         "导航控制。用户要去某个地方、改去别处、停止导航、只打开地图时调用。\n" +
-            "用户说「去X」「导航到X」「带我去X」「改去X」「回刚才那个地方」「就去这家」都算 navigate。"
+            "用户说「去X」「导航到X」「带我去X」「改去X」「回刚才那个地方」「就去这家」都算 navigate。\n" +
+            "用户说「你休息吧」「你先休息吧」「不要打扰我」「你先不要打扰我」「安静点」这类要你闭嘴的，调用 action=sleep。"
 
     override fun parametersJson(): String = """
         {"type":"object","properties":{
-          "action":{"type":"string","enum":["navigate","stop","open_map"],"description":"navigate=导航去某地；stop=停止/结束导航；open_map=只打开地图不算路"},
+          "action":{"type":"string","enum":["navigate","stop","open_map","sleep"],"description":"navigate=导航去某地；stop=停止/结束导航；open_map=只打开地图不算路；sleep=用户要求你别打扰，进入休眠"},
           "destination":{"type":"string","description":"目的地地名。action=navigate 时必填。照用户原话写，**保留省市县这类行政区划**（如「景泰县条山路金星家园」），不要自己简化"}
         },"required":["action"]}
     """.trimIndent()
@@ -58,6 +61,7 @@ class NavigationTool(
 
             "stop" -> stop()
             "open_map" -> openMap()
+            "sleep" -> sleep()
             else -> "不认识的 action：${obj.optString("action")}"
         }
     }

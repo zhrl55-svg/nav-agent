@@ -182,6 +182,50 @@ class VoiceEngine(private val context: Context) {
         setState(State.ASLEEP)
     }
 
+    /**
+     * 播报完再休眠。
+     *
+     * ★ 为什么不能直接 sleep()：
+     *   用户说「你休息吧」，模型会回一句「好的，我休息了」并用 TTS 播出来。
+     *   如果工具执行时立刻 sleep，TTS 还在播，声音会被麦克风收进去 ——
+     *   半双工下这会导致刚播完又被自己的声音触发一轮识别，
+     *   甚至被 VAD 切成新的一句话送去 ASR。
+     *
+     *   所以这里等播报彻底结束（isSpeakingProvider() 变 false 且过了回声保护期），
+     *   再真正进入 ASLEEP。
+     */
+    fun sleepAfterSpeaking() {
+        main.post {
+            waitSpeakingThenSleep(0)
+        }
+    }
+
+    /**
+     * 轮询等播报结束。
+     *
+     * @param attempt 已经等了多少次（每次 150ms，最多约 15 秒）
+     */
+    private fun waitSpeakingThenSleep(attempt: Int) {
+        val speaking = isSpeakingProvider()
+        if (speaking) {
+            if (attempt >= MAX_WAIT_SPEAKING) {
+                // 等太久了，直接睡，别让用户干等
+                Dbg.log("等待播报结束超时，强制休眠")
+                doSleep()
+                return
+            }
+            main.postDelayed({ waitSpeakingThenSleep(attempt + 1) }, WAIT_SPEAKING_STEP_MS)
+            return
+        }
+        // 播报刚结束，回声尾巴还在，等一小会儿再睡，避免收进自己的声音
+        main.postDelayed({ doSleep() }, POST_SPEAK_GUARD_MS)
+    }
+
+    private fun doSleep() {
+        Dbg.log("播报结束，进入休眠")
+        sleep()
+    }
+
     // ---------------------------------------------------------------- 内部
 
     private fun onFrame(frame: ShortArray, len: Int) {
@@ -368,5 +412,14 @@ class VoiceEngine(private val context: Context) {
 
         /** 20ms 一帧，1500 帧 = 30 秒 */
         const val HEARTBEAT_FRAMES = 1500L
+
+        /** 等待播报结束的轮询间隔 */
+        const val WAIT_SPEAKING_STEP_MS = 150L
+
+        /** 最多等这么久（15 秒）还没播完就强制休眠 */
+        const val MAX_WAIT_SPEAKING = 100
+
+        /** 播报结束后的额外等待，等回声尾巴散掉 */
+        const val POST_SPEAK_GUARD_MS = 800L
     }
 }

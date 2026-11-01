@@ -50,6 +50,15 @@ class NavApp : Application() {
     @Volatile
     var voiceStateSnapshotProvider: (() -> Pair<VoiceEngine.State, String>)? = null
 
+    /**
+     * 语音引擎引用。由 [VoiceService] 挂上。
+     *
+     * 工具层要用它做「主动休眠」（用户说「你休息吧」时）。
+     * 有了这个就不用绕 ACTION_SLEEP 的 Intent 通路。
+     */
+    @Volatile
+    var voiceEngineProvider: (() -> VoiceEngine)? = null
+
     interface ChatUi {
         fun onUser(text: String)
         fun onAssistantDelta(text: String)
@@ -130,7 +139,8 @@ class NavApp : Application() {
                         navigateTo = ::toolNavigate,
                         stop = ::toolStop,
                         openMap = ::toolOpenMap,
-                        lastNearbyName = { freshNearby()?.name }
+                        lastNearbyName = { freshNearby()?.name },
+                        sleep = ::toolSleep
                     ),
                     WeatherTool { nav?.currentCity },
                     NearbyTool(
@@ -291,6 +301,28 @@ class NavApp : Application() {
         // 故意不清 destination —— 底部按钮会变成「开始导航」，点一下能接着走，
         // 不用再让用户说一遍地名
         return "导航已停止。目的地还记着，之后说继续或者点「开始导航」就能接着走"
+    }
+
+    /**
+     * 主动休眠。
+     *
+     * 用户说「你休息吧」「你先休息吧」「不要打扰我」「你先不要打扰我」这类，
+     * 模型会调这个动作。
+     *
+     * ★ 时序很关键：不能立刻休眠。
+     *   模型调用工具后还会生成回复（「好的，我休息了」），要用 TTS 播出来。
+     *   如果这时就休眠，TTS 的声音会被麦克风收进去 ——
+     *   半双工下自己的播报会被当成用户说话，可能又触发一轮识别。
+     *   所以走 [VoiceEngine.sleepAfterSpeaking]：等播报彻底结束再进 ASLEEP。
+     */
+    private fun toolSleep(): String {
+        val engine = voiceEngineProvider?.invoke()
+        if (engine == null) {
+            return "语音服务没启动，无法休眠"
+        }
+        engine.sleepAfterSpeaking()
+        Dbg.log("用户要求休息，进入休眠")
+        return "用户要求不要打扰，已进入休眠。等他说唤醒词再继续。"
     }
 
     private fun toolOpenMap(): String {

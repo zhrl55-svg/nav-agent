@@ -39,6 +39,9 @@ class VoiceService : Service() {
         super.onCreate()
         engine = VoiceEngine(this)
         (application as NavApp).voiceStateSnapshotProvider = { engine.stateSnapshot() }
+        // 引擎引用挂到 Application 上，工具层（主动休眠）要用。
+        // 有了这个就不用绕 ACTION_SLEEP 那条 Intent 通路，也不用等 Intent 派发。
+        (application as NavApp).voiceEngineProvider = { engine }
         // 声纹门禁：每次用时从 Application 取（模型可能是后台下载完才挂上的）
         engine.voiceprintProvider = { (application as NavApp).voiceprintGate }
 
