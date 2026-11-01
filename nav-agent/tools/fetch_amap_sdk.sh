@@ -32,13 +32,15 @@ echo "解压…"
 unzip -o -q "$TMP/sdk.zip" -d "$TMP"
 unzip -o -q "$TMP/AMap3DMap_AMapNavi_AMapSearch_AMapLocation.zip" -d "$TMP"
 
-mkdir -p "$OUT/arm64-v8a" "$OUT/armeabi-v7a"
+mkdir -p "$OUT/arm64-v8a"
 cp "$TMP/$JAR_NAME" "$OUT/"
+# ★ 只取 arm64-v8a —— armeabi-v7a 的 so 有 64MB，app 的 abiFilters 已经砍掉 32 位了。
+#   需要支持 32 位老设备时，把下面这行加回来并同步改 app/build.gradle.kts 的 abiFilters：
+#     cp "$TMP"/armeabi-v7a/*.so "$OUT/armeabi-v7a/"
 cp "$TMP"/arm64-v8a/*.so "$OUT/arm64-v8a/"
-cp "$TMP"/armeabi-v7a/*.so "$OUT/armeabi-v7a/"
 
 echo "完成："
 ls -la "$OUT/$JAR_NAME"
-echo "  so: $(ls "$OUT"/arm64-v8a/*.so | wc -l) 个 (arm64-v8a) + $(ls "$OUT"/armeabi-v7a/*.so | wc -l) 个 (armeabi-v7a)"
+echo "  so: $(ls "$OUT"/arm64-v8a/*.so | wc -l) 个 (arm64-v8a)"
 echo
 echo "下次构建直接跑 gradle 即可（core/build.gradle.kts 会引用这些文件）。"

@@ -249,11 +249,22 @@ class AmapNavController(
             latitude = point.latitude
             longitude = point.longitude
         }
+        val strategy = PathPlanningStrategy.DRIVING_MULTIPLE_ROUTES_DEFAULT
+        Dbg.log("算路策略 = $strategy (DRIVING_MULTIPLE_ROUTES_DEFAULT=10)")
         val ok = n.calculateDriveRoute(
             listOf(start),
             listOf(end),
             null,
-            PathPlanningStrategy.DRIVING_DEFAULT
+            // ★ 用官方推荐的策略，不要用 DRIVING_DEFAULT。
+            //
+            //   官方文档（V11.3.100 API Doc · PathPlanningStrategy）原文：
+            //     「DRIVING_DEFAULT —— **已过时**。推荐使用
+            //       PathPlanningStrategy.DRIVING_MULTIPLE_ROUTES_DEFAULT」
+            //     「DRIVING_MULTIPLE_ROUTES_DEFAULT —— 多路径-速度优先+躲避拥堵+距离较短，
+            //       **建议使用该策略**，策略值 10」
+            //
+            //   多路径会同时返回若干条备选路线，SDK 默认取第一条。
+            strategy
         )
         Dbg.log("calculateDriveRoute 返回=$ok")
         post {
@@ -426,6 +437,22 @@ class AmapNavController(
             val path = n.naviPath
             pathRemainSeconds = path?.allTime ?: 0
             pathRemainMeters = path?.allLength ?: 0
+
+            // ★ 路线诊断：打出每段走哪条路。
+            //   路线跟高德 App 不一致时，靠这个直接看是「走的路不同」还是「起终点不同」。
+            //   （路名在 step 的 links 里 —— AMapNaviStep 自己没有 roadName 字段。）
+            runCatching {
+                path?.steps?.forEachIndexed { i, s ->
+                    if (i < 8) {
+                        val road = s.links?.mapNotNull { it.roadName }
+                            ?.filter { it.isNotBlank() }
+                            ?.distinct()
+                            ?.joinToString(" → ")
+                            ?: "（无名道路）"
+                        Dbg.log("  段$i (${s.length}m): $road")
+                    }
+                }
+            }.onFailure { Dbg.log("路径诊断失败：${it.message}") }
 
             // ★ 已经在导航时改道重算，startNavi 会返回 false（因为导航没停）。
             //   如果直接把 navigating 赋成返回值，就会把自己标成"没在导航"，
