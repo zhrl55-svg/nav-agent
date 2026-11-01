@@ -1,13 +1,17 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  应用图标的前景层：导航箭头。
+  应用图标的前景层：朝上的定位箭头（Navigation Arrow）。
 
-  自适应图标（Adaptive Icon）的结构：
-    背景层 = 纯色方框（ic_launcher_background）
-    前景层 = 这个箭头
-  系统会把前景缩放到中间 72/108 的安全区内，所以箭头要留够边距。
+  ★ 为什么不用「折角」造型：
+    折角（像一张翻起来的地图）本身就有立体方块的感觉，
+    再叠加 EMUI 对自适应图标前景的立体化处理，整个图标就变成了立方体 ——
+    用户一眼看不出是导航 app（实测踩过）。
 
-  坐标按 108x108 设计，实际显示只有中间 66x66 左右。
+  改成最经典、最高度可辨识的「纸飞机式定位箭头」：
+    一个尖朝上的水滴箭头 + 中间的圆孔，一眼就知道是导航/定位。
+
+  坐标按 108x108 设计。自适应图标的安全区是中间 72x108，
+  实际可见约 66x66，所以图形要留够边距，别贴边。
 -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
@@ -15,22 +19,13 @@
     android:viewportWidth="108"
     android:viewportHeight="108">
 
-    <!-- 导航箭头：经典的纸质地图折角造型 -->
+    <!-- 箭头主体：尖朝上，底边圆润的水滴形 -->
     <path
         android:fillColor="#FFFFFF"
-        android:pathData="M54,28 L76,38 L54,48 L32,38 Z" />
+        android:pathData="M54,30 C54,30 75,51 75,65 C75,76.5 65.6,85 54,85 C42.4,85 33,76.5 33,65 C33,51 54,30 54,30 Z" />
 
-    <!-- 箭头主体（向下的折角） -->
+    <!-- 中间的孔（用背景色的圆挖出来，这里直接画深色圆） -->
     <path
-        android:fillColor="#E8F2FB"
-        android:pathData="M54,28 L54,48 L76,38 Z" />
-
-    <!-- 中间分隔线 -->
-    <path
-        android:fillColor="#4A7BA7"
-        android:pathData="M32,38 L54,48 L54,80 L32,70 Z" />
-
-    <path
-        android:fillColor="#B8D4EE"
-        android:pathData="M54,48 L76,38 L76,70 L54,80 Z" />
+        android:fillColor="#3E7CB4"
+        android:pathData="M54,63 m-10,0 a10,10 0 1,0 20,0 a10,10 0 1,0 -20,0 Z" />
 </vector>

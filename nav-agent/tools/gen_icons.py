@@ -11,9 +11,18 @@
     PNG 就是 zlib 压缩的扫描线，纯标准库就能写。
 
 图案：
-    深蓝渐变方框 + 白色导航箭头（跟自适应图标前景一致）
+    亮蓝灰渐变方框 + 白色朝上的定位箭头（跟自适应图标前景一致）
+
+★ 为什么是「朝上的定位箭头」而不是折角：
+    折角造型本身就像立体方块，叠加 EMUI 的前景立体化后整个图标变成立方体，
+    完全看不出是导航 app（实测踩过）。定位箭头最高度可辨识。
+
+★ 为什么底色比应用界面亮：
+    桌面壁纸通常也是深色的，图标底色太深会跟壁纸糊在一起（用户反馈「底色太深」）。
+    图标跟应用界面不必完全同色 —— 图标要的是「在桌面上能一眼找到」。
 """
 
+import math
 import os
 import struct
 import zlib
@@ -32,13 +41,11 @@ DENSITIES = {
     "mipmap-xxxhdpi": 192,
 }
 
-# 配色（跟应用界面统一）
-BG_TOP = (0x1B, 0x30, 0x40)       # #1B3040
-BG_BOTTOM = (0x0E, 0x16, 0x20)    # #0E1620
+# 配色：亮蓝灰渐变（比应用界面亮，保证深色壁纸上能跳出来）
+BG_TOP = (0x6B, 0xAE, 0xE0)       # #6BAEE0
+BG_BOTTOM = (0x2F, 0x6F, 0xA8)    # #2F6FA8
 FG_WHITE = (0xFF, 0xFF, 0xFF)
-FG_LIGHT = (0xE8, 0xF2, 0xFB)
-FG_MID = (0xB8, 0xD4, 0xEE)
-FG_DARK = (0x4A, 0x7B, 0xA7)
+FG_HOLE = (0x3E, 0x7C, 0xB4)      # 箭头中间的孔
 
 
 def lerp(a, b, t):
@@ -94,24 +101,15 @@ def point_in_polygon(px, py, poly):
 
 
 def build_icon(size):
-    """按 108x108 的坐标系画，再缩放到 size"""
+    """按 108x108 的坐标系画朝上的定位箭头，再缩放到 size"""
     S = 108.0
     k = size / S
 
-    # 箭头在 108 坐标系里的顶点（对应 ic_launcher_foreground.xml）
-    top_l = (54, 28)
-    top_r = (76, 38)
-    mid_l = (32, 38)
-    mid_c = (54, 48)
-    bot_l = (32, 70)
-    bot_c = (54, 80)
-    bot_r = (76, 70)
-
-    # 四个面（用多边形，箭头是折角造型，不是单纯的三角形）
-    face_a = [top_l, mid_c, bot_c, bot_l]        # 左下深色
-    face_b = [top_l, top_r, mid_c]              # 上三角（白）
-    face_c = [top_r, bot_r, bot_c, mid_c]        # 右下浅色
-    face_d = [mid_c, bot_c, bot_r]              # 中间浅色三角
+    # 箭头参数（对应 ic_launcher_foreground.xml）
+    tip_x, tip_y = 54.0, 30.0     # 尖（朝上）
+    cx, cy = 54.0, 65.0           # 圆心
+    r = 21.0                      # 下半圆的半径
+    hole_r = 10.0                 # 中间孔的半径
 
     rows = []
     for y in range(size):
@@ -119,21 +117,33 @@ def build_icon(size):
         for x in range(size):
             px = (x + 0.5) / k
             py = (y + 0.5) / k
+
             # 背景：斜向渐变
             t = min(1.0, max(0.0, (px + py) / (2 * S)))
             color = lerp(BG_TOP, BG_BOTTOM, t)
-            alpha = 255
 
-            if point_in_polygon(px, py, face_b):
-                color = FG_WHITE
-            elif point_in_polygon(px, py, face_a):
-                color = FG_DARK
-            elif point_in_polygon(px, py, face_c):
-                color = FG_MID
-            elif point_in_polygon(px, py, face_d):
-                color = FG_LIGHT
+            # 箭头形状：
+            #   上半部分是从尖角到圆心的两侧切线（一个尖顶的等腰三角形）
+            #   下半部分是圆
+            in_arrow = False
+            if py >= cy - 1e-9:
+                # 下半圆
+                if (px - cx) ** 2 + (py - cy) ** 2 <= r * r:
+                    in_arrow = True
+            else:
+                # 三角形：从尖角 (tip_x,tip_y) 到圆弧两端 (cx±r, cy)
+                half_w = r * (py - tip_y) / (cy - tip_y)
+                if abs(px - cx) <= half_w:
+                    in_arrow = True
 
-            row.append((color[0], color[1], color[2], alpha))
+            if in_arrow:
+                # 中间的孔挖掉
+                if (px - cx) ** 2 + (py - cy) ** 2 <= hole_r * hole_r:
+                    color = FG_HOLE
+                else:
+                    color = FG_WHITE
+
+            row.append((color[0], color[1], color[2], 255))
         rows.append(row)
     return rows
 

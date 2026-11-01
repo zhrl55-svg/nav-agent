@@ -1,9 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  应用图标的背景层：蓝灰渐变方框。
+  应用图标的背景层：亮蓝灰渐变方框。
 
-  配色跟应用界面统一（底 #101820 / 强调 #4A7BA7 / 高亮 #7FB2DC），
-  这样桌面图标和打开后的界面是同一套色。
+  ★ 为什么不用应用界面那套深色（#101820 / #0E1620）：
+    桌面壁纸通常也是深色的，图标底色太深会跟壁纸糊在一起，
+    整个图标看起来就是一块黑 —— 用户反馈「底色也太深了」。
+
+    所以这里单独调亮，用中蓝到亮蓝的渐变，
+    跟深色壁纸拉开对比。图标跟应用界面不必完全同色，
+    图标要的是「在桌面上能一眼找到」。
+
+  配色：#5B9BD5（亮）→ #2F6FA8（深），箭头用纯白。
 -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
@@ -19,8 +26,8 @@
                 android:endX="108"
                 android:endY="108"
                 android:type="linear">
-                <item android:offset="0" android:color="#1B3040" />
-                <item android:offset="1" android:color="#0E1620" />
+                <item android:offset="0" android:color="#6BAEE0" />
+                <item android:offset="1" android:color="#2F6FA8" />
             </gradient>
         </aapt:attr>
     </path>
