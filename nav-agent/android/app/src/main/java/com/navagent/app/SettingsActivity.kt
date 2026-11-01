@@ -7,6 +7,7 @@ import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
 import android.content.res.ColorStateList
+import android.os.Build
 import android.os.Bundle
 import android.text.InputType
 import android.view.Gravity
@@ -19,6 +20,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import java.io.File
 
@@ -313,6 +315,43 @@ class SettingsActivity : AppCompatActivity() {
             ) { Prefs.nearbyRadius = it; applied() }
         }
 
+        section("车载蓝牙")
+        rowSwitch("蓝牙自动启动", Prefs.bluetoothAutoStart, "车机连上后自动唤醒语音助手") {
+            Prefs.bluetoothAutoStart = it
+            if (it) {
+                requestBluetoothPermissionThenRegister()
+            } else {
+                BluetoothAutoStart.unregister(this)
+            }
+            applied()
+        }
+
+        row(
+            "目标设备名", Prefs.bluetoothTargetName.ifBlank { "未配置" },
+            "车机蓝牙名里包含这个关键词就触发，如「车机」「Ford」"
+        ) {
+            editText("目标设备名", Prefs.bluetoothTargetName, "如：车机 / Ford / 迈巴赫") {
+                Prefs.bluetoothTargetName = it
+                applied()
+                toast(if (it.isBlank()) "已清空，蓝牙自动启动不再触发" else "已保存：$it")
+                render()
+            }
+        }
+
+        row("蓝牙状态", BluetoothAutoStart.status(this), "查看权限、配对设备", chevron = false) {}
+
+        row("查看已配对设备", "", "看看车机蓝牙叫什么名字，方便填上面那一栏") {
+            val list = BluetoothAutoStart.bondedDevices()
+            AlertDialog.Builder(this)
+                .setTitle("已配对设备")
+                .setMessage(
+                    if (list.isEmpty()) "没有已配对的蓝牙设备（或缺蓝牙权限）"
+                    else list.joinToString("\n")
+                )
+                .setPositiveButton("知道了", null)
+                .show()
+        }
+
         section("联网搜索")
         row("搜索服务", if (Prefs.tavilyKey.isBlank()) "未配置" else "Tavily 已配置", "联网搜索依赖 Tavily Key；未配置时无法实时检索") {
             editText("Tavily 搜索 Key", Prefs.tavilyKey, "tvly-…", masked = true) {
@@ -537,6 +576,53 @@ class SettingsActivity : AppCompatActivity() {
             .setPositiveButton("保存") { _, _ -> onDone(input.text.toString()) }
             .setNegativeButton("取消", null)
             .show()
+    }
+
+    /**
+     * 申请蓝牙权限并注册广播接收器。
+     *
+     * Android 12+ 的 `BLUETOOTH_CONNECT` 是运行时权限，不给就：
+     *  - 读不到设备名（`device.name` 抛 SecurityException）
+     *  - 收不到 `ACTION_ACL_CONNECTED` 广播
+     *
+     * Android 11 及以下不需要运行时权限，直接注册。
+     */
+    private fun requestBluetoothPermissionThenRegister() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            BluetoothAutoStart.register(this)
+            toast("蓝牙自动启动已开启")
+            render()
+            return
+        }
+        val perms = arrayOf(
+            "android.permission.BLUETOOTH_CONNECT",
+            "android.permission.BLUETOOTH_SCAN"
+        )
+        val need = perms.filter {
+            checkSelfPermission(it) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        }
+        if (need.isEmpty()) {
+            BluetoothAutoStart.register(this)
+            toast("蓝牙自动启动已开启")
+            render()
+            return
+        }
+        btPermissionLauncher.launch(need.toTypedArray())
+    }
+
+    /** 权限结果回来后再注册接收器 */
+    private val btPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { result ->
+        val granted = result.values.all { it }
+        if (granted) {
+            BluetoothAutoStart.register(this)
+            toast("蓝牙自动启动已开启")
+        } else {
+            Prefs.bluetoothAutoStart = false
+            toast("没拿到蓝牙权限，蓝牙自动启动已关闭")
+        }
+        render()
     }
 
     private fun confirmReset() {

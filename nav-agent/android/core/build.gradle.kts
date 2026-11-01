@@ -123,6 +123,24 @@ dependencies {
     // 版本 9.7.1 是官方最后一个版本（2024-03 后停更），已是最新。
     //
     // 用去重后的 jar，而不是直接依赖 search —— 否则会撞 AMapUtilCoreApi。
-    compileOnly(files(stripSearchDuplicates))
-    runtimeOnly(files(stripSearchDuplicates))
+    //
+    // ★ 必须用 api 而不是 compileOnly/runtimeOnly：
+    //   compileOnly 不进运行时 classpath（类会 NoClassDefFoundError）；
+    //   runtimeOnly 虽然进运行时，但**不传递给下游模块**（app 模块就拿不到，
+    //   实测 :app:dependencies 里看不到它，APK 里也没有 poisearch 类）。
+    //   app 模块要直接用 PoiSearch / GeocodeSearch，所以必须 api 暴露。
+    //
+    // ★ 必须用「产物路径」而不是 files(stripSearchDuplicates)：
+    //   依赖声明里的 files(TaskProvider) 不会被 Gradle 解析成实际 jar，
+    //   实测 :core:dependencies 里根本看不到这一项，APK 里也没有 poisearch 类。
+    //   改成指向 build 目录里的实际文件，并让编译/打包任务依赖 stripSearchDuplicates，
+    //   保证生成顺序正确。
+    val strippedSearchJar = layout.buildDirectory.file("stripped-search/search-stripped.jar")
+    api(files(strippedSearchJar))
 }
+
+// 让依赖去重任务先于编译和打包执行
+tasks.matching { it.name.startsWith("compile") || it.name.startsWith("package") || it.name.startsWith("merge") }
+    .configureEach {
+        dependsOn("stripSearchDuplicates")
+    }

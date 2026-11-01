@@ -76,7 +76,7 @@ class AmapNavController(
      * 播报说「开始导航，全程6.8公里」，用户以为要去景泰，实际原地转圈。
      */
     @Volatile
-    private var pendingPlace: AmapWebGeocoder.GeoPoint? = null
+    private var pendingPlace: AmapSdkGeocoder.GeoPoint? = null
 
     /** SDK 回调来自工作线程，UI/播报统一切回主线程 */
     private val main = Handler(Looper.getMainLooper())
@@ -151,48 +151,68 @@ class AmapNavController(
         pendingPlace = null
         onState("正在解析「$destination」…")
 
-        // 地理编码是同步网络请求，必须离开主线程
-        Thread {
-            val city = currentCity
-            // POI 搜索优先：口语地名（"高铁西站""火车站""加油站"）本质是 POI，
-            // geocode 会按字符串硬匹配，容易跨城市命中。搜不到再退回地理编码。
-            var point = AmapWebGeocoder.searchPoi(destination, city)
-            Dbg.log("poi 搜索「$destination」city=$city → " + (point?.let { "${it.city}${it.district}/${it.formatted} ${it.latitude},${it.longitude}" } ?: "null"))
-            if (point == null) {
-                point = AmapWebGeocoder.geocode(destination, city)
-                Dbg.log("geocode 兜底「$destination」→ " + (point?.let { "${it.city}${it.district}/${it.formatted} ${it.latitude},${it.longitude}" } ?: "null"))
-            }
-            if (point == null) {
-                post {
-                    onState("找不到「$destination」这个地方")
-                    voice.speak("找不到$destination，换个说法试试", VoiceGuide.Priority.USER)
-                }
-                return@Thread
-            }
-            pendingPlace = point
-            // 用无参构造 + setter，避开 NaviLatLng(double,double) 参数顺序的歧义
-            val start = NaviLatLng().apply {
-                latitude = lastLat
-                longitude = lastLon
-            }
-            val end = NaviLatLng().apply {
-                latitude = point.latitude
-                longitude = point.longitude
-            }
-            val ok = n.calculateDriveRoute(
-                listOf(start),
-                listOf(end),
-                null,
-                PathPlanningStrategy.DRIVING_DEFAULT
+        // POI 搜索优先：口语地名（"高铁西站""火车站""加油站"）本质是 POI，
+        // geocode 会按字符串硬匹配，容易跨城市命中。搜不到再退回地理编码。
+        // 两步都是 SDK 异步回调，不需要自己开线程（也不会再抛 NetworkOnMainThreadException）。
+        val city = currentCity
+        AmapSdkGeocoder.searchPoi(context, destination, city) { poi ->
+            Dbg.log(
+                "poi 搜索「$destination」city=$city → " +
+                    (poi?.let { "${it.city}${it.district}/${it.formatted} ${it.latitude},${it.longitude}" } ?: "null")
             )
-            Dbg.log("calculateDriveRoute 返回=$ok")
-            post {
-                onState(
-                    if (ok) "正在规划到 ${point.formatted} 的路线…" else "算路请求发送失败"
-                )
-                if (!ok) voice.speak("路线规划失败，换个说法试试", VoiceGuide.Priority.USER)
+            if (poi != null) {
+                onPlaceResolved(poi)
+                return@searchPoi
             }
-        }.apply { isDaemon = true }.start()
+            // 兜底：地理编码
+            AmapSdkGeocoder.geocode(context, destination, city) { geo ->
+                Dbg.log(
+                    "geocode 兜底「$destination」→ " +
+                        (geo?.let { "${it.city}${it.district}/${it.formatted} ${it.latitude},${it.longitude}" } ?: "null")
+                )
+                if (geo == null) {
+                    post {
+                        onState("找不到「$destination」这个地方")
+                        voice.speak("找不到$destination，换个说法试试", VoiceGuide.Priority.USER)
+                    }
+                } else {
+                    onPlaceResolved(geo)
+                }
+            }
+        }
+    }
+
+    /**
+     * 拿到坐标后算路。
+     *
+     * 从 navigateTo 里拆出来是因为解析现在是异步回调，
+     * POI 命中和 geocode 兜底都要汇到同一段算路逻辑。
+     */
+    private fun onPlaceResolved(point: AmapSdkGeocoder.GeoPoint) {
+        val n = navi ?: return
+        pendingPlace = point
+        // 用无参构造 + setter，避开 NaviLatLng(double,double) 参数顺序的歧义
+        val start = NaviLatLng().apply {
+            latitude = lastLat
+            longitude = lastLon
+        }
+        val end = NaviLatLng().apply {
+            latitude = point.latitude
+            longitude = point.longitude
+        }
+        val ok = n.calculateDriveRoute(
+            listOf(start),
+            listOf(end),
+            null,
+            PathPlanningStrategy.DRIVING_DEFAULT
+        )
+        Dbg.log("calculateDriveRoute 返回=$ok")
+        post {
+            onState(
+                if (ok) "正在规划到 ${point.formatted} 的路线…" else "算路请求发送失败"
+            )
+            if (!ok) voice.speak("路线规划失败，换个说法试试", VoiceGuide.Priority.USER)
+        }
     }
 
     private fun post(block: () -> Unit) = main.post(block)
@@ -201,7 +221,7 @@ class AmapNavController(
      * 「白银市景泰县」+「金星家园」→「白银市景泰县的金星家园」。
      * 念全称是故意的：只念地名的话，用户分不清是本市同名地点还是外地那个。
      */
-    private fun describePlace(p: AmapWebGeocoder.GeoPoint): String {
+    private fun describePlace(p: AmapSdkGeocoder.GeoPoint): String {
         val region = buildString {
             if (p.city.isNotBlank()) append(p.city)
             // 直辖市的 city 已经等于 district，别重复念

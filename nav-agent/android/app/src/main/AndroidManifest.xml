@@ -16,6 +16,25 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!--
+      蓝牙自动启动：连上车机后自动拉起语音服务。
+
+      Android 12（API 31）起蓝牙权限拆成了运行时权限：
+        BLUETOOTH_CONNECT —— 读设备名、收连接广播（**必需**）
+        BLUETOOTH_SCAN    —— 扫描设备（这里不主动扫，但部分 ROM 要求一起给）
+
+      maxSdkVersion=30 是给 Android 11 及以下的旧权限用的，
+      31+ 系统不认这两个，必须用 BLUETOOTH_CONNECT。
+    -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH"
+        android:maxSdkVersion="30" />
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_ADMIN"
+        android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+
+    <!--
       Android 11+ 的包可见性：不声明 queries 就 getPackageInfo 不到别的应用，
       会把已装的 TTS 引擎（com.iflytek.speechsuite）误判成"没装"。
       实测就是这么回退到华为引擎的。

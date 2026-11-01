@@ -95,7 +95,8 @@ app/
 ├── WebSearchTool.kt     通用搜索（Tavily Search API）
 ├── WebExtractTool.kt    搜索结果网页正文提取（Tavily Extract API）
 ├── AmapNavController.kt AMapNavi + AMapLocationClient 的真实实现
-├── AmapWebGeocoder.kt   POI 搜索 + 地名 → 坐标（高德 Web API，citylimit 按行政区划动态开关）
+├── AmapSdkGeocoder.kt    POI 搜索 + 地理编码 + 一次性定位（高德原生 SDK）
+├── BluetoothAutoStart.kt 蓝牙连上车机后自动拉起语音服务
 ├── NavHud.kt            HUD 数据快照
 ├── NavListenerAdapter.kt AMapNaviListener 34 个回调全空实现
 └── Dbg.kt               文件日志（绕开不可靠的 logcat）
@@ -119,6 +120,9 @@ app/
 | 播报 | 语速 | 1.0x | `VoiceGuide.setRate()` |
 | | 回声保护 | 1.5 秒 | 立即 |
 | 导航 | 周边搜索半径 | 3 公里 | 立即 |
+| 车载蓝牙 | 蓝牙自动启动 | 关 | 立即（需 BLUETOOTH_CONNECT 运行时权限） |
+| | 目标设备名 | 空 | 立即（设备名包含匹配） |
+| 联网搜索 | Tavily 搜索 Key | 编译时注入 | 立即 |
 | 诊断 | 文件日志 | 开 | → `Dbg.enabled` |
 
 **唤醒词语义**：逗号分隔的每一项是**同义变体，任一命中即可**（`VoskWake.match()` 里的
@@ -168,9 +172,15 @@ app/
 2. **接管 SDK 播报。**
    `setUseInnerVoice(false)` 关掉高德 TTS，改由 `onGetNavigationText(String)` 把文本灌进自己的
    `VoiceGuide` 队列。这样「导航播报」和「用户对话」共用一条 TTS，靠 Priority 抢占，不会两套声音打架。
-3. **地理编码走 Web API，不用 search SDK。**
-   `calculateDriveRoute(String, String, ...)` 的地址重载内部要调 POI 搜索模块，而 `search` 与
-   `navi-3dmap` 有无法排除的重复类。改成：Web API 拿坐标 → `calculateDriveRoute(List<NaviLatLng>, ...)`。
+3. **地名解析走高德原生 SDK（PoiSearch + GeocodeSearch），不用 Web API。**
+   2026-11-01 已从 Web API 切换到 SDK：不再受主线程禁发 HTTP 的限制，也不用多管一个 Web Key。
+   坐标结果与 Web API 版本逐位相同（真机实测）。
+
+   ★ **曾经记的「search 与 navi-3dmap 有无法排除的重复类，只能二选一」是错的，已推翻。**
+   实测两个 jar 只重叠 2 个类（`AMapUtilCoreApi`、`NetProxy`），`exclude` 是模块级的剔不了单个类，
+   解法是打包阶段从 search jar 里剔掉这 2 个类、保留 navi-3dmap 的。
+   search 那份是 navi 那份的**方法子集**，运行时行为不变。详见 `core/build.gradle.kts`
+   的 `stripSearchDuplicates` 任务。
 4. **半双工兜底。** 播报期间点按钮是「打断播报」而不是「开始拾音」，避免把自己的声音收进去。
 5. **`NaviLatLng` 用无参构造 + setter**，避开 `NaviLatLng(double, double)` 参数顺序（lat/lon 还是 lon/lat）的歧义。
 
@@ -185,7 +195,11 @@ app/
    注意 `pluginManagement {}` 是**独立脚本作用域**，不能引用 settings.gradle.kts 顶层 `val`，镜像地址必须内联。
 4. **重复类两个来源**：
    - `navi-3dmap` jar 已内置 `maps`(270 类) / `navi`(241 类) / `location`(23 类)，而 POM 又把 `location` 声明为传递依赖 → 必须 `exclude(group="com.amap.api", module="location")`。
-   - `search` 自带 `com.amap.apis.utils.core.api.AMapUtilCoreApi`，与 `navi-3dmap` 冲突且 **exclude 无效** → 干脆不引 search。
+   - `search` 与 `navi-3dmap` 只重叠 `com/amap/apis/utils/core/api/{AMapUtilCoreApi,NetProxy}` 两个类，
+     **exclude 剔不了单个类**（exclude 是模块级的）→ 在打包阶段从 search jar 里剔掉这 2 个类，
+     保留 navi-3dmap 的（search 那份是方法子集，navi 那份是超集，行为不变）。
+     三个坑：`files(TaskProvider)` 不会被解析（要写实际路径）、`runtimeOnly` 不传递给下游模块
+     （要用 `api`）、app 侧必须补 `dependsOn(":core:stripSearchDuplicates")`。
 5. 高德依赖只在 `:core` 声明一次，且必须用 `api` 而非 `implementation`，否则 app 模块 `Unresolved reference 'amap'`。
 
 ### 运行
@@ -227,7 +241,8 @@ app/
     （必须整句匹配，否则「小高，导航去西站」会被误杀）。
 21. **vosk 会把「小高」拆成两个 `final` 结果**（先出「小」再出「高」，各带一次端点），
     逐帧匹配永远拼不出来。`VoskWake` 用 4 秒滑动窗口把碎片拼起来再匹配。
-22. **主线程禁止直接发 HTTP**，`AmapWebGeocoder` 全是同步方法。
+22. **主线程禁止直接发 HTTP。**（2026-11-01 已不适用：高德搜索换成原生 SDK，SDK 自己异步回调。）
+    天气工具仍走 Web API，仍需注意 —— 但它跑在工具线程上。
     `NavApp.nearby()` 用 `FutureTask` + `get(6,SECONDS)`，否则抛 `NetworkOnMainThreadException`，
     而且会被 catch 成「解析异常 null」，看不出是线程问题。
 23. **播报必须念地名全称**（城市 + 区县 + 名字）。只说「开始导航，全程6.8公里」时，
@@ -274,7 +289,7 @@ app/
 
 - [ ] 声纹门禁（只认主人声音）—— 设计定稿在 `HANDOFF.md` 第 10 节，本轮未实现
 - [x] **通用 Web 搜索**（Tavily `web_search` + `web_extract`）——设置页配置 Key；实时/易变信息优先检索，摘要不足时读取来源网页正文。天气已通
-- [x] 周边搜索（`AskNearby` → `AmapWebGeocoder.searchAround()`，子线程执行，不报列表只问「最近的中石化 1.8 公里，要去吗」）
+- [x] 周边搜索（`AmapSdkGeocoder.searchAroundList()`，SDK 异步回调 + latch 转同步，不报列表只问「最近的中石化 1.8 公里，要去吗」）
 - [ ] 回声消除 —— 现在是「播报时暂停拾音」的半双工兜底，
       副作用是**导航播报期间喊「小高」听不见**
 - [ ] 聊天历史持久化（杀进程就丢）

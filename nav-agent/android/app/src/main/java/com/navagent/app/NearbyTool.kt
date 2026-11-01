@@ -1,7 +1,11 @@
 package com.navagent.app
 
+import android.content.Context
 import com.navagent.core.LlmTool
 import org.json.JSONObject
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import java.util.Locale
 
 /**
@@ -16,12 +20,19 @@ import java.util.Locale
  * 为什么可以放心交给模型：
  *   漏判的代价只是变成闲聊（不像「导航去X」漏了会走错路），
  *   而且这个工具本身有定位兜底和超时保护，不会把会话卡死。
+ *
+ * ★ 为什么这里能用 latch 把异步 SDK 转成同步：
+ *   工具是在 `MinimaxLlm` 的独立线程里跑的（FutureTask + 8 秒超时），
+ *   所以在工具内部阻塞等待网络结果是安全的，不会卡主线程。
+ *   之前用 Web API 时是「同步 HTTP + 自己开子线程」，现在 SDK 本身是异步回调，
+ *   正好反过来：用 CountDownLatch 把回调转回同步，调用方代码不用大改。
  */
 class NearbyTool(
+    private val context: Context,
     private val location: () -> Pair<Double, Double>?,
     private val radius: () -> Int,
     /** 记住最近一次结果，用户接着说「去」时能直接导航过去 */
-    private val onResult: (AmapWebGeocoder.Poi) -> Unit = {}
+    private val onResult: (AmapSdkGeocoder.Poi) -> Unit = {}
 ) : LlmTool {
 
     override val name = "search_nearby"
@@ -50,7 +61,7 @@ class NearbyTool(
         }
 
         val r = radius()
-        val list = AmapWebGeocoder.searchAroundList(loc.first, loc.second, keyword, r, 3)
+        val list = awaitAround(loc.first, loc.second, keyword, r)
         Dbg.log("search_nearby($keyword) radius=$r → ${list.size} 条")
 
         if (list.isEmpty()) {
@@ -75,5 +86,33 @@ class NearbyTool(
                 append("\n")
             }
         }.trim()
+    }
+
+    /**
+     * 等高德周边搜索回调。
+     *
+     * 超时比工具层的 8 秒短一点，留出余量给工具层拼字符串。
+     */
+    private fun awaitAround(
+        lat: Double,
+        lon: Double,
+        keyword: String,
+        radiusMeters: Int
+    ): List<AmapSdkGeocoder.Poi> {
+        val latch = CountDownLatch(1)
+        val holder = AtomicReference<List<AmapSdkGeocoder.Poi>>(emptyList())
+        AmapSdkGeocoder.searchAroundList(
+            context, lat, lon, keyword, radiusMeters, 3
+        ) { list ->
+            holder.set(list)
+            latch.countDown()
+        }
+        return try {
+            latch.await(6, TimeUnit.SECONDS)
+            holder.get()
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            emptyList()
+        }
     }
 }

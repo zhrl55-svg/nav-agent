@@ -44,6 +44,8 @@ object Prefs {
     private const val K_NEARBY_RADIUS = "nearby_radius"
     private const val K_FILE_LOG = "file_log"
     private const val K_TAVILY_KEY = "tavily_key"
+    private const val K_BT_TARGET = "bluetooth_target_name"
+    private const val K_BT_AUTOSTART = "bluetooth_auto_start"
 
     /** MiniMax 默认音色：青涩青年 */
     const val DEFAULT_VOICE = "male-qn-qingse"
@@ -226,6 +228,25 @@ object Prefs {
         set(v) = sp.edit().putString(K_TAVILY_KEY, v.trim()).apply()
 
     fun clearTavilyKeyOverride() = sp.edit().remove(K_TAVILY_KEY).apply()
+
+    // ------------------------------------------------------------ 蓝牙
+
+    /**
+     * 蓝牙自动启动的目标设备名关键词。
+     *
+     * 车机蓝牙名一般带品牌（"Ford""迈巴赫""车机"），用**包含**匹配而不是全等，
+     * 因为车机名常有后缀（"Ford Sync""我的车机"）。
+     *
+     * 空串 = 关闭这个功能。
+     */
+    var bluetoothTargetName: String
+        get() = sp.getString(K_BT_TARGET, "").orEmpty().trim()
+        set(v) = sp.edit().putString(K_BT_TARGET, v.trim()).apply()
+
+    /** 蓝牙自动启动总开关 */
+    var bluetoothAutoStart: Boolean
+        get() = sp.getBoolean(K_BT_AUTOSTART, false)
+        set(v) = sp.edit().putBoolean(K_BT_AUTOSTART, v).apply()
 
     // ------------------------------------------------------------ 诊断
 

@@ -102,6 +102,16 @@ class NavApp : Application() {
         // 顺序不能反：Dbg.init 要读 Prefs.fileLog 决定开不开
         Prefs.init(this)
         Dbg.init(this)
+        // 高德 SDK 的隐私合规。必须在任何 SDK 调用（定位/地图/搜索）之前做，
+        // 否则高德会静默失败——查不到城市、周边搜索返回空，都查不出原因。
+        AmapSdkGeocoder.init(this)
+        // 蓝牙自动启动：应用一启动就注册，否则杀进程重启后功能失效
+        //（设置里只管开关和目标名，注册逻辑放在这里才能扛住进程重启）。
+        // 没权限时注册会抛 SecurityException，捕获掉即可——用户可以在设置页授权。
+        if (Prefs.bluetoothAutoStart) {
+            runCatching { BluetoothAutoStart.register(this) }
+                .onFailure { Dbg.log("蓝牙自动启动注册失败：${it.message}") }
+        }
         // 引擎包名构造时传入，避免建完再切一次（那会多一次 TTS 初始化的抖动）
         voice = VoiceGuide(this, Prefs.ttsEngine)
         // 云端合成器：设置里选「MiniMax 云端」时才会被用到
@@ -124,6 +134,7 @@ class NavApp : Application() {
                     ),
                     WeatherTool { nav?.currentCity },
                     NearbyTool(
+                        context = this,
                         location = { nav?.currentLocation() },
                         radius = { Prefs.nearbyRadius },
                         onResult = {
@@ -278,7 +289,7 @@ class NavApp : Application() {
 
     /** 最近一次周边搜索结果，用户说「去」时导航到它 */
     @Volatile
-    private var lastNearby: AmapWebGeocoder.Poi? = null
+    private var lastNearby: AmapSdkGeocoder.Poi? = null
 
     /** 上次周边搜索的时间。开车时几分钟就开出好几公里，旧结果不能再拿来导航 */
     @Volatile
@@ -290,7 +301,7 @@ class NavApp : Application() {
      * 过期就作废：用户 10 分钟前搜的加油站，这会儿说「去」，车已经开出去三五公里，
      * 再导航到那个点等于往回开。宁可重新问一句「去哪儿」。
      */
-    private fun freshNearby(): AmapWebGeocoder.Poi? {
+    private fun freshNearby(): AmapSdkGeocoder.Poi? {
         val p = lastNearby ?: return null
         if (System.currentTimeMillis() - lastNearbyAt > NEARBY_TTL_MS) {
             Dbg.log("周边结果已过期，丢弃")
