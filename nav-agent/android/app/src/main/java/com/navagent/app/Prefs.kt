@@ -46,6 +46,7 @@ object Prefs {
     private const val K_TAVILY_KEY = "tavily_key"
     private const val K_BT_TARGET = "bluetooth_target_name"
     private const val K_BT_AUTOSTART = "bluetooth_auto_start"
+    private const val K_AMAP_BUILTIN_UI = "amap_builtin_ui"
 
     /** MiniMax 默认音色：青涩青年 */
     const val DEFAULT_VOICE = "male-qn-qingse"
@@ -214,6 +215,19 @@ object Prefs {
     var nearbyRadius: Int
         get() = sp.getInt(K_NEARBY_RADIUS, 3_000)
         set(v) = sp.edit().putInt(K_NEARBY_RADIUS, v).apply()
+
+    /**
+     * 导航页用高德官方内置界面，还是自己画的 HUD。
+     *
+     * true  = 高德内置界面（转向图、车道线、全览按钮等官方样式）
+     * false = 自绘 HUD（原来的做法，只显示转向箭头+距离+路名+剩余）
+     *
+     * 默认开启高德内置界面：官方界面信息更全（车道级导航、路况条、限速牌），
+     * 自己维护这套 UI 成本高且更新慢。
+     */
+    var amapBuiltinUi: Boolean
+        get() = sp.getBoolean(K_AMAP_BUILTIN_UI, true)
+        set(v) = sp.edit().putBoolean(K_AMAP_BUILTIN_UI, v).apply()
 
     // ------------------------------------------------------------ 联网
 

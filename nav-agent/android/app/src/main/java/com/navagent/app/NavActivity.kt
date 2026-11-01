@@ -62,14 +62,46 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
 
         naviView = findViewById(R.id.navi_view)
         naviView.onCreate(savedInstanceState)
-        // 关掉 SDK 内置界面（退出/继续导航/设置那条底栏会和我们的按钮重叠），
-        // 只保留地图与路线渲染，HUD 自己画。
-        // 官方示例的写法是「取出 options → 改 → 再 setViewOptions 回去」，
-        // getViewOptions() 返回的对象不保证就是视图正在用的那份，所以这里照官方来。
+        // 高德内置界面 vs 自绘 HUD，由设置页切换。
+        //
+        // 之前是「永远关掉内置 UI，HUD 自己画」—— 理由是 SDK 内置底栏
+        // （退出/继续导航/设置）会和我们的按钮重叠，而且只能 setLayoutVisible(false) 全关、
+        // 无法单关某一项。
+        //
+        // 现在默认开内置界面：用官方的转向图、车道级导航、路况条、限速牌，
+        // 比自己维护一套 HUD 划算得多。重叠问题用 **setCrossLocation** 解决 ——
+        // 告诉高德「你的 HUD 只能画在这个矩形里」，把底部让给我们的聊天浮层和按钮。
         val options = naviView.viewOptions
-        options.isLayoutVisible = false
+        options.isLayoutVisible = Prefs.amapBuiltinUi
         options.isAutoLockCar = false
         options.isAutoChangeZoom = true
+        if (Prefs.amapBuiltinUi) {
+            // 高德 HUD 限制在「上边留出状态栏高度、下边留出底部面板」的区域内。
+            //
+            // 上边不能给 0：高德自己的顶部条会贴到状态栏下面，
+            // 右上角那个路名/比例标签会被系统状态栏压掉一半。
+            // 下边按实际测量留，不能写死 —— 不同屏幕和字号都不一样。
+            val screenW = resources.displayMetrics.widthPixels
+            val screenH = resources.displayMetrics.heightPixels
+            val topInset = statusBarHeight()
+            val navArea = android.graphics.Rect(
+                0, topInset,
+                screenW, screenH - bottomPanelHeight()
+            )
+            options.setCrossLocation(navArea, navArea)
+
+            // 夜间模式跟着系统走。
+            // 不开的话高德默认浅色地图，和本应用的深色蓝灰主题完全打架
+            // （浅底 + 我们的深色面板，中间那道交界特别难看）。
+            options.isAutoNaviViewNightMode = true
+            options.isNaviNight = isNightMode()
+            // 车道级导航：路口有车道箭头那种，官方才有，自己画不出来
+            options.isLaneInfoShow = true
+            // 路况条：显示前方拥堵情况
+            options.isTrafficBarEnabled = true
+            // 路线详情列表按钮：底部空间有限，让给我们的按钮栏
+            options.isRouteListButtonShow = false
+        }
         naviView.viewOptions = options
 
         status = findViewById(R.id.status)
@@ -136,10 +168,53 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
         }
     }
 
+    /**
+     * 状态栏高度（像素）。
+     *
+     * 给 `setCrossLocation` 用：高德顶部条要避开状态栏，
+     * 否则右上角的路名标签会被系统状态栏压掉一半。
+     */
+    private fun statusBarHeight(): Int {
+        val id = resources.getIdentifier("status_bar_height", "dimen", "android")
+        if (id > 0) {
+            return resources.getDimensionPixelSize(id)
+        }
+        return (24 * resources.displayMetrics.density).toInt()
+    }
+
+    /**
+     * 当前是不是夜间模式（跟随系统）。
+     *
+     * 高德内置界面有自己的地图配色，浅色地图配深色底栏会非常割裂，
+     * 所以高德的夜间开关要跟系统一致。
+     */
+    private fun isNightMode(): Boolean {
+        val mode = resources.configuration.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK
+        return mode == android.content.res.Configuration.UI_MODE_NIGHT_YES
+    }
+
+    /**
+     * 底部面板（聊天浮层 + 状态 + 输入框 + 按钮）占多高。
+     *
+     * 给 `setCrossLocation` 用：高德 HUD 必须避开这块，
+     * 否则高德的底部操作栏会压在我们的按钮上，两套 UI 叠一起没法用。
+     *
+     * 布局还没 inflate 完时量不准（返回 0），这时宁可给个保守值。
+     */
+    private fun bottomPanelHeight(): Int {
+        val panel = findViewById<View>(R.id.bottom_panel)
+        val h = panel?.height ?: 0
+        if (h > 0) return h
+        // 兜底：输入框 46dp + 按钮 48dp + 状态文字 + 内外边距，约 220dp
+        return (220 * resources.displayMetrics.density).toInt()
+    }
+
     private fun renderHud(h: NavHud) {
         // 按钮状态跟着导航状态走，放在最前面 —— HUD 隐藏时也要更新
         updateNavButton(h.navigating)
-        if (!h.navigating) {
+        // 用高德内置界面时，顶部转向信息由高德画，我们的 HUD 卡片要让位，
+        // 否则两套转向提示叠在一起。
+        if (!h.navigating || Prefs.amapBuiltinUi) {
             hud.visibility = View.GONE
             return
         }

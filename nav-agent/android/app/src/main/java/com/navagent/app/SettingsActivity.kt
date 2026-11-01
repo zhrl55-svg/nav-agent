@@ -304,6 +304,12 @@ class SettingsActivity : AppCompatActivity() {
         }
 
         section("导航")
+        rowSwitch("高德官方导航界面", Prefs.amapBuiltinUi, "用高德内置的转向图、车道线、路况条。关掉则用自绘 HUD") {
+            Prefs.amapBuiltinUi = it
+            applied()
+            toast(if (it) "下次打开导航页生效" else "下次打开导航页生效")
+        }
+
         row("周边搜索半径", humanRadius(Prefs.nearbyRadius), "问「附近有没有加油站」时的搜索范围") {
             choose(
                 "周边搜索半径", listOf(

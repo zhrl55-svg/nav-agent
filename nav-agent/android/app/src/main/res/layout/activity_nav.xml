@@ -67,6 +67,7 @@
          导航中唤醒聊天，回答不切页面 —— 地图不能离开视野，开车时也不看屏，主要靠 TTS。
          输入框是为了不用说话也能发指令（旁边有人、或者语音识别不准的时候）。 -->
     <LinearLayout
+        android:id="@+id/bottom_panel"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_gravity="bottom"

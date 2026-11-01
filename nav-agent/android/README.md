@@ -164,11 +164,19 @@ app/
 
 ## 关键设计决策
 
-1. **SDK 自带 UI 全关，HUD 自绘。**
-   `AMapNaviView` 在未导航时也会渲染「退出 / 继续导航 / 设置」底栏，和我们的语音按钮完全重叠，
-   而且只能 `setLayoutVisible(false)` 全关、无法单关某一项。所以关掉全部内置 UI，
-   用 `NaviInfo.getIconBitmap()`（SDK 直接给转向箭头位图）+ `nextRoadName` + `curStepRetainDistance`
-   + `pathRetainDistance/Time` 自己画顶部卡片。
+1. **导航界面用高德官方内置 UI（可切回自绘 HUD）。**
+   2026-11-01 改的。原来是「SDK 自带 UI 全关、HUD 自绘」—— 因为内置底栏
+   （退出 / 继续导航 / 设置）和我们的语音按钮完全重叠。
+
+   现在的解法是 **`setCrossLocation(rect, rect)`**：告诉高德「你的 HUD 只能画在这个矩形里」，
+   上边留状态栏、下边留我们的底部面板，两套 UI 就能共存了。官方内置界面有车道级导航、
+   路况条、限速牌这些自己画不出来的东西，维护成本低得多。
+
+   必须同时开 `isAutoNaviViewNightMode` + `isNaviNight` 跟随系统，
+   否则高德浅色地图配我们的深色底栏，交界非常割裂。
+
+   自绘 HUD 保留为备选（设置页可切）：`NaviInfo.getIconBitmap()` + `nextRoadName` +
+   `curStepRetainDistance` + `pathRetainDistance/Time`。
 2. **接管 SDK 播报。**
    `setUseInnerVoice(false)` 关掉高德 TTS，改由 `onGetNavigationText(String)` 把文本灌进自己的
    `VoiceGuide` 队列。这样「导航播报」和「用户对话」共用一条 TTS，靠 Priority 抢占，不会两套声音打架。

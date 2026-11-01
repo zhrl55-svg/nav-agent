@@ -58,3 +58,5 @@ minis-phone-ops.zip
 # 需要看界面时直接 adb screencap 取当前屏，不必回溯历史截图。
 # ---------------------------------------------------------------------------
 nav-agent/shot*.png
+nav-agent/nav_*.png
+hicar-analysis/*.png

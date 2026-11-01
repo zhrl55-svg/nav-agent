@@ -27,7 +27,8 @@ import java.util.Locale
  *  2. 起点用"经度,纬度"字符串传给 calculateDriveRoute 的 String 重载，
  *     由 SDK 内部处理，省掉 GeocodeSearch 依赖（见 core/build.gradle.kts 的注释）。
  *  3. 算路是异步的：navigateTo() 只是发起请求，真正 startNavi 在 onCalculateRouteSuccess 里。
- *  4. 界面完全自绘（见 NavHud），AMapNaviView 只当画布，setLayoutVisible(false) 关掉内置 UI。
+ *  4. 导航界面用高德官方内置 UI（NavActivity 里配置），自绘 HUD 作为备选。
+ *     重叠靠 AMapNaviViewOptions.setCrossLocation 解决 —— 告诉高德 HUD 只能画在哪个矩形里。
  */
 class AmapNavController(
     private val context: Context,
