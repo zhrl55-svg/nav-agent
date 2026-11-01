@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.NavAgent" parent="Theme.AppCompat.DayNight.NoActionBar">
+        <item name="colorPrimary">#3A5A7A</item>
+        <item name="colorPrimaryDark">#0E1620</item>
+        <item name="colorAccent">#4A7BA7</item>
+    </style>
+</resources>

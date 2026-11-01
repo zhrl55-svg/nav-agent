@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_LOCATION_EXTRA_COMMANDS" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!--
+      Android 11+ 的包可见性：不声明 queries 就 getPackageInfo 不到别的应用，
+      会把已装的 TTS 引擎（com.iflytek.speechsuite）误判成"没装"。
+      实测就是这么回退到华为引擎的。
+    -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+    </queries>
+
+    <application
+        android:name=".NavApp"
+        android:allowBackup="false"
+        android:icon="@android:drawable/ic_menu_mylocation"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.NavAgent">
+
+        <!-- 高德 Key：包名 com.navagent，绑定 android-nav -->
+        <meta-data
+            android:name="com.amap.api.v2.apikey"
+            android:value="${AMAP_KEY}" />
+
+        <!--
+          高德定位的辅助服务。
+          navi-3dmap 是纯 jar（不是 aar），它的 manifest 不会被合并，
+          而它内置的 com.amap.api.location.AMapLocationClient 启动时会尝试拉起这个服务。
+          不声明就会在 logcat 里看到：
+            Unable to start service Intent { cmp=com.navagent/com.amap.api.location.APSService } not found
+          并导致定位能力退化。必须手动补上。
+        -->
+        <service
+            android:name="com.amap.api.location.APSService"
+            android:enabled="true"
+            android:exported="false" />
+
+        <!-- 主界面：AI 聊天。导航是从这里说一句话打开的页面，不是入口 -->
+        <activity
+            android:name=".ChatActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:screenOrientation="portrait"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 导航页 -->
+        <activity
+            android:name=".NavActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:screenOrientation="portrait" />
+
+        <!-- 设置页：唤醒词 / 模型 / 播报 / 诊断 -->
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="false"
+            android:screenOrientation="portrait"
+            android:windowSoftInputMode="adjustResize" />
+
+        <!-- 语音常驻：麦克风唯一持有者。息屏也要能听见唤醒词 -->
+        <service
+            android:name=".VoiceService"
+            android:exported="false"
+            android:foregroundServiceType="microphone|location" />
+
+    </application>
+
+</manifest>

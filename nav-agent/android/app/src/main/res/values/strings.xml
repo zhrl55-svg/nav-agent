@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">小高</string>
+    <string name="btn_talk">唤醒小高</string>
+    <string name="hint_idle">说「小高」唤醒，或直接打字</string>
+    <string name="hud_icon_desc">转向图标</string>
+    <string name="chat_title">小高</string>
+    <string name="chat_subtitle">待命 · 说「小高」唤醒</string>
+    <string name="chat_hint">说点什么…</string>
+    <string name="send">发送</string>
+    <string name="mic">语音</string>
+    <string name="nav_back">返回对话</string>
+    <string name="nav_stop">停止导航</string>
+    <string name="nav_start">开始导航</string>
+    <string name="settings">设置</string>
+    <string name="open_nav">导航</string>
+    <string name="open_nav_active">导航中</string>
+    <string name="voice">语音</string>
+    <string name="mic_listening">聆听中</string>
+    <string name="mic_thinking">识别中</string>
+    <string name="chat_greeting">我在。想去哪儿、想问点什么，直接说；说「%1$s」就能叫我。</string>
+</resources>

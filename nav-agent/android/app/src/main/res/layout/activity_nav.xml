@@ -1,0 +1,191 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <!-- AMapNaviView 只当画布用，内置 UI 已在代码里 setLayoutVisible(false) 关掉 -->
+    <com.amap.api.navi.AMapNaviView
+        android:id="@+id/navi_view"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
+    <!-- 顶部 HUD：转向箭头 + 距离 + 路名 + 全程剩余 -->
+    <LinearLayout
+        android:id="@+id/hud"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top"
+        android:layout_margin="10dp"
+        android:background="@drawable/bg_card"
+        android:elevation="8dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:padding="12dp"
+        android:visibility="gone">
+
+        <ImageView
+            android:id="@+id/hud_icon"
+            android:layout_width="56dp"
+            android:layout_height="56dp"
+            android:contentDescription="@string/hud_icon_desc"
+            android:scaleType="fitCenter" />
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="12dp"
+            android:layout_weight="1"
+            android:orientation="vertical">
+
+            <TextView
+                android:id="@+id/hud_step"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textColor="#E6EDF5"
+                android:textSize="24sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/hud_road"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:textColor="#B8CDE0"
+                android:textSize="15sp" />
+
+            <TextView
+                android:id="@+id/hud_remain"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:textColor="#8FA8C0"
+                android:textSize="13sp" />
+        </LinearLayout>
+    </LinearLayout>
+
+    <!-- 底部：聊天浮层 + 状态 + 输入框 + 按钮。
+         导航中唤醒聊天，回答不切页面 —— 地图不能离开视野，开车时也不看屏，主要靠 TTS。
+         输入框是为了不用说话也能发指令（旁边有人、或者语音识别不准的时候）。 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom"
+        android:background="#E6101820"
+        android:elevation="10dp"
+        android:orientation="vertical"
+        android:padding="14dp">
+
+        <LinearLayout
+            android:id="@+id/chat_overlay"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="8dp"
+            android:orientation="vertical"
+            android:visibility="gone" />
+
+        <TextView
+            android:id="@+id/status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/hint_idle"
+            android:textColor="#E6EDF5"
+            android:textSize="14sp" />
+
+        <!-- 打字发指令 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <EditText
+                android:id="@+id/input"
+                android:layout_width="0dp"
+                android:layout_height="46dp"
+                android:layout_weight="1"
+                android:autofillHints=""
+                android:background="@drawable/bg_input"
+                android:hint="@string/chat_hint"
+                android:imeOptions="actionSend"
+                android:inputType="text"
+                android:maxLines="2"
+                android:paddingHorizontal="14dp"
+                android:textColor="#E6EDF5"
+                android:textColorHint="#5A6E82"
+                android:textSize="14sp" />
+
+            <Button
+                android:id="@+id/send"
+                android:layout_width="64dp"
+                android:layout_height="46dp"
+                android:layout_marginStart="8dp"
+                android:background="@drawable/bg_btn_primary"
+                    android:backgroundTint="@null"
+                    android:stateListAnimator="@null"
+                android:text="@string/send"
+                android:textColor="#0E1620"
+                android:textSize="13sp" />
+        </LinearLayout>
+
+        <!-- 三个按钮等宽，别让任何一个被挤掉 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/talk"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
+                android:layout_weight="1"
+                android:background="@drawable/bg_btn_primary"
+                    android:backgroundTint="@null"
+                    android:stateListAnimator="@null"
+                android:text="◉ 语音"
+                android:textColor="#0E1620"
+                android:textSize="14sp" />
+
+            <Button
+                android:id="@+id/stop_nav"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
+                android:layout_marginStart="8dp"
+                android:layout_weight="1"
+                android:background="@drawable/bg_btn_danger"
+                    android:backgroundTint="@null"
+                    android:stateListAnimator="@null"
+                android:text="@string/nav_stop"
+                android:textColor="#F2E4E4"
+                android:textSize="14sp" />
+
+            <Button
+                android:id="@+id/history_nav"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
+                android:layout_marginStart="8dp"
+                android:layout_weight="1"
+                android:background="@drawable/bg_btn_ghost"
+                android:backgroundTint="@null"
+                android:stateListAnimator="@null"
+                android:text="历史目的地"
+                android:textColor="#E6EDF5"
+                android:textSize="14sp" />
+
+            <Button
+                android:id="@+id/back_to_chat"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
+                android:layout_marginStart="8dp"
+                android:layout_weight="1"
+                android:background="@drawable/bg_btn_ghost"
+                android:backgroundTint="@null"
+                android:stateListAnimator="@null"
+                android:text="@string/nav_back"
+                android:textColor="#E6EDF5"
+                android:textSize="14sp" />
+        </LinearLayout>
+    </LinearLayout>
+
+</FrameLayout>
