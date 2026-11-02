@@ -69,8 +69,24 @@ class VoiceEngine(private val context: Context) {
     @Volatile
     var onBargeIn: (() -> Unit)? = null
 
+    /**
+     * 本地命中睡眠口令时回调。宿主注入「播一句『好』然后休眠」。
+     *
+     * ★ 为什么要在本地拦，不交给模型判断（照 D:/AI 的 _sleep_match 移植）：
+     *   原来「你休息吧」是当作普通一句话交给 LLM，由模型决定调 sleep 工具。
+     *   代价是用户说完要等 1~2 秒（LLM 首字延迟 + 工具调用往返）才听到回应，
+     *   而且模型偶尔不调工具，用户就会觉得"说了没反应"。
+     *
+     *   睡眠口令是固定短语、语义明确、不需要推理，本地正则判断既快又不会漏。
+     *   命中后不经过 LLM，直接播报 + 休眠。
+     *
+     *   为 null 时不拦截，退回原来的 LLM 工具路径 —— 保证即使宿主没注入也能用。
+     */
+    @Volatile
+    var onSleepCommand: (() -> Unit)? = null
+
     private var capture: AudioCapture? = null
-    private var wake: VoskWake? = null
+    private var wake: com.navagent.core.WakeWord? = null
     private var vad: EnergyVad? = null
     private val asr = MinimaxAsr()
 
@@ -147,13 +163,14 @@ class VoiceEngine(private val context: Context) {
         // 模型放外部私有目录：adb 能直接 push 进去，省得每次重装都重新下 44MB
         val modelRoot = context.getExternalFilesDir(null) ?: context.filesDir
         val dir = ModelStore.voskDir(modelRoot)
+        val words = Prefs.wakeWordList()
         if (dir != null) {
-            wake = VoskWake(dir, Prefs.wakeWordList())
+            wake = VoskWake(dir, words)
         } else {
             notify("首次使用，正在准备语音模型…")
             val d = ModelStore.ensureVosk(modelRoot) { msg -> notify(msg) }
             if (d != null) {
-                wake = VoskWake(d, Prefs.wakeWordList())
+                wake = VoskWake(d, words)
             } else {
                 lastError = "语音模型下载失败，唤醒词不可用（按钮仍可用）"
                 notify(lastError!!)
@@ -197,10 +214,19 @@ class VoiceEngine(private val context: Context) {
      *
      *   所以这里等播报彻底结束（isSpeakingProvider() 变 false 且过了回声保护期），
      *   再真正进入 ASLEEP。
+     *
+     * @param startGuardMs 开始轮询前的等待。云端 TTS 是"请求 → 合成 → 播放"，
+     *   调用 speak() 之后 isSpeaking 要等几百毫秒才变 true。本地拦截睡眠口令时
+     *   紧接着就调这个方法，如果不给守卫会立刻判定"没在播"→ 800ms 后就睡了，
+     *   把刚合成好的「好」截断。LLM 工具路径不需要（那时 TTS 已经在播），传 0。
      */
-    fun sleepAfterSpeaking() {
+    fun sleepAfterSpeaking(startGuardMs: Long = 0L) {
         main.post {
-            waitSpeakingThenSleep(0)
+            if (startGuardMs <= 0L) {
+                waitSpeakingThenSleep(0)
+            } else {
+                main.postDelayed({ waitSpeakingThenSleep(0) }, startGuardMs)
+            }
         }
     }
 
@@ -314,6 +340,15 @@ class VoiceEngine(private val context: Context) {
                         main.post { setState(State.LISTENING) }
                     }
 
+                    // ★ 睡眠口令本地拦截：不走 LLM，省掉 1~2 秒往返，也不会漏。
+                    //   必须放在 isWakeOnly 之后、else 之前 —— 顺序错了「小度你休息吧」
+                    //   会被当成纯唤醒词丢掉。
+                    onSleepCommand != null && isSleepCommand(text) -> {
+                        Dbg.log("本地命中睡眠口令：「$text」")
+                        lastActivityMs = System.currentTimeMillis()
+                        main.post { onSleepCommand?.invoke() }
+                    }
+
                     else -> {
                         lastActivityMs = System.currentTimeMillis()
                         main.post {
@@ -396,6 +431,29 @@ class VoiceEngine(private val context: Context) {
         return re
     }
 
+    /**
+     * 是不是睡眠口令（照 D:/AI `_sleep_match` 的规则移植）。
+     *
+     * 两条约束缺一不可：
+     *   1. **必须出现在句首**。纯包含匹配太激进 —— D:/AI 那边踩过
+     *      「你休息吧起了怪了是不是必须要等多长时间」被当成睡眠命令吃掉。
+     *   2. **尾巴只能是语气词**。哪怕多一个实词（「你休息吧那导航怎么办」）
+     *      也说明用户是在追问，不是在命令。
+     *
+     * 命中即返回，不再看更短的短语：短语表按长度降序排，
+     * 「你先休息一下吧」优先于「你先休息吧」，避免长句被短词切碎。
+     */
+    private fun isSleepCommand(text: String): Boolean {
+        val norm = text.filter { it.isLetterOrDigit() }
+        if (norm.isEmpty()) return false
+        for (phrase in SLEEP_PHRASES) {
+            if (!norm.startsWith(phrase)) continue
+            val tail = norm.substring(phrase.length)
+            return tail.all { it in TRAILING_PARTICLES }
+        }
+        return false
+    }
+
     private fun setState(s: State) {
         if (state == s) return
         state = s
@@ -415,9 +473,22 @@ class VoiceEngine(private val context: Context) {
         main.post { listener?.onNotice(msg) }
     }
 
+    /**
+     * 唤醒提示音：**两声**短促的「嘀」。
+     *
+     * ★ 为什么从一声改成两声：单声 120ms 在车内太容易被路噪、导航播报盖掉，
+     *   用户喊完不知道有没有醒，往往再喊一遍。两声间隔 140ms 有明显节奏感，
+     *   比加长单声更容易从环境噪音里分辨出来，又不至于像 D:/AI 那样
+     *   播一句「我在呢」—— 车里正在导航，TTS 会打断播报。
+     */
     private fun beep() {
         if (!Prefs.wakeBeep) return
-        runCatching { tone?.startTone(ToneGenerator.TONE_PROP_BEEP, 120) }
+        runCatching {
+            tone?.startTone(ToneGenerator.TONE_PROP_BEEP, WAKE_BEEP_MS)
+            main.postDelayed({
+                runCatching { tone?.startTone(ToneGenerator.TONE_PROP_BEEP, WAKE_BEEP_MS) }
+            }, WAKE_BEEP_GAP_MS)
+        }
     }
 
     fun stateSnapshot(): Pair<State, String> = state to hintFor(state)
@@ -443,5 +514,44 @@ class VoiceEngine(private val context: Context) {
 
         /** 播报结束后的额外等待，等回声尾巴散掉 */
         const val POST_SPEAK_GUARD_MS = 800L
+
+        /** 唤醒提示音：单声时长 / 两声间隔 */
+        const val WAKE_BEEP_MS = 90
+        const val WAKE_BEEP_GAP_MS = 140L
+
+        /**
+         * 睡眠口令表。**必须按长度降序** —— [isSleepCommand] 命中第一个前缀就定论，
+         * 短的排前面会把「你先休息一下吧」切成「你先休息吧 + 一下」，尾巴不是
+         * 语气词，直接判否，反而漏掉。
+         *
+         * 这份表要和 NavigationTool / ChatEngine 提示词里告诉模型的那几句对齐，
+         * 否则会出现「说了但本地不认、模型也不认」的灰区。
+         */
+        val SLEEP_PHRASES = listOf(
+            "你先不要打扰我啊",
+            "你先休息一下吧",
+            "你不要打扰我啊",
+            "你先不要打扰我",
+            "你先休息一下",
+            "你不要打扰我",
+            "我先忙一会啊",
+            "你先休息吧",
+            "我先忙一会",
+            "你休息吧",
+            "你退下吧",
+            "先这样吧",
+            "先到这吧",
+            "安静点",
+            "别说了",
+            "闭嘴"
+        )
+
+        /**
+         * 句尾允许出现的语气词。
+         *
+         * 只有这些字跟在口令后面才算"在命令"；多一个实词（「你休息吧那导航怎么办」）
+         * 就说明用户在追问，必须放给 LLM。这条是从 D:/AI 那边实测踩坑抄来的。
+         */
+        val TRAILING_PARTICLES = "啊呀呢吧哦哈嗯啦哟嘛".toSet()
     }
 }

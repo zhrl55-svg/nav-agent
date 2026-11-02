@@ -10,6 +10,9 @@ interface Asr {
  * feed 是流式喂的，内部自己攒缓冲；命中就返回 true。
  */
 interface WakeWord {
+    /** 模型是否加载成功。失败时 [feed] 永远返回 false，界面据此提示 */
+    val ready: Boolean
+
     fun feed(pcm: ShortArray, len: Int): Boolean
     fun reset()
     fun shutdown()

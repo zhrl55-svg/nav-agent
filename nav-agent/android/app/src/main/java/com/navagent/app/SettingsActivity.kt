@@ -108,11 +108,12 @@ class SettingsActivity : AppCompatActivity() {
         val keepY = if (::scroll.isInitialized) scroll.scrollY else 0
         container.removeAllViews()
 
-        section("语音识别")
-        row(
-            "ASR 模型", Prefs.asrModel,
-            "云端语音识别。改完下一句生效"
-        ) { editText("ASR 模型", Prefs.asrModel, "asr-1.0") { Prefs.asrModel = it; applied() } }
+        // ---------------------------------------------------------- 唤醒与会话
+        //
+        // ★ 2026-11-02 收拢：以前「唤醒词」在「语音识别」栏、「AI 名字 / 唤醒词跟随名字」
+        //   在「对话大脑」栏，改一个唤醒相关的东西要跨两个分区找。
+        //   凡是跟"叫醒它"和"会话什么时候结束"有关的，全放这一栏。
+        section("唤醒与会话")
 
         row(
             "唤醒词", wakeSummary(),
@@ -130,20 +131,43 @@ class SettingsActivity : AppCompatActivity() {
             }
         }
 
-        row("会话休眠", humanDuration(Prefs.idleTimeoutMs), "多久没人说话就退出连续对话") {
+        rowSwitch("唤醒提示音", Prefs.wakeBeep, "命中唤醒词时「嘀」一声") {
+            Prefs.wakeBeep = it; applied()
+        }
+
+        row("会话休眠", humanDuration(Prefs.idleTimeoutMs), "唤醒后这么久没人说话就退出连续对话") {
             choose(
                 "会话休眠", listOf(
-                    "5 秒" to 5_000L,
                     "10 秒" to 10_000L,
-                    "20 秒（推荐）" to 20_000L,
+                    "20 秒" to 20_000L,
                     "30 秒" to 30_000L,
-                    "60 秒" to 60_000L
+                    "60 秒（推荐）" to 60_000L,
+                    "120 秒（长时间不打断）" to 120_000L
                 ), Prefs.idleTimeoutMs
             ) { Prefs.idleTimeoutMs = it; applied() }
         }
 
-        rowSwitch("唤醒提示音", Prefs.wakeBeep, "命中唤醒词时「嘀」一声") {
-            Prefs.wakeBeep = it; applied()
+        row("AI 名字", Prefs.aiName, "模型自称、聊天页标题都用它，改完下一句生效") {
+            editText("AI 名字", Prefs.aiName, "小高") {
+                val name = it.trim().ifBlank { "小高" }
+                Prefs.aiName = name
+                if (Prefs.wakeFollowsName) {
+                    Prefs.wakeWords = "${name},${name}你好,你好${name}"
+                    VoiceService.reloadWake(this)
+                }
+                applied()
+                toast(if (Prefs.wakeFollowsName) "名字和唤醒词已同步为「$name」" else "AI 名字已改为「$name」")
+            }
+        }
+        rowSwitch("唤醒词跟随 AI 名字", Prefs.wakeFollowsName, "开启后，唤醒词自动设为「名字」「名字你好」「你好名字」") {
+            Prefs.wakeFollowsName = it
+            if (it) {
+                val name = Prefs.aiName
+                Prefs.wakeWords = "${name},${name}你好,你好${name}"
+                VoiceService.reloadWake(this)
+                toast("唤醒词已同步为「$name」")
+            }
+            render()
         }
 
         section("声纹")
@@ -179,65 +203,43 @@ class SettingsActivity : AppCompatActivity() {
             ) { Prefs.voiceprintThreshold = it; applied() }
         }
 
-        section("对话大脑")
-        row("AI 名字", Prefs.aiName, "模型自称、聊天页标题都用它，改完下一句生效") {
-            editText("AI 名字", Prefs.aiName, "小高") {
-                val name = it.trim().ifBlank { "小高" }
-                Prefs.aiName = name
-                if (Prefs.wakeFollowsName) {
-                    Prefs.wakeWords = "${name},${name}你好,你好${name}"
-                    VoiceService.reloadWake(this)
-                }
+        // ---------------------------------------------------------- 语音服务
+        //
+        // ★ 语音（识别/合成）目前只有 MiniMax，和「对话大脑」是两套独立的配置。
+        //   以前它们共用一个地址和一个 Key，于是"把对话接到本地模型"必然会把
+        //   语音识别一起打坏。现在分开：这一栏改坏了只影响听和说，不影响思考。
+        section("语音服务 · MiniMax")
+
+        row(
+            "语音 API Key", voiceKeyLabel(),
+            "识别和合成共用。填自己的额度，不用重新编译；清空恢复内置"
+        ) {
+            editText("语音 API Key", Prefs.voiceKeyRaw, "sk-...", masked = true) {
+                Prefs.voiceKeyRaw = it
                 applied()
-                toast(if (Prefs.wakeFollowsName) "名字和唤醒词已同步为「$name」" else "AI 名字已改为「$name」")
-            }
-        }
-        rowSwitch("唤醒词跟随 AI 名字", Prefs.wakeFollowsName, "开启后，唤醒词自动设为「名字」「名字你好」「你好名字」") {
-            Prefs.wakeFollowsName = it
-            if (it) {
-                val name = Prefs.aiName
-                Prefs.wakeWords = "${name},${name}你好,你好${name}"
-                VoiceService.reloadWake(this)
-                toast("唤醒词已同步为「$name」")
-            }
-            render()
-        }
-
-        row("对话模型", Prefs.chatModel, "闲聊和问答用哪个模型") {
-            val presets = listOf(
-                "minimax-m3.1-flash（快，推荐）" to "minimax-m3.1-flash",
-                "MiniMax-M2.7（更快）" to "MiniMax-M2.7",
-                "MiniMax-Text-01（稳）" to "MiniMax-Text-01",
-                "MiniMax-M2.5-highspeed" to "MiniMax-M2.5-highspeed",
-                "自定义…" to ""
-            )
-            choose("对话模型", presets, Prefs.chatModel) { pick ->
-                if (pick.isEmpty()) {
-                    editText("自定义对话模型", Prefs.chatModel, "模型名") { Prefs.chatModel = it; applied() }
-                } else {
-                    Prefs.chatModel = pick; applied()
-                }
+                toast(if (it.isBlank()) "已恢复内置 Key" else "已切换到自定义 Key")
             }
         }
 
-        row("回复长度", humanTokens(Prefs.maxTokens), "单条回复最多多少 token") {
-            choose(
-                "回复长度", listOf(
-                    "短（150，一两句）" to 150,
-                    "中（400，推荐）" to 400,
-                    "长（800）" to 800
-                ), Prefs.maxTokens
-            ) { Prefs.maxTokens = it; applied() }
+        row(
+            "语音 API 地址",
+            Prefs.voiceBaseRaw.ifEmpty { "默认（api.minimaxi.com）" },
+            "换中转才需要改。接本地大模型请去下面「对话大脑」，别改这里"
+        ) {
+            editText("语音 API 地址", Prefs.voiceBaseRaw, "https://api.minimaxi.com/v1") {
+                Prefs.voiceBaseRaw = it
+                applied()
+            }
         }
 
-        row("记忆轮数", "${Prefs.historyTurns} 轮", "带多少轮历史给模型，越多越贵越慢") {
-            choose(
-                "记忆轮数", listOf(
-                    "4 轮" to 4,
-                    "8 轮（推荐）" to 8,
-                    "16 轮" to 16
-                ), Prefs.historyTurns
-            ) { Prefs.historyTurns = it; applied() }
+        row("识别模型", Prefs.asrModel, "云端语音识别，改完下一句生效") {
+            editText("识别模型", Prefs.asrModel, "asr-1.0") { Prefs.asrModel = it; applied() }
+        }
+
+        row("合成模型", Prefs.ttsCloudModel, "云端播报用的模型，只对「MiniMax 云端」引擎生效") {
+            editText("合成模型", Prefs.ttsCloudModel, "speech-02-hd") {
+                Prefs.ttsCloudModel = it; applied()
+            }
         }
 
         section("语音播报")
@@ -303,6 +305,114 @@ class SettingsActivity : AppCompatActivity() {
             Prefs.bargeIn = it; applied()
         }
 
+        // ---------------------------------------------------------- 对话大脑
+        //
+        // ★ 2026-11-02 解耦：不再是"MiniMax 专用"。
+        //   协议本来就是 OpenAI 那套，只要对方支持 `{地址}/chat/completions`，
+        //   云端中转、局域网里的 Ollama / LM Studio / vLLM 都能接。
+        //   地址和 Key 跟上面「语音服务」完全独立，改这边不会影响听和说。
+        section("对话大脑")
+
+        row("服务商", providerLabel(), "换一家会同时改接口地址和模型名，之后可以再手动改") {
+            choose(
+                "对话大脑服务商", listOf(
+                    "MiniMax（默认，云端）" to Prefs.PROVIDER_MINIMAX,
+                    "OpenAI 兼容（自填地址）" to Prefs.PROVIDER_OPENAI,
+                    "本地 / 局域网（Ollama、LM Studio、vLLM）" to Prefs.PROVIDER_LOCAL
+                ), Prefs.chatProvider
+            ) { applyProvider(it) }
+        }
+
+        row(
+            "接口地址", chatBaseLabel(),
+            "OpenAI 兼容格式。默认预设 http://127.0.0.1:8802/v1"
+        ) {
+            editText("接口地址", Prefs.chatBaseRaw, "http://127.0.0.1:8802/v1") {
+                Prefs.chatBaseRaw = it
+                applied()
+                toast(
+                    when {
+                        it.isBlank() -> "已恢复默认：跟随语音服务的 MiniMax 地址"
+                        !it.startsWith("http") -> "地址要以 http:// 或 https:// 开头"
+                        else -> "接口地址已保存"
+                    }
+                )
+            }
+        }
+
+        row("API Key", chatKeyLabel(), "本地模型一般不用填；清空就不发送 Key") {
+            editText("对话大脑 API Key", Prefs.chatKeyRaw, "sk-...（本地可留空）", masked = true) {
+                Prefs.chatKeyRaw = it
+                applied()
+                toast(if (it.isBlank()) "已清空，请求不再带 Key" else "Key 已保存")
+            }
+        }
+
+        row("对话模型", Prefs.chatModel, "填服务端实际的模型名，写错会 404") {
+            val custom = {
+                editText("对话模型", Prefs.chatModel, "服务端里的模型名") {
+                    Prefs.chatModel = it; applied()
+                }
+                Unit
+            }
+            when (Prefs.chatProvider) {
+                // 本地跑什么模型只有用户自己知道，直接让他填，别拿预设误导
+                Prefs.PROVIDER_LOCAL -> custom()
+                else -> choose(
+                    "对话模型",
+                    if (Prefs.chatProvider == Prefs.PROVIDER_OPENAI) OPENAI_MODELS else MINIMAX_MODELS,
+                    Prefs.chatModel
+                ) { pick -> if (pick.isEmpty()) custom() else { Prefs.chatModel = pick; applied() } }
+            }
+        }
+
+        // 接本地模型最容易踩的三个坑（地址、端口、模型名）表现完全一样：说了没反应。
+        // 日志要连 adb 才看得到，车里没这个条件，所以给一个能当场出结论的按钮。
+        row("连接测试", "测一下", "发一句最短的话，验证地址、模型名和 Key") {
+            toast("正在测试…")
+            Thread {
+                val result = ChatProbe.run()
+                runOnUiThread {
+                    if (isFinishing) return@runOnUiThread
+                    AlertDialog.Builder(this)
+                        .setTitle("对话大脑连通性")
+                        .setMessage(result)
+                        .setPositiveButton("知道了", null)
+                        .show()
+                }
+            }.apply { isDaemon = true; name = "chat-probe" }.start()
+        }
+
+        rowSwitch(
+            "工具调用", Prefs.toolsEnabled,
+            "导航、搜索、天气都靠它。本地小模型不会 Function Calling 时关掉，退化成纯聊天"
+        ) {
+            Prefs.toolsEnabled = it
+            applied()
+            if (!it) toast("已关闭：只能聊天，导航和搜索都用不了")
+        }
+
+        row("回复长度", humanTokens(Prefs.maxTokens), "单条回复最多多少 token") {
+            choose(
+                "回复长度", listOf(
+                    "短（150，一两句）" to 150,
+                    "中（400，推荐）" to 400,
+                    "长（800）" to 800,
+                    "超长（2000）" to 2000
+                ), Prefs.maxTokens
+            ) { Prefs.maxTokens = it; applied() }
+        }
+
+        row("记忆轮数", "${Prefs.historyTurns} 轮", "带多少轮历史给模型，越多越贵越慢") {
+            choose(
+                "记忆轮数", listOf(
+                    "4 轮" to 4,
+                    "8 轮（推荐）" to 8,
+                    "16 轮" to 16
+                ), Prefs.historyTurns
+            ) { Prefs.historyTurns = it; applied() }
+        }
+
         section("导航")
         rowSwitch("高德官方导航界面", Prefs.amapBuiltinUi, "用高德内置的转向图、车道线、路况条。关掉则用自绘 HUD") {
             Prefs.amapBuiltinUi = it
@@ -361,7 +471,24 @@ class SettingsActivity : AppCompatActivity() {
         }
 
         section("联网搜索")
-        row("搜索服务", if (Prefs.tavilyKey.isBlank()) "未配置" else "Tavily 已配置", "联网搜索依赖 Tavily Key；未配置时无法实时检索") {
+
+        // ★ 2026-11-02：接本地接口时不再塞 Tavily。
+        //   本地那套服务（127.0.0.1:8802）自带完整检索，模型在服务端就查完了；
+        //   再给它一个 web_search 等于让它二选一，而 Tavily 那份又慢又碎。
+        row(
+            "搜索工具", webSearchLabel(),
+            "接本地模型时默认关闭：本地服务自己会检索，不用再塞一份 Tavily"
+        ) {
+            choose(
+                "搜索工具", listOf(
+                    "自动（本地接口关闭，云端开启）" to Prefs.WEB_SEARCH_AUTO,
+                    "始终开启（用 Tavily）" to Prefs.WEB_SEARCH_ON,
+                    "始终关闭" to Prefs.WEB_SEARCH_OFF
+                ), Prefs.webSearchMode
+            ) { Prefs.webSearchMode = it; applied() }
+        }
+
+        row("搜索服务", if (Prefs.tavilyKey.isBlank()) "未配置" else "Tavily 已配置", "只在上面「搜索工具」启用时才用得到") {
             editText("Tavily 搜索 Key", Prefs.tavilyKey, "tvly-…", masked = true) {
                 val key = it.trim()
                 Prefs.tavilyKey = key
@@ -754,13 +881,23 @@ class SettingsActivity : AppCompatActivity() {
 
     private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
 
-    private fun humanDuration(ms: Long): String =
-        if (ms % 1000L == 0L) "${ms / 1000} 秒" else String.format("%.1f 秒", ms / 1000f)
+    /**
+     * 毫秒 → 人话。
+     *
+     * 整分钟优先显示分钟：会话休眠的选项里有 120 秒，写成「120 秒」读起来
+     * 还得在脑子里换算一下，「2 分钟」一眼就懂。60 秒以下的行为不变。
+     */
+    private fun humanDuration(ms: Long): String = when {
+        ms >= 60_000L && ms % 60_000L == 0L -> "${ms / 60_000} 分钟"
+        ms % 1000L == 0L -> "${ms / 1000} 秒"
+        else -> String.format("%.1f 秒", ms / 1000f)
+    }
 
     private fun humanTokens(t: Int): String = when {
         t <= 200 -> "短（$t）"
         t <= 500 -> "中（$t）"
-        else -> "长（$t）"
+        t <= 1000 -> "长（$t）"
+        else -> "超长（$t）"
     }
 
     private fun humanRadius(m: Int): String =
@@ -784,6 +921,87 @@ class SettingsActivity : AppCompatActivity() {
         VOICES.firstOrNull { it.second == id }?.first ?: id
 
     private fun voiceLabel(): String = labelOfVoice(Prefs.ttsVoiceId)
+
+    // ---------------------------------------------------------------- 对话大脑
+
+    private fun providerLabel(): String = when (Prefs.chatProvider) {
+        Prefs.PROVIDER_LOCAL -> if (Prefs.chatEndpointIsLocal()) "本地 / 局域网" else "自定义地址"
+        Prefs.PROVIDER_OPENAI -> "OpenAI 兼容"
+        else -> "MiniMax（默认）"
+    }
+
+    private fun chatBaseLabel(): String = when {
+        Prefs.chatBaseRaw.isEmpty() -> "MiniMax 官方（跟随语音服务）"
+        else -> Prefs.chatBaseRaw
+    }
+
+    private fun chatKeyLabel(): String {
+        val k = Prefs.chatApiKey()
+        if (k.isBlank()) return "未填（不发 Key）"
+        return if (Prefs.chatEndpointIsCustom()) {
+            "自定义 ${Prefs.maskedChatKey()}"
+        } else {
+            "内置 ${Prefs.maskedChatKey()}"
+        }
+    }
+
+    private fun voiceKeyLabel(): String =
+        if (Prefs.voiceUsingCustomKey()) "自定义 ${Prefs.maskedVoiceKey()}" else "内置 ${Prefs.maskedVoiceKey()}"
+
+    private fun webSearchLabel(): String = when (Prefs.webSearchMode) {
+        Prefs.WEB_SEARCH_ON -> "开启（Tavily）"
+        Prefs.WEB_SEARCH_OFF -> "关闭"
+        else -> if (Prefs.webSearchEnabled()) "自动 · 开启" else "自动 · 关闭"
+    }
+
+    /**
+     * 切服务商：一次把地址、模型改到位。
+     *
+     * 不这么做的话，用户从 MiniMax 切到本地模型时地址改了、模型名还留着
+     * `minimax-m3.1-flash`，请求必然 404，而报错只写进日志 ——
+     * 体感就是"接上本地模型之后它不说话了"。
+     */
+    private fun applyProvider(provider: String) {
+        Prefs.chatProvider = provider
+        when (provider) {
+            Prefs.PROVIDER_MINIMAX -> {
+                // 空 = 跟随语音服务，老配置和内置 Key 都能直接用
+                Prefs.chatBaseRaw = ""
+                Prefs.chatKeyRaw = ""
+                Prefs.chatModel = "minimax-m3.1-flash"
+                toast("已切回 MiniMax 官方，不用再填地址")
+            }
+            Prefs.PROVIDER_OPENAI -> {
+                Prefs.chatBaseRaw = "https://api.openai.com/v1"
+                Prefs.chatModel = "gpt-4o-mini"
+                toast("把地址换成你自己的中转，再填 Key")
+            }
+            else -> {
+                // 用户指定：本地模型默认预设 127.0.0.1:8802（手机上的转发/本机服务）。
+                // 接电脑上的 LM Studio（1234）或 Ollama（11434）时把地址改掉即可。
+                Prefs.chatBaseRaw = "http://127.0.0.1:8802/v1"
+                Prefs.chatModel = "qwen2.5:7b"
+                toast("已填本地预设 127.0.0.1:8802；接电脑上的服务就把地址改成电脑 IP")
+            }
+        }
+        app.applySettings()
+        render()
+    }
+
+    /** MiniMax 云端可选模型 */
+    private val MINIMAX_MODELS = listOf(
+        "minimax-m3.1-flash（快，推荐）" to "minimax-m3.1-flash",
+        "MiniMax-M2.7（更快）" to "MiniMax-M2.7",
+        "MiniMax-Text-01（稳）" to "MiniMax-Text-01",
+        "MiniMax-M2.5-highspeed" to "MiniMax-M2.5-highspeed",
+        "自定义…" to ""
+    )
+
+    private val OPENAI_MODELS = listOf(
+        "gpt-4o-mini（便宜）" to "gpt-4o-mini",
+        "gpt-4o" to "gpt-4o",
+        "自定义…" to ""
+    )
 
     /** 唤醒词太长，列表里只显示摘要；点进去看全部 */
     private fun wakeSummary(): String {

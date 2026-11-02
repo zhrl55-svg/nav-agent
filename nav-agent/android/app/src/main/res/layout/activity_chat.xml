@@ -76,6 +76,17 @@
             android:text="@string/settings"
             android:textColor="#8FA8C0"
             android:textSize="14sp" />
+
+        <ImageButton
+            android:id="@+id/exit_chat"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:layout_marginStart="2dp"
+            android:background="@drawable/bg_nav_exit"
+            android:contentDescription="@string/nav_exit_desc"
+            android:padding="12dp"
+            android:scaleType="fitCenter"
+            android:src="@drawable/ic_close" />
     </LinearLayout>
 
     <androidx.recyclerview.widget.RecyclerView
@@ -112,20 +123,37 @@
             android:textSize="15sp"
             android:autofillHints="" />
 
-        <Button
+        <!-- 同导航页：自己排图标和文字，别用 Button 的 drawableStart -->
+        <LinearLayout
             android:id="@+id/mic"
             android:layout_width="wrap_content"
             android:layout_height="46dp"
             android:layout_marginStart="8dp"
-            android:minWidth="72dp"
             android:background="@drawable/bg_btn_primary"
-                    android:backgroundTint="@null"
-                    android:stateListAnimator="@null"
-            android:drawableStart="@drawable/ic_mic"
-            android:drawablePadding="4dp"
-            android:text="语音"
-            android:textColor="#0E1620"
-            android:textSize="13sp" />
+            android:clickable="true"
+            android:focusable="true"
+            android:gravity="center"
+            android:minWidth="72dp"
+            android:orientation="horizontal"
+            android:paddingHorizontal="10dp">
+
+            <ImageView
+                android:id="@+id/mic_icon"
+                android:layout_width="18dp"
+                android:layout_height="18dp"
+                android:contentDescription="@null"
+                android:src="@drawable/ic_mic" />
+
+            <TextView
+                android:id="@+id/mic_label"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="3dp"
+                android:includeFontPadding="false"
+                android:text="语音"
+                android:textColor="#0E1620"
+                android:textSize="13sp" />
+        </LinearLayout>
 
         <Button
             android:id="@+id/send"

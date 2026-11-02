@@ -92,6 +92,12 @@ class AmapNavController(
                 // 关掉内置语音，否则会和我们自己的 TTS 双重播报
                 it.setUseInnerVoice(false)
 
+                // ★ 不要开 setMultipleRouteNaviMode(true)。
+                //   官方语义是「多路径导航模式」：导航中 SDK 会实时比较所有候选路线的路况，
+                //   **自动切换到更快的那条**。实测在市区短途会来回跳（候选路线长度还都一样），
+                //   表现就是导航频繁改道、播报反复说「已为你换路」。
+                //   2026-11-01 加过又撤了，别再开。
+
                 // ★ 车辆信息：开启车行限制。详见 [applyCarInfo]。
                 applyCarInfo(it)
             }
@@ -249,6 +255,14 @@ class AmapNavController(
             latitude = point.latitude
             longitude = point.longitude
         }
+        // 调试起点：固定坐标重算，排除 GPS 漂移干扰（对比配置改动时用）
+        debugStart?.let { (lat, lon) ->
+            start.latitude = lat
+            start.longitude = lon
+            Dbg.log("★ 使用调试起点 $lat,$lon（忽略真实定位）")
+        }
+        Dbg.log("算路 ${start.latitude},${start.longitude} → ${end.latitude},${end.longitude}（${point.formatted}）")
+
         val strategy = PathPlanningStrategy.DRIVING_MULTIPLE_ROUTES_DEFAULT
         Dbg.log("算路策略 = $strategy (DRIVING_MULTIPLE_ROUTES_DEFAULT=10)")
         val ok = n.calculateDriveRoute(
@@ -263,7 +277,10 @@ class AmapNavController(
             //     「DRIVING_MULTIPLE_ROUTES_DEFAULT —— 多路径-速度优先+躲避拥堵+距离较短，
             //       **建议使用该策略**，策略值 10」
             //
-            //   多路径会同时返回若干条备选路线，SDK 默认取第一条。
+            //   ★ 2026-11-01 实测：换成带 AMapNaviCalRouteOptions 的重载、
+            //     开 setIntelligentSorting(true)（智能排序），同一个起点算出来的
+            //     路线一模一样。所以智能排序对「起点在小区内部」这个场景无效，
+            //     没必要为了它改调用方式。详见 README 决策 7。
             strategy
         )
         Dbg.log("calculateDriveRoute 返回=$ok")
@@ -396,6 +413,18 @@ class AmapNavController(
     val hasLocationFix: Boolean
         get() = hasFix
 
+    /**
+     * 调试用：强制指定算路起点，忽略真实定位。
+     *
+     * 为什么要这个：室内 GPS 会在小区里漂几十米，而起点差 30m 就能让路线
+     * 从南门变成北门。不固定起点，就没法判断「改配置到底有没有用」——
+     * 实测踩过一次：以为智能排序生效了，其实是定位漂到了另一条路上。
+     *
+     * 入口：`am start ... --es slat 38.945004 --es slon 100.418646`
+     */
+    @Volatile
+    var debugStart: Pair<Double, Double>? = null
+
     /** 当前坐标，给周边搜索用；没定位返回 null */
     fun currentLocation(): Pair<Double, Double>? =
         if (hasFix) lastLat to lastLon else null
@@ -433,7 +462,11 @@ class AmapNavController(
 
         override fun onCalculateRouteSuccess(p0: AMapCalcRouteResult?) {
             val n = navi ?: return
-            Dbg.log("onCalculateRouteSuccess")
+            // 只记录候选数量，**不要**去 selectRouteId 遍历。
+            // 遍历会把当前路线切到最后一条，而且多路径模式下 SDK 自己也会来回切，
+            // 叠在一起就是导航频繁改道（实测故障）。
+            Dbg.log("onCalculateRouteSuccess 候选=${p0?.getRouteid()?.size ?: 0}")
+
             val path = n.naviPath
             pathRemainSeconds = path?.allTime ?: 0
             pathRemainMeters = path?.allLength ?: 0

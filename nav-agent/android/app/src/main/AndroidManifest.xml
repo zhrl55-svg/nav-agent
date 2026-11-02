@@ -45,6 +45,18 @@
         </intent>
     </queries>
 
+    <!--
+      usesCleartextTraffic：允许明文 HTTP。
+
+      ★ 2026-11-02 加。对话大脑现在可以接本地模型，地址形如
+        `http://192.168.1.100:1234/v1`（LM Studio）/ `:11434/v1`（Ollama）。
+        Android 9+ 默认禁止明文 HTTP，不开这个开关，请求会直接抛
+        `Cleartext HTTP traffic not permitted` —— 现象是"接上本地模型之后它不说话"，
+        而且这个异常只在日志里出现一次，极难联想。
+
+      代价说明：这意味着全 App 都允许 http://。对本项目可以接受 ——
+      默认走的是 https 的官方接口，明文只会在用户自己填局域网地址时用到。
+    -->
     <application
         android:name=".NavApp"
         android:allowBackup="false"
@@ -52,6 +64,7 @@
         android:roundIcon="@mipmap/ic_launcher_round"
         android:label="@string/app_name"
         android:supportsRtl="true"
+        android:usesCleartextTraffic="true"
         android:theme="@style/Theme.NavAgent">
 
         <!-- 高德 Key：包名 com.navagent，绑定 android-nav -->
@@ -81,12 +94,20 @@
           导航页本来就有地图、语音按钮和输入框，功能是聊天页的超集。
 
           LAUNCHER 只能有一个，所以 ChatActivity 那边移掉了 intent-filter。
+
+          clearTaskOnLaunch：每次从桌面点图标都清空任务栈，只留这一页。
+          没有它的话，用户上次停在对话页、按 Home 再点图标，Android 会恢复
+          任务栈顶层 —— 也就是又看到对话页。用户明确要求「打开 App 默认
+          不要停在对话页」，所以这里强制回到导航页。
+          注意它只影响"从桌面启动"这一刻，应用内导航页 ↔ 对话页的往返
+          （REORDER_TO_FRONT 保留实例）不受影响。
         -->
         <activity
             android:name=".NavActivity"
             android:exported="true"
             android:launchMode="singleTop"
-            android:screenOrientation="portrait">
+            android:screenOrientation="portrait"
+            android:clearTaskOnLaunch="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

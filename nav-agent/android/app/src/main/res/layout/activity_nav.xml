@@ -3,19 +3,25 @@
     android:layout_width="match_parent"
     android:layout_height="match_parent">
 
-    <!-- AMapNaviView 只当画布用，内置 UI 已在代码里 setLayoutVisible(false) 关掉 -->
+    <!-- AMapNaviView 当画布用。内置 UI 默认开着（Prefs.amapBuiltinUi），
+         由代码里的 setCrossLocation 限制在「状态栏下方 → 底部面板上方」这块区域。 -->
     <com.amap.api.navi.AMapNaviView
         android:id="@+id/navi_view"
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
-    <!-- 顶部 HUD：转向箭头 + 距离 + 路名 + 全程剩余 -->
+    <!-- 顶部 HUD：转向箭头 + 距离 + 路名 + 全程剩余。
+         ★ marginStart 让开左上角退出按钮（按钮 48dp + 左右各 8dp = 64dp），
+           否则 HUD 卡片会压住按钮，两个都点不准。 -->
     <LinearLayout
         android:id="@+id/hud"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_gravity="top"
-        android:layout_margin="10dp"
+        android:layout_marginTop="10dp"
+        android:layout_marginEnd="10dp"
+        android:layout_marginBottom="10dp"
+        android:layout_marginStart="64dp"
         android:background="@drawable/bg_card"
         android:elevation="8dp"
         android:gravity="center_vertical"
@@ -62,6 +68,32 @@
                 android:textSize="13sp" />
         </LinearLayout>
     </LinearLayout>
+
+    <!--
+      左上角退出按钮 —— 退出**整个应用**，不是退出导航。
+
+      ★ 为什么需要它：高德内置界面的底栏（退出 / 继续导航 / 设置）被
+        setCrossLocation 裁到了屏幕外 —— 我们把底部让给了自己的面板，
+        官方那个「退出」就跟着没了。不给一个显式入口，用户只能靠系统返回键，
+        车机上（尤其车机把返回键收进菜单）等于没有出口。
+
+      位置：贴状态栏下方、左边 8dp。topMargin 在代码里按状态栏实际高度设，
+            写死 12dp 在刘海屏上会被状态栏压掉。
+      z 序：放在 HUD 之后 → 盖在 HUD 和地图上面。
+    -->
+    <ImageButton
+        android:id="@+id/exit_nav"
+        android:layout_width="48dp"
+        android:layout_height="48dp"
+        android:layout_gravity="top|start"
+        android:layout_marginStart="8dp"
+        android:layout_marginTop="12dp"
+        android:background="@drawable/bg_nav_exit"
+        android:contentDescription="@string/nav_exit_desc"
+        android:elevation="6dp"
+        android:padding="14dp"
+        android:scaleType="fitCenter"
+        android:src="@drawable/ic_close" />
 
     <!-- 底部：状态 + 输入框 + 按钮。
          导航中唤醒聊天，回答不切页面 —— 地图不能离开视野，开车时也不看屏，主要靠 TTS。
@@ -154,19 +186,40 @@
             android:layout_marginTop="8dp"
             android:orientation="horizontal">
 
-            <Button
+            <!--
+              ★ 用 LinearLayout + ImageView + TextView，不用 Button 的 drawableStart。
+                Button 的「图标+文字」组合居中不可控：实测 paddingStart=0 之后
+                左边留白 1dp、右边 8dp，整体明显偏左，图标和文字之间也松。
+                自己排就能把间距压到 3dp，并且真正居中。
+            -->
+            <LinearLayout
                 android:id="@+id/talk"
                 android:layout_width="0dp"
                 android:layout_height="48dp"
                 android:layout_weight="1"
                 android:background="@drawable/bg_input"
-                    android:backgroundTint="@null"
-                    android:stateListAnimator="@null"
-                android:drawableStart="@drawable/ic_mic"
-                android:drawablePadding="3dp"
-                android:text="语音"
-                android:textColor="#E6EDF5"
-                android:textSize="13sp" />
+                android:clickable="true"
+                android:focusable="true"
+                android:gravity="center"
+                android:orientation="horizontal">
+
+                <ImageView
+                    android:id="@+id/talk_icon"
+                    android:layout_width="18dp"
+                    android:layout_height="18dp"
+                    android:contentDescription="@null"
+                    android:src="@drawable/ic_mic" />
+
+                <TextView
+                    android:id="@+id/talk_label"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="3dp"
+                    android:includeFontPadding="false"
+                    android:text="语音"
+                    android:textColor="#E6EDF5"
+                    android:textSize="13sp" />
+            </LinearLayout>
 
             <Button
                 android:id="@+id/stop_nav"

@@ -11,6 +11,7 @@ import android.content.pm.ServiceInfo
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
+import com.navagent.core.VoiceGuide
 
 /**
  * 语音前台服务。
@@ -55,6 +56,18 @@ class VoiceService : Service() {
             // 保护期长度在设置页可调：车内音响好、混响长就调大。
             v.isSpeaking || v.inEchoWindow(Prefs.echoGuardMs)
         }
+
+        // 睡眠口令本地命中：不经过 LLM，直接播一句「好」再休眠。
+        //
+        // 为什么给起始守卫：云端 TTS 是「请求 → 合成 → 播放」，speak() 返回时
+        // isSpeaking 还是 false，要几百毫秒才变 true。不给守卫的话
+        // sleepAfterSpeaking 会立刻判定"没在播"，800ms 后就睡了，「好」被截断。
+        engine.onSleepCommand = {
+            val app = application as NavApp
+            app.voice.speak("好", VoiceGuide.Priority.USER)
+            engine.sleepAfterSpeaking(SLEEP_SPEAK_GUARD_MS)
+        }
+
         // 识别的结果统一从这里进大脑，Activity 只是观众
         engine.setListener(object : VoiceEngine.Listener {
             override fun onState(state: VoiceEngine.State, hint: String) {
@@ -144,6 +157,14 @@ class VoiceService : Service() {
         const val ACTION_SLEEP = "com.navagent.SLEEP"
         const val ACTION_RELOAD_WAKE = "com.navagent.RELOAD_WAKE"
 
+        /**
+         * 本地睡眠口令命中后，等 TTS 真正开始播的守卫时间。
+         *
+         * 云端合成通常 300~800ms 才出声，给到 1.5 秒留足余量；
+         * 就算 TTS 失败，1.5 秒后也会正常走休眠，不会卡住。
+         */
+        private const val SLEEP_SPEAK_GUARD_MS = 1_500L
+
         fun start(context: Context) {
             val i = Intent(context, VoiceService::class.java)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -164,6 +185,20 @@ class VoiceService : Service() {
             context.startService(
                 Intent(context, VoiceService::class.java).setAction(ACTION_RELOAD_WAKE)
             )
+        }
+
+        /**
+         * 彻底停掉语音常驻服务。
+         *
+         * 给导航页左上角的「退出应用」用：光 finish Activity 的话，
+         * 服务还活着 —— 通知栏那条「语音待命」留着、麦克风还开着、
+         * 唤醒词还在响应，用户会以为没退干净。
+         *
+         * `stopService` 是显式停止，不受 START_STICKY 影响（那条只管进程被系统杀掉后重建）。
+         * 停止后 `onDestroy → engine.stop()` 会释放 AudioRecord。
+         */
+        fun stop(context: Context) {
+            context.stopService(Intent(context, VoiceService::class.java))
         }
     }
 }

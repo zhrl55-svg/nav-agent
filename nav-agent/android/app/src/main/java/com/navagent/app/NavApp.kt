@@ -133,7 +133,7 @@ class NavApp : Application() {
             // 全部走 Function Calling —— 导航动作也是工具，不再有正则规则。
             // 顺序不是随便排的：navigate 最常用放前面，web_search 最"万能"放最后，
             // 免得模型什么都拿它兜。
-            llm = MinimaxLlm(
+            llm = OpenAiLlm(
                 tools = listOf(
                     NavigationTool(
                         navigateTo = ::toolNavigate,
@@ -162,7 +162,12 @@ class NavApp : Application() {
             speak = { text -> voice.speak(text, VoiceGuide.Priority.CHAT) },
             context = ::navContext,
             // 名字固化在 prompt 里，每轮都从设置取 —— 改名下一句就自称新名字
-            assistantName = { Prefs.aiName }
+            assistantName = { Prefs.aiName },
+            // 两次请求全失败才算"没连上"。用系统提示的形式告知，
+            // 不伪装成 AI 的对话气泡 —— 这条不会进对话历史。
+            onFailure = { msg -> dispatchNotice(msg) },
+            // 接本地接口时不给 Tavily（本地服务自带检索），prompt 也要跟着改口
+            webSearchAvailable = { Prefs.webSearchEnabled() }
         )
 
         prewarm()
@@ -223,16 +228,26 @@ class NavApp : Application() {
      *
      * 实测第一句聊天要 2.9~3.0s 才出首字，后面只要 1.1~1.5s —— 差的那 1.5 秒
      * 全花在域名解析和 TLS 握手上。启动时先握一次，把这段成本挪到用户看不见的时候。
+     *
+     * ★ 2026-11-02：端口从地址里取，不再写死 443。
+     *   接本地模型时地址是 `http://192.168.1.100:1234/v1`，往 443 上握
+     *   等于握了个空，还白等 4 秒超时。
      */
     private fun prewarm() {
         Thread {
-            val host = runCatching { java.net.URI(BuildConfig.MINIMAX_BASE_URL).host }.getOrNull()
+            val uri = runCatching { java.net.URI(Prefs.chatBaseUrl()) }.getOrNull()
                 ?: return@Thread
+            val host = uri.host ?: return@Thread
+            val port = when {
+                uri.port > 0 -> uri.port
+                uri.scheme.equals("http", ignoreCase = true) -> 80
+                else -> 443
+            }
             val t0 = System.currentTimeMillis()
             runCatching {
                 val addr = java.net.InetAddress.getByName(host)
-                java.net.Socket().use { it.connect(java.net.InetSocketAddress(addr, 443), 4000) }
-                Dbg.log("预热 $host 完成 ${System.currentTimeMillis() - t0}ms")
+                java.net.Socket().use { it.connect(java.net.InetSocketAddress(addr, port), 4000) }
+                Dbg.log("预热 $host:$port 完成 ${System.currentTimeMillis() - t0}ms")
             }.onFailure { Dbg.log("预热失败 ${it.javaClass.simpleName}: ${it.message}") }
         }.apply { isDaemon = true; name = "prewarm" }.start()
     }

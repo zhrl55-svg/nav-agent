@@ -45,7 +45,7 @@ class VoskWake(modelDir: File, private val wakeWords: List<String>) : WakeWord {
     private var windowTs = 0L
 
     @Volatile
-    var ready = false
+    override var ready = false
         private set
 
     private val normalized = wakeWords.map { normalize(it) }.filter { it.isNotEmpty() }
@@ -101,15 +101,45 @@ class VoskWake(modelDir: File, private val wakeWords: List<String>) : WakeWord {
      * 但"校高"这种会误命中），车内场景可以接受 —— 误唤醒只是多说一句"在"，
      * 比喊十遍不理人强。
      *
-     * ★ 只在唤醒词还是「小X高」时才启用。用户换成「你好小明」之后，
-     *   这套字表完全对不上，硬套只会乱命中。
+     * ★ 2026-11-01 修：这段原来是写死的「小X高」，唤醒词换成「小度」之后
+     *   这层兜底**整个失效**（条件不成立直接返回 null）。
+     *   实测「小多」还能靠拼音匹配兜住，但「晓度」「小杜」「小渡」这种
+     *   中间夹字或首字不同音的会漏。现在按当前唤醒词动态生成同音字表。
      */
-    private val fuzzy: Regex? =
-        if (wakeWords.any { it.contains("小") && it.contains("高") }) {
-            Regex("[小晓笑校萧效].?[高搞告稿糕]")
-        } else {
-            null
-        }
+    private val fuzzy: Regex? = buildFuzzy(wakeWords)
+
+    /**
+     * 按唤醒词生成同音兜底正则。
+     *
+     * 两条路径：
+     *  1. **逐字精确**：唤醒词里每个字都在 [HOMOPHONES] 表里，就生成
+     *     `[小晓笑校…][猪朱珠竹…][佩配培赔…][奇其琪骑…]` —— 每个位置只认同音字，
+     *     误唤醒率最低。四字唤醒词（「小猪佩奇」）走这条。
+     *  2. **首尾兜底**：有字没收录，退化成「首字同音组 + 中间任意 + 尾字同音组」。
+     *     宽是宽了点（「小什么奇」都算），但总比完全没兜底强。
+     *
+     * ★ 为什么要两条：原来只认「小X高」两字结构，唤醒词换成「小度」时这层直接
+     *   返回 null（条件不成立），换成「小猪佩奇」更是完全没覆盖 —— 实测日志里
+     *   每次启动都是 `唤醒同音兜底正则=null`。
+     */
+    private fun buildFuzzy(words: List<String>): Regex? {
+        val head = HOMOPHONES['小'] ?: "小"
+        val parts = words.mapNotNull { w ->
+            val chars = w.toList()
+            when {
+                chars.size < 2 -> null
+                // ① 逐字都有同音组：最精确
+                chars.all { HOMOPHONES.containsKey(it) } ->
+                    chars.joinToString("") { "[${HOMOPHONES[it]}]" }
+                // ② 有字没收录：首尾兜底，中间允许 0~n 个字
+                else -> {
+                    val tail = HOMOPHONES[chars.last()] ?: return@mapNotNull null
+                    "[$head].{0,${chars.size - 1}}[$tail]"
+                }
+            }
+        }.distinct()
+        return if (parts.isEmpty()) null else Regex(parts.joinToString("|"))
+    }
 
     init {
         try {
@@ -128,6 +158,11 @@ class VoskWake(modelDir: File, private val wakeWords: List<String>) : WakeWord {
             Dbg.log("vosk 加载失败 ${t.javaClass.simpleName}: ${t.message}")
             ready = false
         }
+        // ★ 诊断日志放在 try 外面，且只打 fuzzy。
+        //   踩过：在 init 块里插值 $expectedPinyin，触发 by lazy 的构造期前向引用，
+        //   抛 NullPointerException 被上面的 catch 抓住 → ready 被打成 false，
+        //   唤醒直接失效（日志里能看到「唤醒就绪」紧跟一行「加载失败 NPE」）。
+        runCatching { Dbg.log("唤醒同音兜底正则=$fuzzy") }
     }
 
     /**
@@ -303,12 +338,40 @@ class VoskWake(modelDir: File, private val wakeWords: List<String>) : WakeWord {
             return true
         }
 
+        // ③ 词首丢失兜底 —— 见 [tailMatch] 注释。
+        //    ★ 2026-11-02 加：真机日志里 vosk 把「小猪佩奇」稳定识别成
+        //    「猪配其」/「猪皮」，「小」一次都没出现过。窗口拼音 `zupeiqi`
+        //    和期望 `xiaozupeiqi` 差 4 个字母，编辑距离 4 > 阈值 2，
+        //    所以永远唤不醒 —— 这不是阈值问题，是缺一整段。
+        val tailHit = cands.firstNotNullOfOrNull { candidate ->
+            expectedPinyin.firstNotNullOfOrNull { expected ->
+                tailMatch(candidate, expected)
+            }
+        }
+        if (tailHit != null) {
+            Dbg.log("唤醒词词首丢失兜底命中：「$tail」→「$tailHit」")
+            return true
+        }
+
+        // ④ 任意片段兜底 —— 只对四字及以上的唤醒词启用。
+        //    用户明确要求"不怕误唤醒"，四字词听到任意两个字就认。
+        //    两字词不进来，否则「角度」会被 `aodu` 片段重新误唤醒。
+        val segHit = cands.firstNotNullOfOrNull { candidate ->
+            expectedPinyin.firstNotNullOfOrNull { expected ->
+                anySegmentMatch(candidate, expected)
+            }
+        }
+        if (segHit != null) {
+            Dbg.log("唤醒词片段命中：「$tail」→「$segHit」")
+            return true
+        }
+
         // ③ 老的同音兜底，只对「小X高」有意义
         return fuzzy?.containsMatchIn(norm) ?: false
     }
 
     /**
-     * 连续无声调拼音的有界近似匹配：预期串必须至少 4 音素，允许最多 1 个编辑错误，
+     * 连续无声调拼音的有界近似匹配：预期串必须至少 4 音素，允许 MAX_EDIT_ERRORS 个编辑错误，
      * 且命中片段要与识别窗口末尾相邻。这样「小度」的度/都混淆可过，单个「小」不会误唤醒。
      *
      * ★ 首音节必须是「同声母或近似声母」，否则会误唤醒。
@@ -332,7 +395,95 @@ class VoskWake(modelDir: File, private val wakeWords: List<String>) : WakeWord {
             val sample = actual.substring(start, endAt)
             // 声母检查放在编辑距离之前 —— 不合格就不用再比了
             if (!sameInitials(sample, expected)) continue
-            if (editDistanceAtMostOne(sample, expected)) return sample
+            if (editDistanceWithinLimit(sample, expected)) return sample
+        }
+        return null
+    }
+
+    /**
+     * 词首丢失兜底：允许识别结果只覆盖唤醒词的**后半截**。
+     *
+     * ★ 为什么需要（2026-11-02，真机日志实证）：
+     *   唤醒词配的是「小猪佩奇」，vosk 中文小模型稳定只吐后三个字 ——
+     *   日志里「猪」「配」「其/七」「皮」都出现过，**「小」一次都没有**。
+     *   窗口拼音是 `zupeiqi`，期望 `xiaozupeiqi`，少的是一整段 `xiao`，
+     *   编辑距离 4，远超阈值 2。所以这不是"放宽阈值"能救的，是缺了开头。
+     *
+     *   vosk 小模型对词首轻音节、连读首字吞音很常见（喊「小猪佩奇」时
+     *   「小」和后面的「猪」连得太紧，解码器直接并进下一个词）。
+     *
+     * 做法：拿 expected 的**后缀**去和 actual 的尾部比，覆盖率达到
+     * [MIN_COVER_RATIO] 就算命中。
+     *
+     *   xiaozupeiqi 的后缀 zupeiqi（7/11 = 64%）→ 命中 ✓
+     *   peiqi（5/11 = 45%）→ 不命中 ✓（否则任何说「佩奇」的都唤醒）
+     *
+     * 对两字唤醒词（如「小度」xiaodu）几乎无副作用：去掉词首只剩 `du`，
+     * 长度不够 MIN_WAKE_PHONEMES，而且 sameInitials 也会挡住。
+     */
+    private fun tailMatch(actual: String, expected: String): String? {
+        if (expected.length < MIN_WAKE_PHONEMES) return null
+        // 覆盖率下限：至少认到唤醒词拼音的 60%
+        val minCover = maxOf(MIN_WAKE_PHONEMES, expected.length * 3 / 5)
+        // 从"整串"开始往下试，命中越长的后缀越可信
+        for (keep in expected.length downTo minCover) {
+            val suffix = expected.substring(expected.length - keep)
+            val maxLen = keep + MAX_EDIT_ERRORS
+            val minLen = keep - MAX_EDIT_ERRORS
+            for (length in minLen..maxLen) {
+                if (length > actual.length) continue
+                val sample = actual.substring(actual.length - length)
+                if (!sameInitials(sample, suffix)) continue
+                if (editDistanceWithinLimit(sample, suffix)) return sample
+            }
+        }
+        return null
+    }
+
+    /**
+     * 任意片段兜底：唤醒词的**任意一段**命中就算（只对长词启用）。
+     *
+     * ★ 2026-11-02 加。用户明确要求「不怕误唤醒，喊得醒就行」。
+     *   [tailMatch] 只能兜"词首丢了"；如果 vosk 丢的是中间或结尾
+     *   （「小猪…奇」「小…佩奇」），后缀匹配照样不中。这里把 expected 的
+     *   每一段都拿去比，任意 45% 以上的片段命中即可。
+     *
+     *   `xiaozupeiqi` 的片段：
+     *     `xiaozu`（小猪）→ 命中 ✓
+     *     `zupei`（猪佩）→ 命中 ✓
+     *     `peiqi`（佩奇）→ 命中 ✓
+     *     `zu`（猪）→ 长度不够，不命中 ✓
+     *
+     * 只对 ≥ [LONG_WAKE_PHONEMES] 的词启用：两字词的片段会撞上常用词，
+     * 详见该常量的注释。
+     */
+    private fun anySegmentMatch(actual: String, expected: String): String? {
+        if (expected.length < LONG_WAKE_PHONEMES) return null
+        // 片段下限 = 至少 5 个字母（约两个音节）。
+        // ★ 不能取 4：`xiao` 正好是 4 个字母，取 4 的话单说一个「小」
+        //   就会唤醒（真机实测踩过，日志 `唤醒词片段命中：「小」→「xiao」`），
+        //   车里说「小心」「小声点」全会误触。
+        val minLen = maxOf(MIN_WAKE_PHONEMES + 1, expected.length * 45 / 100)
+        // 从长片段往短试，先命中更可信
+        for (len in expected.length downTo minLen) {
+            for (start in 0..(expected.length - len)) {
+                // 从词首开始的片段要求再多一个字：否则「小猪」的 `xiaozu`
+                // 会退化成 `xiao` 命中，又回到单字唤醒。
+                if (start == 0 && len <= minLen) continue
+                val part = expected.substring(start, start + len)
+                // 廉价预筛：片段首字母必须在识别结果里出现过，
+                // 否则后面那圈编辑距离纯属白算（每帧都跑，省一点是一点）
+                if (!actual.contains(part[0])) continue
+                // sample 最多比片段短 1 个字母 —— 短太多就等于只听了半个词
+                val lo = maxOf(MIN_WAKE_PHONEMES, len - 1)
+                val hi = len + MAX_EDIT_ERRORS
+                for (length in lo..hi) {
+                    if (length > actual.length) continue
+                    val sample = actual.substring(actual.length - length)
+                    if (!sameInitials(sample, part)) continue
+                    if (editDistanceWithinLimit(sample, part)) return sample
+                }
+            }
         }
         return null
     }
@@ -362,23 +513,52 @@ class VoskWake(modelDir: File, private val wakeWords: List<String>) : WakeWord {
     private fun initialOf(pinyin: String): String =
         if (pinyin.length >= 2) pinyin.substring(0, 2) else pinyin
 
-    /** 两字符串编辑距离是否 ≤ 1；长度通常 8～12，直接线性检查即可 */
-    private fun editDistanceAtMostOne(a: String, b: String): Boolean {
-        if (kotlin.math.abs(a.length - b.length) > MAX_EDIT_ERRORS) return false
-        var i = 0
-        var j = 0
-        var errors = 0
-        while (i < a.length && j < b.length) {
-            if (a[i] == b[j]) { i++; j++; continue }
-            if (++errors > MAX_EDIT_ERRORS) return false
-            when {
-                a.length > b.length -> i++
-                b.length > a.length -> j++
-                else -> { i++; j++ }
+    /**
+     * 两字符串编辑距离是否在 MAX_EDIT_ERRORS 以内。
+     *
+     * ★ 必须是真正的 Levenshtein DP，不能用「逐字符比、错了跳一个」的贪心写法。
+     *   实测反例：`xiangduo` vs `xiaodu`（喊「小度」被听成「想多」），
+     *   正确距离是 2（插一个 n、删一个 o），但贪心在插入点连续报 3 个错，
+     *   直接判否 —— 放宽阈值也救不回来。
+     *
+     * 串长通常 6~12，O(n·m) 完全够用；带行最小值剪枝，超阈值立刻返回。
+     */
+    private fun editDistanceWithinLimit(a: String, b: String): Boolean {
+        // ★ 短串按比例收紧：4 个字母的串如果也允许 3 个编辑错误，
+        //   等于"几乎什么都算命中"（`xiao` 对任何 4 字母拼音都能过）。
+        //   长串才放开到 MAX_EDIT_ERRORS。
+        val limit = allowedErrors(minOf(a.length, b.length))
+        if (kotlin.math.abs(a.length - b.length) > limit) return false
+        if (a == b) return true
+        val m = b.length
+        var prev = IntArray(m + 1) { it }
+        var cur = IntArray(m + 1)
+        for (i in 1..a.length) {
+            cur[0] = i
+            var rowMin = cur[0]
+            for (j in 1..m) {
+                val cost = if (a[i - 1] == b[j - 1]) 0 else 1
+                cur[j] = minOf(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+                if (cur[j] < rowMin) rowMin = cur[j]
             }
+            if (rowMin > limit) return false
+            val tmp = prev
+            prev = cur
+            cur = tmp
         }
-        if (i < a.length || j < b.length) errors++
-        return errors <= MAX_EDIT_ERRORS
+        return prev[m] <= limit
+    }
+
+    /**
+     * 这个长度的串允许几个编辑错误。
+     *
+     * 4 字母 → 1，6 字母 → 2，8 字母以上 → [MAX_EDIT_ERRORS]。
+     * 短串多给一个错误，识别结果就会变成"什么都能匹配"。
+     */
+    private fun allowedErrors(len: Int): Int = when {
+        len <= 4 -> 1
+        len <= 6 -> 2
+        else -> MAX_EDIT_ERRORS
     }
 
     private fun normalize(s: String): String = s.filter { it.isLetterOrDigit() }
@@ -459,8 +639,15 @@ class VoskWake(modelDir: File, private val wakeWords: List<String>) : WakeWord {
     }
 
     private companion object {
-        /** 20ms 一帧，750 帧 = 15 秒 */
-        const val RESET_EVERY_FRAMES = 750
+        /**
+         * 多久无条件重置一次解码器。
+         *
+         * ★ 2026-11-02 从 750（15 秒）放宽到 3000（60 秒）。
+         *   15 秒太密：唤醒词说一半正好撞上重置点，前半截直接被清掉 ——
+         *   日志里能看到「猪」单独出现、前面没有「小」，很可能就是撞了重置。
+         *   重置的本意只是防解码状态无限增长，60 秒完全够，vosk 内部也有上限。
+         */
+        const val RESET_EVERY_FRAMES = 3000
 
         /** 热身帧数：50 帧 × 20ms = 1 秒静音 */
         const val WARMUP_FRAMES = 50
@@ -481,18 +668,84 @@ class VoskWake(modelDir: File, private val wakeWords: List<String>) : WakeWord {
             "r" to "l"
         )
 
-        /** 窗口过期：3 秒没新内容就清空，避免老字残留造成误唤醒 */
-        const val WINDOW_MS = 3_000L
+        /** 窗口过期：4 秒没新内容就清空，避免老字残留造成误唤醒。
+         *  3 秒时实测「小——度」这种拖长音的会被切掉后半截，放宽到 4 秒 */
+        const val WINDOW_MS = 4_000L
 
-        /** 窗口最长保留的字数 */
-        const val MAX_WINDOW_CHARS = 10
+        /** 窗口最长保留的字数。
+         *  ★ 2026-11-02 从 10 放宽到 14：四字唤醒词（「小猪佩奇」）加上前后
+         *  环境噪音，10 个字经常把唤醒词的前半截挤出窗口。 */
+        const val MAX_WINDOW_CHARS = 14
 
-        /** 匹配只看窗口最后这么多个字 */
-        const val MATCH_TAIL_CHARS = 8
+        /** 匹配只看窗口最后这么多个字。
+         *  ★ 2026-11-02 从 8 放宽到 12：四字唤醒词前面常带噪音字，
+         *  只取末尾 8 字时「小猪」可能已经被挤出匹配范围。 */
+        const val MATCH_TAIL_CHARS = 12
 
         /** 多音字交叉组合的候选上限（8 字窗口 3^8=6561 太疯，32 条足够） */
         const val CAND_CAP = 32
         const val MIN_WAKE_PHONEMES = 4
-        const val MAX_EDIT_ERRORS = 1
+
+        /**
+         * 长唤醒词的门槛（约 4 个音节以上）。
+         *
+         * ★ [anySegmentMatch] 的片段匹配只对这个长度以上的词启用。
+         *   原因：片段匹配会忽略唤醒词的任意部分，两字词（「小度」xiaodu）的
+         *   后缀 `aodu` 正好等于「角度 jiao-du」的尾部，一放开就会把
+         *   「角度」重新变成误唤醒 —— 那是 2026-11-01 专门修掉的坑。
+         *   四字词没有这个问题：`xiaozupeiqi` 的任意 45% 片段都不太可能是常用词。
+         */
+        const val LONG_WAKE_PHONEMES = 8
+
+        /**
+         * 允许的编辑错误数。
+         *
+         * ★ 2026-11-01 从 1 放宽到 2。实测证据（华为 P40 Pro 日志）：
+         *   喊「小度」，vosk 识别成「想多」→ `xiangduo` vs `xiaodu`，编辑距离 2，
+         *   卡在阈值 1 上永远匹配不上。用户感受就是「刚打开 app 喊不动，
+         *   过一会儿又能喊醒」—— 其实是每次识别结果不同，恰好那次差两个字母。
+         *
+         * ★ 2026-11-02 再放宽到 3。用户明确要求「不怕误唤醒，只要喊得醒」。
+         *   代价：`xiaodong`(小东)、`xiangduo`(想多) 这类距离 2~3 的词更容易命中。
+         *   「角度 jiaodu」仍然安全 —— 首字母 j/x 不同，被 sameInitials 挡在前面。
+         */
+        const val MAX_EDIT_ERRORS = 3
+
+        /**
+         * 同音字兜底表（归一化后的汉字 → 同音字集合），用于 buildFuzzy()。
+         *
+         * 只收常见字：唤醒词里每个字如果在此表中，就生成逐字精确同音正则；
+         * 有字不在表中时退化成「首字同音 + 中间任意 + 尾字同音」。
+         *
+         * ★ 表是按字收的，不是按词收的——「小猪佩奇」四个字都在表里就走逐字精确，
+         *   不在就退化成兜底。这样加新唤醒词时，只要给新字补一行映射即可。
+         */
+        val HOMOPHONES = mapOf(
+            // 常见首字（xiao）
+            '小' to "小晓笑校萧效消销宵肖想",
+            // 两字唤醒词尾字
+            '度' to "度渡肚杜读毒多夺朵",
+            '高' to "高搞告稿糕",
+            '爱' to "爱艾哎哀",
+            '艺' to "艺义亿易",
+            '明' to "明名鸣",
+            // 小猪佩奇
+            '猪' to "猪朱珠竹",
+            '佩' to "佩配培赔",
+            '奇' to "奇其琪骑",
+            '企' to "企起岂乞气",
+            '鹅' to "鹅额俄厄",
+            // 其他常用字
+            '宝' to "宝保饱堡",
+            '贝' to "贝备背被倍",
+            '天' to "天添田甜",
+            '使' to "使始史矢",
+            '乐' to "乐勒乐",
+            '尼' to "尼泥你拟",
+            '马' to "马玛码妈麻",
+            '叮' to "叮盯钉丁",
+            '当' to "当档党荡",
+            '猫' to "猫毛矛茅"
+        )
     }
 }

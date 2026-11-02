@@ -22,7 +22,7 @@ import java.util.Locale
  *   而且这个工具本身有定位兜底和超时保护，不会把会话卡死。
  *
  * ★ 为什么这里能用 latch 把异步 SDK 转成同步：
- *   工具是在 `MinimaxLlm` 的独立线程里跑的（FutureTask + 8 秒超时），
+ *   工具是在 `OpenAiLlm` 的独立线程里跑的（FutureTask + 8 秒超时），
  *   所以在工具内部阻塞等待网络结果是安全的，不会卡主线程。
  *   之前用 Web API 时是「同步 HTTP + 自己开子线程」，现在 SDK 本身是异步回调，
  *   正好反过来：用 CountDownLatch 把回调转回同步，调用方代码不用大改。

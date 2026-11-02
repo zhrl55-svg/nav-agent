@@ -13,6 +13,7 @@ import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
 import android.widget.Button
 import android.widget.EditText
+import android.widget.ImageView
 import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -65,7 +66,7 @@ class ChatActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
         scrollToBottom()
 
         findViewById<Button>(R.id.send).setOnClickListener { submitInput() }
-        findViewById<Button>(R.id.mic).setOnClickListener { onMic() }
+        findViewById<View>(R.id.mic).setOnClickListener { onMic() }
         findViewById<TextView>(R.id.open_nav).setOnClickListener { app.openNavPage() }
         findViewById<TextView>(R.id.interrupt_nav).setOnClickListener {
             app.nav?.stop()
@@ -74,6 +75,7 @@ class ChatActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
             status.text = "导航已中断 · 目的地已保留"
         }
         findViewById<TextView>(R.id.settings).setOnClickListener { SettingsActivity.start(this) }
+        findViewById<View>(R.id.exit_chat).setOnClickListener { exitApp() }
         input.setOnEditorActionListener { _, actionId, _ ->
             if (actionId == EditorInfo.IME_ACTION_SEND) {
                 submitInput(); true
@@ -150,6 +152,18 @@ class ChatActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
             .onFailure { status.text = "语音服务启动失败：${it.message}" }
     }
 
+    /** 对话页退出与导航页保持一致：停止导航与语音服务，再结束整个任务栈。 */
+    private fun exitApp() {
+        Dbg.log("对话页退出应用")
+        runCatching { app.nav?.stop() }
+        runCatching { app.voice.silence() }
+        runCatching { VoiceService.stop(this) }
+        finishAffinity()
+        window.decorView.postDelayed({
+            runCatching { android.os.Process.killProcess(android.os.Process.myPid()) }
+        }, 400)
+    }
+
     private fun submitInput() {
         val text = input.text.toString().trim()
         if (text.isEmpty()) return
@@ -224,25 +238,30 @@ class ChatActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
      *
      * 为什么要动：纯靠底下那行小字，开车时根本注意不到是不是在听。
      * 按钮自己会动，余光就能看见。
+     *
+     * ★ 按钮是 LinearLayout（图标 + 文字），文字和图标分开设 —— 用 Button 的
+     *   drawableStart 时「图标+文字」整体偏左（实测左边 1dp、右边 8dp）。
      */
     private fun updateMicIndicator(state: VoiceEngine.State?) {
-        val mic = findViewById<Button>(R.id.mic) ?: return
+        val mic = findViewById<View>(R.id.mic) ?: return
+        val label = findViewById<TextView>(R.id.mic_label) ?: return
+        val icon = findViewById<ImageView>(R.id.mic_icon) ?: return
         // ★ 播报中优先显示「播报中」。
         //   AI 正在说话时用户喊话是要打断的，这个提示比「聆听中」有意义得多。
         //   （而且此时是半双工，麦克风根本不拾音。）
         if (app.voice.isSpeaking) {
-            mic.text = getString(R.string.mic_speaking)
+            label.text = getString(R.string.mic_speaking)
             mic.alpha = 1f
             mic.setBackgroundResource(R.drawable.bg_btn_primary)
-            mic.setTextColor(android.graphics.Color.parseColor("#0E1620"))
+            label.setTextColor(android.graphics.Color.parseColor("#0E1620"))
             // 播报中用喇叭图标：这时候是「它在说话」
-            mic.setCompoundDrawablesWithIntrinsicBounds(R.drawable.ic_mic, 0, 0, 0)
+            icon.setImageResource(R.drawable.ic_mic)
             stopMicPulse(mic)
             return
         }
         when (state) {
             VoiceEngine.State.LISTENING -> {
-                mic.text = getString(R.string.mic_listening)
+                label.text = getString(R.string.mic_listening)
                 mic.alpha = 1f
                 // ★ 用对话页专用的明亮聆听样式（bg_mic_listening）。
                 //   不能用导航页那个 bg_btn_listening —— 那个是「深底+描边」，
@@ -250,25 +269,25 @@ class ChatActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
                 //   几乎看不见（用户反馈「聆听中是暗色，显示不明显」）。
                 mic.setBackgroundResource(R.drawable.bg_mic_listening)
                 // 亮底必须配深字，不然白字压在亮蓝上反而看不清
-                mic.setTextColor(android.graphics.Color.parseColor("#0E1620"))
+                label.setTextColor(android.graphics.Color.parseColor("#0E1620"))
                 // 聆听中换成麦克风图标：这时候是「在听你说话」
-                mic.setCompoundDrawablesWithIntrinsicBounds(R.drawable.ic_mic_active, 0, 0, 0)
+                icon.setImageResource(R.drawable.ic_mic_active)
                 startMicPulse(mic)
             }
 
             VoiceEngine.State.THINKING -> {
-                mic.text = getString(R.string.mic_thinking)
+                label.text = getString(R.string.mic_thinking)
                 mic.setBackgroundResource(R.drawable.bg_btn_primary)
-                mic.setTextColor(android.graphics.Color.parseColor("#0E1620"))
-                mic.setCompoundDrawablesWithIntrinsicBounds(R.drawable.ic_mic, 0, 0, 0)
+                label.setTextColor(android.graphics.Color.parseColor("#0E1620"))
+                icon.setImageResource(R.drawable.ic_mic)
                 stopMicPulse(mic)
             }
 
             VoiceEngine.State.ASLEEP, null -> {
-                mic.text = "语音"
+                label.text = "语音"
                 mic.setBackgroundResource(R.drawable.bg_btn_primary)
-                mic.setTextColor(android.graphics.Color.parseColor("#0E1620"))
-                mic.setCompoundDrawablesWithIntrinsicBounds(R.drawable.ic_mic, 0, 0, 0)
+                label.setTextColor(android.graphics.Color.parseColor("#0E1620"))
+                icon.setImageResource(R.drawable.ic_mic)
                 stopMicPulse(mic)
             }
         }

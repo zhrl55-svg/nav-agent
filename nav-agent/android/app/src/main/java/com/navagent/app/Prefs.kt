@@ -2,7 +2,9 @@ package com.navagent.app
 
 import android.content.Context
 import android.content.SharedPreferences
+import com.navagent.app.BuildConfig.MINIMAX_API_KEY
 import com.navagent.app.BuildConfig.MINIMAX_ASR_MODEL
+import com.navagent.app.BuildConfig.MINIMAX_BASE_URL
 import com.navagent.app.BuildConfig.MINIMAX_CHAT_MODEL
 import com.navagent.app.BuildConfig.TAVILY_API_KEY
 import com.navagent.app.BuildConfig.WAKE_WORDS
@@ -24,6 +26,17 @@ object Prefs {
     private const val FILE = "settings"
 
     private const val K_ASR_MODEL = "asr_model"
+
+    /** 语音服务（识别/合成）的 Key 与地址。存储名保留 minimax_*，老版本的设置不会丢 */
+    private const val K_API_KEY = "minimax_api_key"
+    private const val K_API_BASE = "minimax_api_base"
+
+    /** 对话大脑可以完全独立于语音服务：接本地模型时不能跟语音共用地址 */
+    private const val K_CHAT_PROVIDER = "chat_provider"
+    private const val K_CHAT_BASE = "chat_api_base"
+    private const val K_CHAT_KEY = "chat_api_key"
+    private const val K_TOOLS = "chat_tools_enabled"
+
     private const val K_CHAT_MODEL = "chat_model"
     private const val K_MAX_TOKENS = "max_tokens"
     private const val K_HISTORY_TURNS = "history_turns"
@@ -44,6 +57,7 @@ object Prefs {
     private const val K_NEARBY_RADIUS = "nearby_radius"
     private const val K_FILE_LOG = "file_log"
     private const val K_TAVILY_KEY = "tavily_key"
+    private const val K_WEB_SEARCH_MODE = "web_search_mode"
     private const val K_BT_TARGET = "bluetooth_target_name"
     private const val K_BT_AUTOSTART = "bluetooth_auto_start"
     private const val K_AMAP_BUILTIN_UI = "amap_builtin_ui"
@@ -51,6 +65,16 @@ object Prefs {
 
     /** MiniMax 默认音色：青涩青年 */
     const val DEFAULT_VOICE = "male-qn-qingse"
+
+    /** 对话大脑服务商标识 */
+    const val PROVIDER_MINIMAX = "minimax"
+    const val PROVIDER_OPENAI = "openai"
+    const val PROVIDER_LOCAL = "local"
+
+    /** Tavily 搜索工具的三态 */
+    const val WEB_SEARCH_AUTO = "auto"
+    const val WEB_SEARCH_ON = "on"
+    const val WEB_SEARCH_OFF = "off"
 
     private lateinit var sp: SharedPreferences
 
@@ -126,9 +150,16 @@ object Prefs {
     fun primaryWakeWord(): String =
         wakeWordList().minByOrNull { it.length } ?: "小高"
 
-    /** 会话休眠：连续这么久没人说话就退出连续会话 */
+    /**
+     * 会话休眠：连续这么久没人说话就退出连续会话。
+     *
+     * ★ 默认从 20 秒提到 60 秒（2026-11-02）。20 秒在车里太激进：
+     *   导航途中正常沉默半分钟很常见（听路况、等红灯、跟人说话），
+     *   一睡就得重新喊唤醒词。参考 D:/AI 那边默认 300 秒 —— 移动端不用那么长，
+     *   但 60 秒能让"问一句、想一下、再问一句"这种节奏不被切断。
+     */
     var idleTimeoutMs: Long
-        get() = sp.getLong(K_IDLE_TIMEOUT, 20_000L)
+        get() = sp.getLong(K_IDLE_TIMEOUT, 60_000L)
         set(v) = sp.edit().putLong(K_IDLE_TIMEOUT, v).apply()
 
     /** 唤醒/命中时是否「嘀」一声 */
@@ -138,9 +169,118 @@ object Prefs {
 
     // ------------------------------------------------------------ 对话
 
+    /**
+     * 用户在设置里填的语音服务 Key（识别 + 合成）。空字符串 = 用编译期注入的那个。
+     *
+     * 为什么要这一层：BuildConfig 里的 Key 是编译时烧进 APK 的，换 Key 就得重新
+     * 构建一次；装到别人手机上也没法用他自己的额度。有了这个字段，
+     * 装好的 APK 直接在设置页填自己的 Key 就能跑，清空就退回出厂默认。
+     *
+     * ★ 2026-11-02 起它只管**语音**。对话大脑有独立的 Key/地址（见下面的 chat*），
+     *   因为本地模型接的是 `http://192.168.x.x:1234/v1`，跟语音服务根本不是一个服务。
+     *   混用一个字段的话，改对话大脑的地址会把语音识别也一起改坏。
+     */
+    var voiceKeyRaw: String
+        get() = sp.getString(K_API_KEY, "").orEmpty().trim()
+        set(v) = sp.edit().putString(K_API_KEY, v.trim()).apply()
+
+    /** 语音服务地址。空 = 用编译期的。换中转 / 私有部署时填 */
+    var voiceBaseRaw: String
+        get() = sp.getString(K_API_BASE, "").orEmpty().trim()
+        set(v) = sp.edit().putString(K_API_BASE, v.trim()).apply()
+
+    /** 语音服务实际生效的 Key：用户填了用用户的，没填用出厂的 */
+    fun voiceApiKey(): String = voiceKeyRaw.ifEmpty { MINIMAX_API_KEY }
+
+    /** 语音服务实际生效的地址：用户填了用用户的，没填用出厂的 */
+    fun voiceBaseUrl(): String = voiceBaseRaw.ifEmpty { MINIMAX_BASE_URL }
+
+    /** 当前用的是不是用户自己填的 Key（设置页显示状态用） */
+    fun voiceUsingCustomKey(): Boolean = voiceKeyRaw.isNotEmpty()
+
+    // ------------------------------------------------------------ 对话大脑
+
+    /** 对话大脑服务商。只用于设置页的预设和文案，运行时真正生效的是地址 + 模型名 */
+    var chatProvider: String
+        get() = sp.getString(K_CHAT_PROVIDER, PROVIDER_MINIMAX).orEmpty().ifBlank { PROVIDER_MINIMAX }
+        set(v) = sp.edit().putString(K_CHAT_PROVIDER, v.trim()).apply()
+
+    /**
+     * 对话大脑的接口地址（OpenAI 兼容，`{地址}/chat/completions`）。
+     *
+     * 空 = 跟随语音服务（也就是 MiniMax 官方）。填了就用填的 ——
+     * 本地跑 Ollama / LM Studio / vLLM 时这里填 `http://电脑IP:端口/v1`。
+     */
+    var chatBaseRaw: String
+        get() = sp.getString(K_CHAT_BASE, "").orEmpty().trim()
+        set(v) = sp.edit().putString(K_CHAT_BASE, v.trim()).apply()
+
+    /** 对话大脑的 Key。本地模型通常不需要，允许留空 */
+    var chatKeyRaw: String
+        get() = sp.getString(K_CHAT_KEY, "").orEmpty().trim()
+        set(v) = sp.edit().putString(K_CHAT_KEY, v.trim()).apply()
+
+    fun chatBaseUrl(): String = chatBaseRaw.ifEmpty { MINIMAX_BASE_URL }
+
+    /**
+     * 对话大脑实际使用的 Key。
+     *
+     * - 没填自定义地址 → 跟随语音服务（同一家 MiniMax，一把 Key 通吃，老配置自动兼容）
+     * - 填了自定义地址 → **只**用自己填的；留空就不发 Authorization 头
+     *   （本地 llama.cpp / Ollama 大多不校验，发个假 Key 反而被某些网关拒）
+     */
+    fun chatApiKey(): String = if (chatBaseRaw.isEmpty()) voiceApiKey() else chatKeyRaw
+
+    /** 是否接了自定义 / 本地接口 */
+    fun chatEndpointIsCustom(): Boolean = chatBaseRaw.isNotEmpty()
+
+    /** 地址是不是本机或局域网。设置页文案和「免 Key」提示用 */
+    fun chatEndpointIsLocal(): Boolean {
+        val host = runCatching { java.net.URI(chatBaseUrl()).host }.getOrNull()
+            ?.lowercase() ?: return false
+        if (host == "localhost" || host == "127.0.0.1" || host == "10.0.2.2") return true
+        val p = host.split(".")
+        if (p.size != 4) return false
+        val a = p[0].toIntOrNull() ?: return false
+        val b = p[1].toIntOrNull() ?: return false
+        return a == 10 || (a == 192 && b == 168) || (a == 172 && b in 16..31)
+    }
+
+    /**
+     * 是否允许模型调用工具（导航 / 搜索 / 天气 / 周边）。
+     *
+     * ★ 必须能关：本地跑的小模型（7B 以下）大多不会 Function Calling，
+     *   开着它只会得到一段"我这就帮你导航"的空话。关掉至少还能当聊天用。
+     */
+    var toolsEnabled: Boolean
+        get() = sp.getBoolean(K_TOOLS, true)
+        set(v) = sp.edit().putBoolean(K_TOOLS, v).apply()
+
+    /** Key 的脱敏展示：只留后 4 位 */
+    fun maskedVoiceKey(): String = mask(voiceApiKey())
+
+    fun maskedChatKey(): String = mask(chatApiKey())
+
+    private fun mask(k: String): String = when {
+        k.isBlank() -> "未配置"
+        k.length <= 8 -> "已配置"
+        else -> "…" + k.takeLast(4)
+    }
+
+    /**
+     * 对话模型名。留空时按服务商给一个合理的默认值 ——
+     * 接了本地模型却还默认 `minimax-m3.1-flash` 的话，请求必然 404，
+     * 用户会以为"本地接口不通"。
+     */
     var chatModel: String
-        get() = sp.getString(K_CHAT_MODEL, MINIMAX_CHAT_MODEL).orEmpty().ifBlank { MINIMAX_CHAT_MODEL }
+        get() = sp.getString(K_CHAT_MODEL, "").orEmpty().ifBlank { defaultChatModel() }
         set(v) = sp.edit().putString(K_CHAT_MODEL, v.trim()).apply()
+
+    private fun defaultChatModel(): String = when (chatProvider) {
+        PROVIDER_LOCAL -> "qwen2.5:7b"
+        PROVIDER_OPENAI -> "gpt-4o-mini"
+        else -> MINIMAX_CHAT_MODEL
+    }
 
     /** 单条回复的 token 上限 */
     var maxTokens: Int
@@ -256,6 +396,32 @@ object Prefs {
         set(v) = sp.edit().putString(K_TAVILY_KEY, v.trim()).apply()
 
     fun clearTavilyKeyOverride() = sp.edit().remove(K_TAVILY_KEY).apply()
+
+    /**
+     * 是否把 Tavily 搜索工具交给模型。
+     *
+     * ★ 2026-11-02：接本地接口时**默认不给**。
+     *
+     *   本地那套服务（127.0.0.1:8802）自己就带完整的检索能力，模型拿到问题会直接
+     *   在服务端查完再答。这时候再塞一个 Tavily 的 `web_search` 进去是重复劳动，
+     *   而且是**更差的那一份**：Tavily 要 5 秒、要单独的 Key、搜回来的中文新闻
+     *   还经常是一堆短讯。模型看到两个搜索入口反而会挑错。
+     *
+     *   所以三态：
+     *     auto（默认）—— 用本地/自定义接口时关，用云端 MiniMax 时开
+     *     on          —— 强制开（本地服务没搜索能力时手动打开）
+     *     off         —— 强制关
+     */
+    var webSearchMode: String
+        get() = sp.getString(K_WEB_SEARCH_MODE, WEB_SEARCH_AUTO).orEmpty().ifBlank { WEB_SEARCH_AUTO }
+        set(v) = sp.edit().putString(K_WEB_SEARCH_MODE, v.trim()).apply()
+
+    /** 实际是否启用 Tavily 搜索工具 */
+    fun webSearchEnabled(): Boolean = when (webSearchMode) {
+        WEB_SEARCH_ON -> true
+        WEB_SEARCH_OFF -> false
+        else -> !chatEndpointIsCustom()
+    }
 
     // ------------------------------------------------------------ 蓝牙
 

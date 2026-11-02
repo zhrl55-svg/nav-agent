@@ -80,6 +80,11 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
             // 上边不能给 0：高德自己的顶部条会贴到状态栏下面，
             // 右上角那个路名/比例标签会被系统状态栏压掉一半。
             // 下边按实际测量留，不能写死 —— 不同屏幕和字号都不一样。
+            //
+            // ★ 不要为了左上角退出按钮动这个矩形。踩过两次：
+            //   往下推 → 顶部空出一条深色带，很难看；
+            //   往右推（left=56dp）→ 高德切成窄条模式，转向箭头直接消失。
+            //   按钮压住箭头一点无所谓，功能优先。
             val screenW = resources.displayMetrics.widthPixels
             val screenH = resources.displayMetrics.heightPixels
             val topInset = statusBarHeight()
@@ -190,8 +195,12 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
         )
         app.nav = nav
 
+        // 调试：固定算路起点，排除室内 GPS 漂移的干扰
+        //   am start ... --es dest 张掖西站 --es slat 38.945004 --es slon 100.418646
+        readDebugStart(intent)
+
         // 播报期间点按钮是"打断播报"，不是"开始拾音"（半双工兜底）
-        findViewById<Button>(R.id.talk).setOnClickListener {
+        findViewById<View>(R.id.talk).setOnClickListener {
             if (app.voice.isSpeaking) {
                 app.voice.silence()
             } else {
@@ -212,6 +221,14 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
             SettingsActivity.start(this)
         }
 
+        // ★ 左上角退出按钮（退出整个应用）。
+        //   topMargin 必须在代码里按状态栏实际高度算 —— xml 里那个 12dp 只是占位，
+        //   刘海/挖孔屏上会被状态栏压掉一半（和高德顶部条踩过同一个坑）。
+        findViewById<View>(R.id.exit_nav).apply {
+            (layoutParams as android.widget.FrameLayout.LayoutParams).topMargin = exitButtonTop()
+            setOnClickListener { exitApp() }
+        }
+
         // 打字发指令：旁边有人、或者语音识别不准时用
         findViewById<Button>(R.id.send).setOnClickListener { submitInput() }
         findViewById<EditText>(R.id.input).setOnEditorActionListener { _, actionId, _ ->
@@ -223,6 +240,10 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
         if (hasLocationPermission()) {
             nav.start()
             startVoiceService()
+            // 调试入口：冷启动时也要能接 --es say。
+            // ★ 之前只在 onNewIntent 里接了，onCreate 漏了 —— 结果
+            //   `am start ... --es say "..."` 在 app 没运行时静默失效，白排查半天。
+            consumeSayExtra(intent)
             if (intent?.getStringExtra(EXTRA_DEST).isNullOrBlank()) {
                 status.text = "地图已打开 · 说个目的地就开始导航"
             } else {
@@ -250,6 +271,19 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
      * 缺 RECORD_AUDIO 权限时 startForeground 会失败，捕获掉即可 ——
      * 定位和地图不受影响，用户点语音按钮时再申请。
      */
+    /**
+     * 调试入口：固定算路起点。
+     *
+     * 室内 GPS 在小区里能漂 70 米，而起点差 30 米路线就从南门变北门。
+     * 不钉住起点，任何「改配置有没有用」的对比都是假的（实测被坑过一次）。
+     */
+    private fun readDebugStart(intent: Intent?) {
+        val lat = intent?.getStringExtra(EXTRA_SLAT)?.toDoubleOrNull() ?: return
+        val lon = intent.getStringExtra(EXTRA_SLON)?.toDoubleOrNull() ?: return
+        nav.debugStart = lat to lon
+        Dbg.log("NavActivity 固定起点：$lat,$lon")
+    }
+
     private fun startVoiceService() {
         runCatching { VoiceService.start(this) }
             .onFailure { Dbg.log("语音服务启动失败：${it.message}") }
@@ -293,6 +327,44 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
             return resources.getDimensionPixelSize(id)
         }
         return (24 * resources.displayMetrics.density).toInt()
+    }
+
+    /**
+     * 退出按钮的顶部偏移（像素）。
+     *
+     * ★ 这里**不能**再加状态栏高度。本主题（Theme.NavAgent）没有做全屏，
+     *   `android:id/content` 本身就从状态栏下沿开始（真机 dump：状态栏 0~154px，
+     *   content 从 154px 起）。之前写成 statusBarHeight() + 8dp，
+     *   等于把状态栏高度算了两遍，按钮整整低了 46dp —— 看着像陷在高德卡片里。
+     */
+    private fun exitButtonTop(): Int = dp(8)
+
+    /**
+     * 左上角退出按钮：**退出整个应用**，不是退出导航。
+     *
+     * 四件事必须一起做，少一件都算「没退干净」（真机逐项验证过）：
+     *   1. 停导航 —— 不然高德还在后台播报、还在刷定位
+     *   2. 停语音前台服务 —— 不然通知栏那条「语音待命」留着，唤醒词还在听，
+     *      用户以为退了，其实麦克风还开着
+     *   3. finishAffinity —— 结束整个任务栈（ChatActivity 可能还在栈里，
+     *      只 finish 自己会把它露出来）
+     *   4. 杀进程 —— 高德的 APSService（定位辅助服务）不跟着 Activity 走，
+     *      finish 完它还在后台赖着，`pidof` 依然有值。不杀就等于没退。
+     *
+     * 不弹确认框：这是「退出应用」不是「结束导航」。底部已经有停止导航的入口，
+     * 出口上再设一道门只会让人烦。
+     */
+    private fun exitApp() {
+        Dbg.log("左上角退出应用：navigating=" + nav.isNavigating)
+        runCatching { nav.stop() }
+        runCatching { app.voice.silence() }
+        runCatching { VoiceService.stop(this) }
+        finishAffinity()
+        // 留 400ms 让 finishAffinity 走完 onDestroy（那里才是 nav.release() 和
+        // naviView.onDestroy() 的正确顺序），再终结进程
+        window.decorView.postDelayed({
+            runCatching { android.os.Process.killProcess(android.os.Process.myPid()) }
+        }, 400)
     }
 
     /**
@@ -511,6 +583,7 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
         setIntent(intent)
         Dbg.log("NavActivity onNewIntent extras=${intent.extras?.keySet()?.toList()}")
         consumeSayExtra(intent)
+        readDebugStart(intent)
         val dest = intent.getStringExtra(EXTRA_DEST)?.takeIf { it.isNotBlank() } ?: return
         app.destination = dest
         Dbg.log("NavActivity onNewIntent dest=$dest")
@@ -570,44 +643,51 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
         }
     }
 
-    /** 导航页的「语音」按钮也做同样的呼吸反馈 */
+    /**
+     * 导航页的「语音」按钮也做同样的呼吸反馈。
+     *
+     * ★ 按钮是 LinearLayout（图标 + 文字），不是 Button —— 所以文字和图标要分开设。
+     *   用 Button 的 drawableStart 时「图标+文字」整体偏左，实测左边 1dp、右边 8dp。
+     */
     private fun updateTalkIndicator(state: VoiceEngine.State) {
-        val talk = findViewById<Button>(R.id.talk) ?: return
+        val talk = findViewById<View>(R.id.talk) ?: return
+        val label = findViewById<TextView>(R.id.talk_label) ?: return
+        val icon = findViewById<ImageView>(R.id.talk_icon) ?: return
         // ★ 播报中优先显示「播报中」。导航播报时这个提示特别有用 ——
         //   用户能看出「现在是导航在说话」，喊话要等它说完或主动打断。
         if (app.voice.isSpeaking) {
-            talk.text = getString(R.string.mic_speaking)
+            label.text = getString(R.string.mic_speaking)
             talk.alpha = 1f
             talk.setBackgroundResource(R.drawable.bg_input)
             // 播报中用喇叭图标：这时候是「它在说话」
-            talk.setCompoundDrawablesWithIntrinsicBounds(R.drawable.ic_mic, 0, 0, 0)
+            icon.setImageResource(R.drawable.ic_mic)
             stopTalkPulse(talk)
             return
         }
         when (state) {
             VoiceEngine.State.LISTENING -> {
-                talk.text = getString(R.string.mic_listening)
+                label.text = getString(R.string.mic_listening)
                 talk.alpha = 1f
                 // ★ 底色统一用 bg_input（跟输入框一致），但聆听态要能看出来，
                 //   所以用 bg_btn_listening 那个双层蓝框 —— 它是描边样式，
                 //   不会破坏底色统一。
                 talk.setBackgroundResource(R.drawable.bg_btn_listening)
                 // 聆听中换成麦克风图标：这时候是「在听你说话」
-                talk.setCompoundDrawablesWithIntrinsicBounds(R.drawable.ic_mic_active, 0, 0, 0)
+                icon.setImageResource(R.drawable.ic_mic_active)
                 startTalkPulse(talk)
             }
 
             VoiceEngine.State.THINKING -> {
-                talk.text = getString(R.string.mic_thinking)
+                label.text = getString(R.string.mic_thinking)
                 talk.setBackgroundResource(R.drawable.bg_input)
-                talk.setCompoundDrawablesWithIntrinsicBounds(R.drawable.ic_mic, 0, 0, 0)
+                icon.setImageResource(R.drawable.ic_mic)
                 stopTalkPulse(talk)
             }
 
             VoiceEngine.State.ASLEEP -> {
-                talk.text = "语音"
+                label.text = "语音"
                 talk.setBackgroundResource(R.drawable.bg_input)
-                talk.setCompoundDrawablesWithIntrinsicBounds(R.drawable.ic_mic, 0, 0, 0)
+                icon.setImageResource(R.drawable.ic_mic)
                 stopTalkPulse(talk)
             }
         }
@@ -691,6 +771,8 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
     companion object {
         const val EXTRA_DEST = "dest"
         const val EXTRA_SAY = "say"
+        const val EXTRA_SLAT = "slat"
+        const val EXTRA_SLON = "slon"
         private const val REQ_PERMS = 1002
         private const val FIX_TIMEOUT_MS = 60_000L
     }

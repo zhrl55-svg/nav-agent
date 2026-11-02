@@ -24,7 +24,13 @@ class WebExtractTool(private val apiKey: () -> String) : LlmTool {
     override fun execute(argumentsJson: String): String {
         val args = runCatching { JSONObject(argumentsJson) }.getOrNull()
             ?: return "网页读取参数格式错误，未执行"
-        val input = args.optJSONArray("urls") ?: return "缺少网页 URL，未执行"
+        // ★ 模型经常把 urls 写成 url（单数），直接判失败太浪费一轮 ——
+        //   实测它搜到新闻后想核对正文，传了 {"url":"https://..."}，
+        //   这里拒掉，它只能干巴巴回一句「没查到细节」。两种都收。
+        val input = args.optJSONArray("urls")
+            ?: args.optString("url").trim().takeIf { it.isNotBlank() }
+                ?.let { JSONArray().put(it) }
+            ?: return "缺少网页 URL，未执行"
         val urls = (0 until minOf(input.length(), 2)).mapNotNull { input.optString(it).trim().takeIf(String::isNotBlank) }
         if (urls.isEmpty()) return "没有有效网页 URL，未执行"
         if (urls.any { runCatching { URL(it).protocol == "https" }.getOrDefault(false).not() }) {

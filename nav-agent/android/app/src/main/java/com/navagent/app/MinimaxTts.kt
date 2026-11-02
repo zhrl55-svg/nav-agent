@@ -4,8 +4,6 @@ import android.content.Context
 import android.media.MediaPlayer
 import android.os.Handler
 import android.os.Looper
-import com.navagent.app.BuildConfig.MINIMAX_API_KEY
-import com.navagent.app.BuildConfig.MINIMAX_BASE_URL
 import com.navagent.core.CloudTts
 import org.json.JSONObject
 import java.io.File
@@ -95,8 +93,10 @@ class MinimaxTts(private val context: Context) : CloudTts {
     // ------------------------------------------------------------ 合成
 
     private fun synth(text: String): ByteArray? {
-        if (MINIMAX_API_KEY.isBlank()) {
-            Dbg.log("TTS：没有配置 MINIMAX_API_KEY")
+        // 每次合成都从 Prefs 读：设置页换 Key 后立刻生效
+        val apiKey = Prefs.voiceApiKey()
+        if (apiKey.isBlank()) {
+            Dbg.log("TTS：没有配置 API Key（设置页没填，编译期也没注入）")
             return null
         }
         val payload = JSONObject()
@@ -121,13 +121,13 @@ class MinimaxTts(private val context: Context) : CloudTts {
 
         var conn: HttpURLConnection? = null
         return try {
-            val base = MINIMAX_BASE_URL.trimEnd('/')
+            val base = Prefs.voiceBaseUrl().trimEnd('/')
             conn = (URL("$base/t2a_v2").openConnection() as HttpURLConnection).apply {
                 requestMethod = "POST"
                 connectTimeout = 8_000
                 readTimeout = 20_000
                 doOutput = true
-                setRequestProperty("Authorization", "Bearer $MINIMAX_API_KEY")
+                setRequestProperty("Authorization", "Bearer $apiKey")
                 setRequestProperty("Content-Type", "application/json")
             }
             conn.outputStream.use { it.write(payload.toByteArray()) }

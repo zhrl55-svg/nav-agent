@@ -1,7 +1,5 @@
 package com.navagent.app
 
-import com.navagent.app.BuildConfig.MINIMAX_API_KEY
-import com.navagent.app.BuildConfig.MINIMAX_BASE_URL
 import com.navagent.core.Asr
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
@@ -28,8 +26,10 @@ class MinimaxAsr : Asr {
         private set
 
     override fun transcribe(pcm: ShortArray, sampleRate: Int): String? {
-        if (MINIMAX_API_KEY.isBlank()) {
-            Dbg.log("ASR: 没有配置 MINIMAX_API_KEY")
+        // 每次调用都从 Prefs 读：设置页换 Key 后立刻生效
+        val apiKey = Prefs.voiceApiKey()
+        if (apiKey.isBlank()) {
+            Dbg.log("ASR: 没有配置 API Key（设置页没填，编译期也没注入）")
             return null
         }
         val seconds = pcm.size.toDouble() / sampleRate
@@ -39,7 +39,7 @@ class MinimaxAsr : Asr {
         val boundary = "----navagent" + UUID.randomUUID().toString().replace("-", "")
         val body = buildMultipart(boundary, wav)
 
-        val base = MINIMAX_BASE_URL.trimEnd('/')
+        val base = Prefs.voiceBaseUrl().trimEnd('/')
         val url = URL("$base/speech_to_text")
 
         var attempt = 0
@@ -52,7 +52,7 @@ class MinimaxAsr : Asr {
                     connectTimeout = 6_000
                     readTimeout = TIMEOUT_MS
                     doOutput = true
-                    setRequestProperty("Authorization", "Bearer $MINIMAX_API_KEY")
+                    setRequestProperty("Authorization", "Bearer $apiKey")
                     setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
                     setRequestProperty("language", "zh")
                 }

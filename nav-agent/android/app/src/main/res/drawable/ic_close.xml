@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  退出按钮的 × 图标。
+
+  ★ 用矢量图而不是「✕」字符：跟 ic_mic 同样的理由 ——
+    Unicode 乘号在不同 ROM/字体下粗细、居中、基线都不一样，
+    有的还会渲染成全角，撑出按钮。矢量图在任何设备上一致。
+
+  尺寸 20dp：按钮 48dp、内边距 14dp，视觉重心正好。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="20dp"
+    android:height="20dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24"
+    android:tint="#E6EDF5">
+
+    <path
+        android:fillColor="#E6EDF5"
+        android:pathData="M19,6.41L17.59,5 12,10.59 6.41,5 5,6.41 10.59,12 5,17.59 6.41,19 12,13.41 17.59,19 19,17.59 13.41,12z" />
+</vector>
