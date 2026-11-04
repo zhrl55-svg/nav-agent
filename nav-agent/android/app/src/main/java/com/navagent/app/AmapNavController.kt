@@ -42,7 +42,19 @@ class AmapNavController(
      * AMapNaviView 不会自动把镜头挪到当前位置，实测停在北京市 —— 
      * 必须自己 moveCamera 一次。
      */
-    private val onFirstFix: (Double, Double) -> Unit = { _, _ -> }
+    private val onFirstFix: (Double, Double) -> Unit = { _, _ -> },
+    /**
+     * 算路完成、导航开始（2026-11-04）。
+     *
+     * ★ 用来做「先看全程，5 秒后回到当前位置」——
+     *   算路成功了但用户还不知道路线长什么样、往哪走，
+     *   直接切到跟随视角会让人一头雾水。全程图看一眼，路线就在心里了。
+     *
+     * @param meters 全程长度（米）
+     * @param seconds 全程时间（秒）
+     * @param isReroute 是不是导航中改道（改道时不打断当前视角）
+     */
+    private val onRouteReady: (meters: Int, seconds: Int, isReroute: Boolean) -> Unit = { _, _, _ -> }
 ) : NavController {
 
     private var navi: AMapNavi? = null
@@ -62,9 +74,70 @@ class AmapNavController(
         private set
 
     @Volatile private var navigating = false
+
+    /**
+     * 用户请求了停止导航（SDK 的 stopNavi 是软停止，会有延迟）。
+     *
+     * ★ 用途（2026-11-04）：
+     *   stopNavi() 之后 SDK 还会再画一帧，甚至触发一次重新算路，
+     *   导致「退出导航后又播一遍准备出发」（用户反馈）。
+     *   这个标志用来识别「这是停止后的残留回调」，忽略掉。
+     *
+     *   navigateTo() 重新发起导航时会清掉。
+     */
+    @Volatile private var stopRequested = false
+
+    /**
+     * 「路线算好了」的信号（2026-11-04）。
+     *
+     * ★ 为什么需要：
+     *   算路是异步的 —— navigateTo() 只是发起请求，
+     *   真正 startNavi 在 onCalculateRouteSuccess 里（几百毫秒到几秒）。
+     *   工具如果不等就返回，模型拿到的就是「正在算路」这种中间态，
+     *   会照着念出来 —— 用户听到「正在规划张掖西站」，
+     *   但地图其实已经开始导航了，两边不同步（用户反馈）。
+     *
+     *   工具侧 await 这个 latch，拿到的就是**真实**结果：
+     *   「已导航到张掖西站，全程 2.6 公里，约 9 分钟」。
+     */
+    @Volatile
+    private var routeReadyLatch: java.util.concurrent.CountDownLatch? = null
     @Volatile private var stepRemainMeters = 0
     @Volatile private var pathRemainSeconds = 0
     @Volatile private var pathRemainMeters = 0
+
+    /**
+     * 前方剩余红绿灯个数（SDK `NaviInfo.getRouteRemainLightCount`）。
+     *
+     * ★ 2026-11-03：用户反馈「没有显示红绿灯时间」。
+     *   SDK 的倒计时只对有信号数据的路口下发，本地拿不到通用倒计时；
+     *   但「还剩几个灯」是全量数据，稳定可用 —— 先把它显示出来，
+     *   比什么都不显示有用。真正的秒数交给 SDK 内置的红绿灯视图。
+     */
+    @Volatile var remainLights: Int = 0
+        private set
+
+    /** 最近一次定位成功的时刻，用来判断信号是否断流 */
+    @Volatile private var lastFixMs = 0L
+
+    /** SDK 上报的 GPS 信号弱状态 */
+    @Volatile private var gpsWeak = false
+
+    /**
+     * 当前导航信号等级，给 UI 每秒轮询刷新用。
+     *
+     * 0 = 没信号 / 1 = 弱 / 2 = 正常。
+     *
+     * ★ 为什么不用 SDK 内置那个「卫星信号弱」：
+     *   它是静态视图，进了弱信号状态后经常不自己恢复（用户反馈「不能自动刷新」）。
+     *   这里用两个来源交叉判断：SDK 的 onGpsSignalWeak + 定位回调有没有断流，
+     *   UI 每秒取一次，掉线 8 秒就降级，恢复定位立刻回正常。
+     */
+    fun signalLevel(): Int {
+        if (!hasFix) return 0
+        if (lastFixMs > 0 && System.currentTimeMillis() - lastFixMs > SIGNAL_LOST_MS) return 0
+        return if (gpsWeak) 1 else 2
+    }
 
     private var pendingDestination: String? = null
 
@@ -91,6 +164,12 @@ class AmapNavController(
                 Dbg.log("AMapNavi.getInstance 成功 ver=" + AMapNavi.getVersion())
                 // 关掉内置语音，否则会和我们自己的 TTS 双重播报
                 it.setUseInnerVoice(false)
+
+                // ★ 红绿灯信号数据。
+                //   只开 View 上的 setTrafficLightsVisible 只能画图标，
+                //   倒计时/剩余灯数要靠这里打开信号源（V11.x 才有的开关）。
+                runCatching { it.setTrafficSignalEnable(Prefs.navTrafficLight) }
+                    .onFailure { e -> Dbg.log("红绿灯信号开关失败：${e.message}") }
 
                 // ★ 不要开 setMultipleRouteNaviMode(true)。
                 //   官方语义是「多路径导航模式」：导航中 SDK 会实时比较所有候选路线的路况，
@@ -123,6 +202,9 @@ class AmapNavController(
                     if (loc != null && loc.errorCode == 0) {
                         lastLat = loc.latitude
                         lastLon = loc.longitude
+                        // 定位时间戳：UI 靠它判断信号有没有断流（GPS 丢了 SDK 不一定回调）
+                        lastFixMs = System.currentTimeMillis()
+                        gpsWeak = false
                         loc.city?.takeIf { it.isNotBlank() }?.let { currentCity = it }
                         if (!hasFix) {
                             hasFix = true
@@ -159,8 +241,9 @@ class AmapNavController(
         }
         pendingDestination = destination
         pendingPlace = null
+        // 新的一次导航 → 解除「停止中」标志
+        stopRequested = false
         onState("正在解析「$destination」…")
-
         // ★ 城市偏置要等城市名解析出来。
         //   定位回调里坐标是先到的，`loc.city` 要靠 setNeedAddress(true) 反查地址，
         //   慢一拍（实测差几百毫秒）。hasFix 一变 true 就去搜索的话，
@@ -173,6 +256,43 @@ class AmapNavController(
             return
         }
         resolvePlace(destination)
+    }
+
+    /**
+     * 直接用坐标导航（跳过地名解析）。
+     *
+     * ★ 为什么需要（2026-11-04）：
+     *   语音说地址 → 搜出候选 → 用户确认 → 导航。
+     *   这时候坐标**已经拿到了**（POI 搜索结果里有经纬度），
+     *   再拿地名走一遍解析是多余的 ——
+     *   而且可能解析到**另一个同名地点**（「张掖西站」vs「张掖西站(南广场)」）。
+     *   直接用候选的坐标，百分之百是用户选的那个。
+     */
+    fun navigateToPoint(name: String, latitude: Double, longitude: Double, formatted: String = name) {
+        Dbg.log("navigateToPoint($name) $latitude,$longitude hasFix=$hasFix")
+        val n = navi
+        if (n == null) {
+            onState("导航引擎未就绪")
+            voice.speak("导航引擎还没准备好", VoiceGuide.Priority.USER)
+            return
+        }
+        if (!hasFix) {
+            onState("正在定位，请稍候再试")
+            voice.speak("还没定位到当前位置，稍等一下再说", VoiceGuide.Priority.USER)
+            return
+        }
+        pendingDestination = name
+        // 新的一次导航 → 解除「停止中」标志
+        stopRequested = false
+        onPlaceResolved(
+            AmapSdkGeocoder.GeoPoint(
+                latitude = latitude,
+                longitude = longitude,
+                formatted = formatted,
+                city = currentCity.orEmpty(),
+                district = ""
+            )
+        )
     }
 
     /**
@@ -368,7 +488,77 @@ class AmapNavController(
         }
     }
 
+    /**
+     * 开始导航并**等路线算完**。
+     *
+     * ★ 为什么加这个（2026-11-04）：
+     *   算路是异步的，`navigateTo()` 只是发起请求。
+     *   工具如果不等就返回，模型拿到的就是「正在算路」这种中间态，
+     *   会照着念 —— 用户听到「正在规划张掖西站」，
+     *   但地图其实早就开始导航了，模型和地图对不上（用户反馈）。
+     *
+     * @return 路线信息描述（真实结果），超时则返回中间态描述
+     */
+    fun navigateAndAwait(destination: String, timeoutMs: Long = 8_000): String {
+        val latch = java.util.concurrent.CountDownLatch(1)
+        routeReadyLatch = latch
+        navigateTo(destination)
+        val ok = runCatching {
+            latch.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+        }.getOrDefault(false)
+        routeReadyLatch = null
+        if (!ok) {
+            Dbg.log("等待路线超时（${timeoutMs}ms）")
+            return ""
+        }
+        val meters = pathRemainMeters
+        val seconds = pathRemainSeconds
+        return if (meters > 0 && seconds > 0) {
+            "全程${meters}米，约${Math.max(1, seconds / 60)}分钟"
+        } else {
+            ""
+        }
+    }
+
+    /**
+     * 开始导航并**等路线算完**（用精确坐标的版本）。
+     */
+    fun navigateToPointAndAwait(
+        name: String,
+        latitude: Double,
+        longitude: Double,
+        formatted: String = name,
+        timeoutMs: Long = 8_000
+    ): String {
+        val latch = java.util.concurrent.CountDownLatch(1)
+        routeReadyLatch = latch
+        navigateToPoint(name, latitude, longitude, formatted)
+        val ok = runCatching {
+            latch.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+        }.getOrDefault(false)
+        routeReadyLatch = null
+        if (!ok) {
+            Dbg.log("等待路线超时（${timeoutMs}ms）")
+            return ""
+        }
+        val meters = pathRemainMeters
+        val seconds = pathRemainSeconds
+        return if (meters > 0 && seconds > 0) {
+            "全程${meters}米，约${Math.max(1, seconds / 60)}分钟"
+        } else {
+            ""
+        }
+    }
+
     override fun stop() {
+        // ★ 先置「已请求停止」标志，再调 stopNavi()。
+        //   SDK 的 stopNavi() 是个**软停止**：它先播「导航结束」，
+        //   然后才真正停下来。这中间如果位置更新触发了重新算路，
+        //   onCalculateRouteSuccess 会又来一次 → 又播一遍「准备出发」→
+        //   用户听到的就是「退出导航后又重新开始一次导航」（用户反馈）。
+        //
+        //   置了标志，算路成功回调里就会忽略这次重算。
+        stopRequested = true
         runCatching { navi?.stopNavi() }
         navigating = false
         pendingDestination = null
@@ -462,6 +652,14 @@ class AmapNavController(
 
         override fun onCalculateRouteSuccess(p0: AMapCalcRouteResult?) {
             val n = navi ?: return
+            // ★ 用户已经请求停止导航了 —— 这次算路结果**作废**。
+            //   SDK 的 stopNavi() 是软停止（先播「导航结束」再真正停），
+            //   这中间位置更新会触发一次重算，如果照单全收就会又播一遍
+            //   「准备出发」—— 用户听到的就是「退出导航后又重新开始导航」（用户反馈）。
+            if (stopRequested) {
+                Dbg.log("算路结果作废（用户已请求停止导航）")
+                return
+            }
             // 只记录候选数量，**不要**去 selectRouteId 遍历。
             // 遍历会把当前路线切到最后一条，而且多路径模式下 SDK 自己也会来回切，
             // 叠在一起就是导航频繁改道（实测故障）。
@@ -470,6 +668,13 @@ class AmapNavController(
             val path = n.naviPath
             pathRemainSeconds = path?.allTime ?: 0
             pathRemainMeters = path?.allLength ?: 0
+
+            // ★ 通知等待方「路线算好了」（2026-11-04）
+            //   工具那边在等这个 —— 不等的话工具返回的是「正在算路」这种中间态，
+            //   模型会照着念，用户听到「正在规划张掖西站」，
+            //   但地图其实早就开始导航了，两边对不上（用户反馈）。
+            routeReadyLatch?.countDown()
+            routeReadyLatch = null
 
             // ★ 路线诊断：打出每段走哪条路。
             //   路线跟高德 App 不一致时，靠这个直接看是「走的路不同」还是「起终点不同」。
@@ -494,6 +699,12 @@ class AmapNavController(
             val started = n.startNavi(NaviType.GPS)
             navigating = started || wasNavigating
             Dbg.log("startNavi=$started pathLen=${path?.allLength} pathTime=${path?.allTime} wasNav=$wasNavigating")
+
+            // ★ 算路完成 → 通知界面「先看全程」（2026-11-04）
+            //   改道重算时**不打断**：用户正开着导航呢，突然切全程很烦。
+            if (started) {
+                onRouteReady(pathRemainMeters, pathRemainSeconds, wasNavigating)
+            }
 
             val place = pendingPlace
             val where = place?.let { describePlace(it) } ?: (pendingDestination ?: "目的地")
@@ -540,6 +751,7 @@ class AmapNavController(
             stepRemainMeters = info.curStepRetainDistance
             pathRemainSeconds = info.pathRetainTime
             pathRemainMeters = info.pathRetainDistance
+            remainLights = runCatching { info.routeRemainLightCount }.getOrDefault(0)
             // 高德经常把下一条路给成"无名道路"（村道、园区路、新建路），
             // 直接显示很丑，退回当前路名更可读；都没有就给个兜底话术。
             val next = info.nextRoadName?.takeIf { it.isNotBlank() && it != UNNAMED_ROAD }
@@ -579,6 +791,23 @@ class AmapNavController(
         override fun onReCalculateRouteForTrafficJam() {
             voice.speak("前方拥堵，已为你换路", VoiceGuide.Priority.NAV)
         }
+
+        /**
+         * GPS 信号弱状态变化。
+         *
+         * ★ 2026-11-03：接到 UI 上去做实时信号指示。
+         *   原来只看 SDK 内置那个静态标签，进了弱信号就一直挂着「卫星信号弱」，
+         *   出了隧道也不会恢复 —— 用户说的「信号显示不能自动刷新」就是这个。
+         */
+        override fun onGpsSignalWeak(p0: Boolean) {
+            gpsWeak = p0
+            if (p0) Dbg.log("GPS 信号弱")
+        }
+
+        override fun onGpsOpenStatus(p0: Boolean) {
+            Dbg.log("GPS 开关状态=$p0")
+            if (!p0) gpsWeak = true
+        }
     }
 
     private companion object {
@@ -594,5 +823,8 @@ class AmapNavController(
          * 不等的话城市偏置是 null，跨城市地名会解析错。
          */
         const val CITY_WAIT_MS = 3_000L
+
+        /** 定位超过这么久没更新，就认为信号断了（隧道、地下车库） */
+        const val SIGNAL_LOST_MS = 8_000L
     }
 }

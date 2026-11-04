@@ -3,10 +3,9 @@ package com.navagent.core
 /**
  * 对话编排：一句话进来 → 交给模型 → 流式回复 + 播报。
  *
- * 2026-11-01 起**不再有规则分支**。以前是「正则优先，没命中才问模型」，
- * 但实测正则漏得厉害（「打开导航去X」「拐到前面那家」「回刚才那个地方」全匹配不上），
- * 用户的体感是"导航坏了"。现在导航动作也走 Function Calling，
- * 由模型判断意图、调 `navigate` 工具执行。
+ * 2026-11-01 起导航意图主要由模型判断并通过 Function Calling 执行。
+ * 对明确的导航指令和上下文中已确认的地点，宿主可在 [interceptAction] 中做确定性兜底，
+ * 防止本地模型声明了工具却只输出文字、没有真正执行动作。
  *
  * 代价是延迟（7ms → 1.5~3s）和离线不可用，用户确认接受。
  *
@@ -44,7 +43,9 @@ class ChatEngine(
      *   模型会照着调一个不存在的工具，轻则空转一轮，重则直接编造「我查到了」。
      *   prompt 必须跟着工具一起变。
      */
-    private val webSearchAvailable: () -> Boolean = { true }
+    private val webSearchAvailable: () -> Boolean = { true },
+    /** 明确的本地动作意图可由宿主直接执行，避免不支持工具调用的模型只给文字承诺。 */
+    private val interceptAction: (String, List<ChatMessage>) -> String? = { _, _ -> null }
 ) {
 
     private val history = ArrayList<ChatMessage>()
@@ -78,6 +79,19 @@ class ChatEngine(
         history += ChatMessage(ChatMessage.Role.USER, utterance)
 
         busy = true
+        val intercepted = runCatching { interceptAction(utterance, history.toList()) }.getOrNull()
+        if (!intercepted.isNullOrBlank()) {
+            history += ChatMessage(ChatMessage.Role.ASSISTANT, intercepted)
+            onDelta(intercepted)
+            onReply(intercepted)
+            Thread {
+                runCatching { speak(intercepted) }
+                busy = false
+                drainPending()
+            }.apply { isDaemon = true; name = "chat-action" }.start()
+            return true
+        }
+
         val sb = StringBuilder()
         // 边流边念：攒到一句话就立刻交给 TTS，别等整段生成完。
         // 实测模型出首字 1~3s、整段 3~5s，逐句播报能把"听到第一声"提前 2 秒。
@@ -204,6 +218,14 @@ class ChatEngine(
         append("   用户回答「去」「好」「就这家」「走吧」等肯定答复时，必须结合前文确定目的地，")
         append("   立即调用 navigate 工具实际开始导航；不能只用文字表示同意、确认或说「这就带你去」。")
         append("   只有用户明确拒绝、改选其他地点或表达不确定时，才不要直接导航；目的地仍有歧义时先问清楚。")
+        // ★ 2026-11-04：导航播报会打断你说的话，所以导航成功后**只说一句短的**。
+        //   高德在导航开始时会自己播「准备出发，全程 2.6 公里，大约 9 分钟」，
+        //   如果你也念一遍，用户听到的是重复；
+        //   而且你的话正在念的时候高德那句会把它**打断**（用户反馈：
+        //   「全程视图打断了播报」「说了一半就没声了」）。
+        append("   navigate 工具返回「已开始导航…」之后，你只需要简短确认一句（比如「好，正在导航」），")
+        append("   **不要**重复念里程、时间、转向这些 —— 高德会自己播，重复还会互相打断。")
+        append("   只有用户明确问「多久到」「怎么走」时才说具体数字。")
         // 主动休眠：用户明说「别打扰我」时必须真的闭嘴，不能只是嘴上答应。
         append("2b) 用户说「你休息吧」「你先休息吧」「不要打扰我」「你先不要打扰我」「安静点」")
         append("   「别烦我了」这类要你别说话，**必须调 navigate 工具的 action=sleep**，")
@@ -235,6 +257,17 @@ class ChatEngine(
         // 用户要求：需要他做选择时列序号，他回数字就行。语音场景这样最省事。
         append("4) 需要用户在几个选项里挑一个时（比如搜出几家店），用 1、2、3 编号列出来，")
         append("   每项一句话说完，最后问「要哪个」。用户回「2」「第二个」就按上一轮列表理解。")
+        // ★ 2026-11-04：地点候选确认。这条不写清楚，模型会跳过确认直接导航，
+        //   或者搜完候选只说一句「找到几个地方」就不再管了 —— 用户根本没法选。
+        append("4b) navigate 工具返回「搜到 N 个候选」时，说明**还没导航**，只是搜到了几个可能的地方。")
+        append("   这时你必须：用 1、2、3 把候选列出来，问用户「是哪个」（候选名 + 地址，一句话说完）。")
+        append("   用户回答后（比如「2」或直接说名字），**再调一次 navigate**，")
+        append("   destination 用候选列表里的完整名称，并且 confirmed=true。")
+        append("   ★ 只有**一个**候选时才可以直接导航（confirmed=true），不用问。")
+        append("   ★ 有两个以上候选时，即使其中一个名字跟用户说的完全一致，")
+        append("     也**必须先列出来问**。为什么：同名的地方往往有好几个")
+        append("     （「张掖西站」「张掖西站(进站口)」「张掖西站停车场」），")
+        append("     选错了用户开半天才发现，白跑一趟。")
         append("5) 不确定的事就说不知道，不要编。涉及日期、星期、几号，以上面给的「现在是」为准。")
         // ★ 2026-11-01 改：原来是一刀切「政治不展开，一句这个我不聊带过」。
         //   实测用户说「听一下今天的国内和国际新闻」，搜回来的全是新闻联播要闻，

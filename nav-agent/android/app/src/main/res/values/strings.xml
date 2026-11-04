@@ -13,6 +13,8 @@
     <string name="nav_stop">停止导航</string>
     <string name="nav_start">开始导航</string>
     <string name="nav_exit_desc">退出应用</string>
+    <string name="route_overview_desc">导航全程</string>
+    <string name="nav_search_hint">搜索地点、地址</string>
     <string name="settings">设置</string>
     <string name="open_nav">导航</string>
     <string name="open_nav_active">导航中</string>

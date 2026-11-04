@@ -61,6 +61,23 @@ class MinimaxTts(private val context: Context) : CloudTts {
 
             val mp = MediaPlayer()
             player = mp
+            // ★ 必须标成「导航语音」，不能留默认的 USAGE_MEDIA/MUSIC。
+            //
+            //   默认值是音乐类音频，只走 A2DP（媒体）通道；车机如果只接了通话通道
+            //   （HFP），或者媒体音量是 0，播报就完全没声 —— 这就是用户反馈的
+            //   「声音传不到车机，高德 App 可以」。高德能响是因为它标了导航语音。
+            //
+            //   类型也要给 SPEECH：系统据此决定是否走语音增强链路。
+            //   必须在 setDataSource 之前设，否则不生效。
+            runCatching {
+                mp.setAudioAttributes(
+                    android.media.AudioAttributes.Builder()
+                        .setUsage(android.media.AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
+                        .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build()
+                )
+            }.onFailure { Dbg.log("TTS 音频属性设置失败：${it.message}") }
+
             mp.setDataSource(f.absolutePath)
             mp.setOnCompletionListener {
                 stopInternal()

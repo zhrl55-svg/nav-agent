@@ -61,6 +61,14 @@ object Prefs {
     private const val K_BT_TARGET = "bluetooth_target_name"
     private const val K_BT_AUTOSTART = "bluetooth_auto_start"
     private const val K_AMAP_BUILTIN_UI = "amap_builtin_ui"
+    private const val K_NAV_CAR_UP = "nav_car_up"
+    private const val K_NAV_AUTO_LOCK = "nav_auto_lock"
+    private const val K_NAV_AUTO_ZOOM = "nav_auto_zoom"
+    private const val K_NAV_TRAFFIC_LINE = "nav_traffic_line"
+    private const val K_NAV_TRAFFIC_LIGHT = "nav_traffic_light"
+    private const val K_NAV_SEARCH_BAR = "nav_search_bar"
+    private const val K_NAV_ZOOM = "nav_zoom"
+    private const val K_CAR_BT_AUDIO = "car_bt_audio"
     private const val K_CAR_NUMBER = "car_number"
 
     /** MiniMax 默认音色：青涩青年 */
@@ -369,6 +377,62 @@ object Prefs {
     var amapBuiltinUi: Boolean
         get() = sp.getBoolean(K_AMAP_BUILTIN_UI, true)
         set(v) = sp.edit().putBoolean(K_AMAP_BUILTIN_UI, v).apply()
+
+    /**
+     * 导航视角：true = 车头朝上（跟随转向），false = 正北朝上。
+     *
+     * ★ 2026-11-03：用户反馈「地图有时候不能自动调整方向和中心」。
+     *   原来 `isAutoLockCar` 写死 false，地图就不会跟着车走 ——
+     *   车开出几个路口，车标已经跑到屏幕边缘甚至屏幕外，看着像「地图卡住了」。
+     *   改成默认 true（锁车跟随），并且把视角做成可选：跑长途看全局用北朝上。
+     */
+    var navCarUp: Boolean
+        get() = sp.getBoolean(K_NAV_CAR_UP, true)
+        set(v) = sp.edit().putBoolean(K_NAV_CAR_UP, v).apply()
+
+    /** 自动锁车：车标固定在地图中心，地图随车移动 */
+    var navAutoLock: Boolean
+        get() = sp.getBoolean(K_NAV_AUTO_LOCK, true)
+        set(v) = sp.edit().putBoolean(K_NAV_AUTO_LOCK, v).apply()
+
+    /** 自动缩放：按车速自动拉近/拉远 */
+    var navAutoZoom: Boolean
+        get() = sp.getBoolean(K_NAV_AUTO_ZOOM, true)
+        set(v) = sp.edit().putBoolean(K_NAV_AUTO_ZOOM, v).apply()
+
+    /** 路况线：路线按拥堵着色。关掉是纯蓝线 */
+    var navTrafficLine: Boolean
+        get() = sp.getBoolean(K_NAV_TRAFFIC_LINE, true)
+        set(v) = sp.edit().putBoolean(K_NAV_TRAFFIC_LINE, v).apply()
+
+    /** 红绿灯：地图图标 + 提示视图 + SDK 信号数据 */
+    var navTrafficLight: Boolean
+        get() = sp.getBoolean(K_NAV_TRAFFIC_LIGHT, true)
+        set(v) = sp.edit().putBoolean(K_NAV_TRAFFIC_LIGHT, v).apply()
+
+    /** 顶部地址搜索栏是否显示 */
+    var navSearchBar: Boolean
+        get() = sp.getBoolean(K_NAV_SEARCH_BAR, true)
+        set(v) = sp.edit().putBoolean(K_NAV_SEARCH_BAR, v).apply()
+
+    /** 未锁车时的地图缩放级别（3~20） */
+    var navZoom: Int
+        get() = sp.getInt(K_NAV_ZOOM, 16)
+        set(v) = sp.edit().putInt(K_NAV_ZOOM, v.coerceIn(3, 20)).apply()
+
+    /**
+     * 车载蓝牙播报。
+     *
+     * ★ 为什么需要这个开关：车机蓝牙常常只接通话通道（HFP），没接媒体通道（A2DP）。
+     *   MediaPlayer 默认走 USAGE_MEDIA，这种车机上就完全没有声音；
+     *   高德能响是因为它把播报标成「导航语音」，系统会把它往蓝牙通话通道送。
+     *
+     *   打开后：播报期间把音频模式切到通信模式并启用蓝牙 SCO，播完立刻恢复。
+     *   关掉则只改 AudioAttributes（更省事，但个别车机仍可能没声）。
+     */
+    var carBluetoothAudio: Boolean
+        get() = sp.getBoolean(K_CAR_BT_AUDIO, true)
+        set(v) = sp.edit().putBoolean(K_CAR_BT_AUDIO, v).apply()
 
     /**
      * 车牌号（如「甘G12345」）。

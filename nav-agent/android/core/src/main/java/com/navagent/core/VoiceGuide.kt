@@ -95,9 +95,26 @@ class VoiceGuide(
         speakingListeners.forEach { runCatching { it(speaking) } }
     }
 
+    /**
+     * 播报窗口回调：(是否开始播报, 是否导航级)。
+     *
+     * ★ 2026-11-03 加。宿主用它切车载蓝牙通道（见 app 层 CarAudioRoute）：
+     *   播报开始前把音频路由到车机，播报一结束立刻还原 ——
+     *   不还原的话 SCO 会把麦克风锁在 8kHz 窄带，下一句指令就识别不准了。
+     */
+    @Volatile
+    var speakWindowListener: ((Boolean, Boolean) -> Unit)? = null
+
+    /** 当前正在播/刚播完那条的优先级，给 speakWindowListener 判断用 */
+    @Volatile
+    private var currentPriority: Priority = Priority.CHAT
+
     private fun setSpeaking(speaking: Boolean) {
         if (isSpeaking == speaking) return
         isSpeaking = speaking
+        runCatching {
+            speakWindowListener?.invoke(speaking, currentPriority == Priority.NAV)
+        }
         notifySpeaking(speaking)
     }
 
@@ -246,17 +263,18 @@ class VoiceGuide(
             }
 
             override fun onDone(utteranceId: String?) {
-                finishCurrent()
+                // ★ 传 id —— 打断产生的回调不能误伤后来入队的那条
+                finishCurrent(utteranceId)
             }
 
             @Deprecated("Deprecated in Java")
             override fun onError(utteranceId: String?) {
-                finishCurrent()
+                finishCurrent(utteranceId)
             }
 
             override fun onError(utteranceId: String?, errorCode: Int) {
                 Log.w(TAG, "播报出错 code=$errorCode")
-                finishCurrent()
+                finishCurrent(utteranceId)
             }
         })
         ready = true
@@ -273,7 +291,27 @@ class VoiceGuide(
     }
 
     @Synchronized
-    private fun finishCurrent() {
+    /**
+     * 播完一条，继续下一条。
+     *
+     * ★ ★ 必须按 utteranceId 匹配（2026-11-04）：
+     *   打断当前播报时，TTS 引擎会回调 `onError(被打断那条的 id)`。
+     *   如果不检查 id，这个「打断产生的回调」会把**后来加入的**那条
+     *   也当成播完了 —— 结果是新语音刚要播就被丢掉，
+     *   用户听到的是「说了一半就没声了」（用户反馈：
+     *   「停止的时候又触发了没有播报完的语音」）。
+     *
+     *   id 不匹配就只更新状态，不动 current、不 drain。
+     */
+    private fun finishCurrent(utteranceId: String? = null) {
+        if (utteranceId != null) {
+            val cur = current
+            if (cur == null || cur.id != utteranceId) {
+                // 这是**别的** utterance 的回调（多半是被打断的那条）
+                Log.w(TAG, "忽略不匹配的播报回调 id=$utteranceId（当前=${current?.id}）")
+                return
+            }
+        }
         current = null
         setSpeaking(false)
         lastSpokeEndMs = System.currentTimeMillis()
@@ -289,6 +327,7 @@ class VoiceGuide(
             val cloud = cloudTts ?: return
             val next = queue.poll() ?: return
             current = next
+            currentPriority = next.priority
             setSpeaking(true)
             cloud.speak(
                 next.text,
@@ -306,19 +345,41 @@ class VoiceGuide(
         if (engine.isSpeaking) return
         val next = queue.poll() ?: return
         current = next
-        engine.speak(next.text, TextToSpeech.QUEUE_FLUSH, null, next.id)
+        currentPriority = next.priority
+        // ★ 显式指定媒体流。
+        //   不传 Bundle 时用的是引擎默认流，各家 TTS 引擎不一样（有的是 STREAM_SYSTEM），
+        //   而 STREAM_SYSTEM 在车机上根本不走蓝牙媒体通道 —— 这也是一类"没声音"的来源。
+        val params = android.os.Bundle().apply {
+            putInt(TextToSpeech.Engine.KEY_PARAM_STREAM, android.media.AudioManager.STREAM_MUSIC)
+        }
+        engine.speak(next.text, TextToSpeech.QUEUE_FLUSH, params, next.id)
     }
 
     /**
      * 播报。NAV 优先级会清空待播的闲聊并打断当前播报。
+     *
+     * ★ 顺序很关键（2026-11-04）：
+     *   ① 先把 current 清掉
+     *   ② **再** tts.stop()
+     *   反过来的话，stop() 触发的 onError 回调（异步，在下一个消息循环）
+     *   回来时 current 已经被 null 掉了、新的那���也 drain 出来了，
+     *   回调就会把**新播报的那条**误判成「播完了」——
+     *   用户听到「说了一半就没声了」（用户反馈：
+     *   「停止的时候又触发了没有播报完的语音」）。
+     *
+     *   现在 finishCurrent(utteranceId) 会按 id 匹配，
+     *   老回调找不到对应的 current 就直接忽略，不会误伤新语音。
      */
     fun speak(text: String, priority: Priority = Priority.CHAT) {
         if (!ready) return
         if (priority == Priority.NAV) {
             queue.removeAll { it.priority == Priority.CHAT }
-            tts?.stop()
+            // ① 先清 current（让 stop() 的回调找不到它，只能被忽略）
             current = null
             setSpeaking(false)
+            // ② 再打断引擎
+            tts?.stop()
+            cloudTts?.stop()
         }
         queue.offer(Utterance("u${++seq}", text, priority))
         drain()

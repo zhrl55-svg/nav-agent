@@ -21,9 +21,23 @@ class NavApp : Application() {
     lateinit var chat: ChatEngine
         private set
 
+    /**
+     * 车载蓝牙播报路由。
+     *
+     * 必须进程级单例：播报和录音是同一套音频通道，
+     * Activity 重建时如果丢了这个对象，SCO 就没人负责关了 ——
+     * 结果是麦克风一直卡在通信模式，识别全废。
+     */
+    lateinit var carAudio: CarAudioRoute
+        private set
+
     /** 导航控制器，NavActivity 创建时挂上、销毁时摘掉 */
     @Volatile
     var nav: AmapNavController? = null
+
+    /** 共享的导航工具实例；本地确定性兜底和模型 Function Calling 共用执行路径 */
+    @Volatile
+    private var navigationTool: NavigationTool? = null
 
     /** 当前导航目的地，给 system prompt 用 */
     @Volatile
@@ -125,23 +139,39 @@ class NavApp : Application() {
         voice = VoiceGuide(this, Prefs.ttsEngine)
         // 云端合成器：设置里选「MiniMax 云端」时才会被用到
         voice.cloudTts = MinimaxTts(this)
+        // ★ 车载蓝牙路由：播报期间把音频送到车机，播完立刻还原
+        //   （不还原的话 SCO 会把麦克风锁在 8kHz，下一句指令就听不清了）
+        carAudio = CarAudioRoute(this)
+        voice.speakWindowListener = { speaking, navPriority ->
+            runCatching {
+                if (speaking) carAudio.begin(navPriority) else carAudio.end()
+            }.onFailure { Dbg.log("车载音频路由异常：${it.message}") }
+        }
         // TTS 的问题在华为机上 logcat 看不到，接到文件日志里
         voice.logger = { Dbg.log("VoiceGuide: $it") }
         voice.setRate(Prefs.ttsRate)
 
+        val navTool = NavigationTool(
+            navigateTo = ::toolNavigate,
+            navigateToPoi = ::toolNavigateToPoi,
+            stop = ::toolStop,
+            openMap = ::toolOpenMap,
+            lastNearbyName = { freshNearby()?.name },
+            sleep = ::toolSleep,
+            // ★ 候选确认（2026-11-04）：语音说地址时先搜候选给用户确认
+            searchPlaces = { keyword -> searchPlaceCandidates(keyword) },
+            showCandidates = { keyword, pois -> setPendingPois(keyword, pois) },
+            currentCandidates = { pendingPois },
+            clearCandidates = { selected -> clearPendingPois(selected) }
+        )
+        navigationTool = navTool
+
         chat = ChatEngine(
-            // 全部走 Function Calling —— 导航动作也是工具，不再有正则规则。
-            // 顺序不是随便排的：navigate 最常用放前面，web_search 最"万能"放最后，
-            // 免得模型什么都拿它兜。
+            // 模型原生 Function Calling 优先；明确的出发指令另有本地兜底，
+            // 避免不支持工具调用的本地模型只说「好的」却不执行。
             llm = OpenAiLlm(
                 tools = listOf(
-                    NavigationTool(
-                        navigateTo = ::toolNavigate,
-                        stop = ::toolStop,
-                        openMap = ::toolOpenMap,
-                        lastNearbyName = { freshNearby()?.name },
-                        sleep = ::toolSleep
-                    ),
+                    navTool,
                     WeatherTool { nav?.currentCity },
                     NearbyTool(
                         context = this,
@@ -167,7 +197,8 @@ class NavApp : Application() {
             // 不伪装成 AI 的对话气泡 —— 这条不会进对话历史。
             onFailure = { msg -> dispatchNotice(msg) },
             // 接本地接口时不给 Tavily（本地服务自带检索），prompt 也要跟着改口
-            webSearchAvailable = { Prefs.webSearchEnabled() }
+            webSearchAvailable = { Prefs.webSearchEnabled() },
+            interceptAction = ::interceptNavigation
         )
 
         prewarm()
@@ -260,6 +291,95 @@ class NavApp : Application() {
         chatObservers.remove(ui)
     }
 
+    // ------------------------------------------------------------ 地点候选
+
+    /**
+     * 地点候选展示者。
+     *
+     * ★ 为什么单独一个接口而不是塞进 ChatUi：
+     *   ChatUi 是「对话消息」的通路（用户说了什么、模型答了什么），
+     *   这里要传的是**结构化候选列表 + 关键词**，
+     *   混在一起以后 ChatUi 会变成什么都能塞的大杂烩。
+     *
+     * ★ 为什么要展示候选（2026-11-04）：
+     *   语音说「导航去XX」直接解析地名，解析歪了没人知道 ——
+     *   可能导航到 400 公里外的同名 POI，用户全程不知情。
+     *   先搜候选、摆出来让用户点/说编号，才靠谱。
+     */
+    interface PlaceSearchUi {
+        /** 搜到候选了：填进搜索框 + 弹出候选列表 */
+        fun onPlaceCandidates(keyword: String, pois: List<AmapSdkGeocoder.Poi>)
+
+        /** 搜索失败/无结果 */
+        fun onPlaceSearchFailed(keyword: String, reason: String)
+
+        /**
+         * 候选已确认（用户选完了），把列表收起来。
+         *
+         * ★ 为什么需要（2026-11-04）：
+         *   语音确认走的是「模型调工具」这条路，不经过点击处理，
+         *   列表没人收 —— 用户确认完了列表还挂在屏幕上（用户反馈）。
+         *
+         * @param selected 用户选中的那个（可空 —— 没有匹配到具体 POI 时）
+         */
+        fun onPlaceCandidatesCleared(selected: AmapSdkGeocoder.Poi?)
+    }
+
+    private val placeSearchObservers = CopyOnWriteArrayList<PlaceSearchUi>()
+
+    fun addPlaceSearchUi(ui: PlaceSearchUi) {
+        if (!placeSearchObservers.contains(ui)) placeSearchObservers.add(ui)
+    }
+
+    fun removePlaceSearchUi(ui: PlaceSearchUi) {
+        placeSearchObservers.remove(ui)
+    }
+
+    /**
+     * 待确认的候选（导航工具搜出来后暂存）。
+     *
+     * ★ 为什么要存：
+     *   模型搜到候选后问用户「是哪个」，用户回「2」。
+     *   模型再调 navigate(destination="第二个") —— 它未必会把完整名字给你，
+     *   可能就回个序号。所以这里存着 navigate 时好按序号/名字回查。
+     *
+     * ★ 存在 Application 而不是 Activity：
+     *   导航工具跑在 Application 的子线程里，跟 Activity 生命周期无关。
+     */
+    @Volatile
+    var pendingPois: List<AmapSdkGeocoder.Poi> = emptyList()
+        private set
+
+    /** 待确认候选对应的关键词（用户/模型后续提到它时用来判断是不是同一批） */
+    @Volatile
+    var pendingKeyword: String = ""
+        private set
+
+    /** 记下候选并推给界面 */
+    fun setPendingPois(keyword: String, pois: List<AmapSdkGeocoder.Poi>) {
+        pendingPois = pois
+        pendingKeyword = keyword
+        android.os.Handler(android.os.Looper.getMainLooper()).post {
+            placeSearchObservers.forEach { it.onPlaceCandidates(keyword, pois) }
+        }
+    }
+
+    /**
+     * 清掉待确认候选（用户已确认 / 已导航 / 换了新需求）。
+     *
+     * @param selected 用户选中的那个（语音确认时传，界面会把它写进搜索框）
+     */
+    fun clearPendingPois(selected: AmapSdkGeocoder.Poi? = null) {
+        pendingPois = emptyList()
+        pendingKeyword = ""
+        // ★ 通知界面把候选列表收起来（2026-11-04）。
+        //   语音确认走的是「模型调工具」这条路，不经过点击处理，
+        //   列表没人收 —— 用户确认完了列表还挂在屏幕上（用户反馈）。
+        android.os.Handler(android.os.Looper.getMainLooper()).post {
+            placeSearchObservers.forEach { it.onPlaceCandidatesCleared(selected) }
+        }
+    }
+
     /** 语音识别的结果统一从这里进 */
     fun submit(text: String) {
         Dbg.log("submit: $text")
@@ -271,6 +391,165 @@ class NavApp : Application() {
     }
 
     // ------------------------------------------------------------ 导航工具
+
+    /**
+     * 本地兜底：OpenAI 兼容接口声明了 tools，但部分模型仍只返回文字。
+     * 对明确的导航命令，或对「要不要去 X」的肯定答复，直接复用同一个导航工具执行。
+     */
+    private fun interceptNavigation(text: String, history: List<com.navagent.core.ChatMessage>): String? {
+        val normalized = text.trim().lowercase()
+        val affirmative = normalized.trimEnd('。', '！', '？', '!', '?', '.', ' ')
+            .removeSuffix("啊").removeSuffix("吧")
+            .let { it in setOf("去", "好", "好啊", "可以", "行", "走", "走吧", "就去", "去吧") }
+        val priorAssistant = history.dropLast(1)
+            .lastOrNull { it.role == com.navagent.core.ChatMessage.Role.ASSISTANT }?.text.orEmpty()
+        val askedToGo = priorAssistant.contains(Regex("(要不要|是否|想不想|去不去|要去).{0,30}(吗|么|？|\\?)"))
+        val explicit = Regex("(导航(过去|到|去)|带我(去|到)|开(到|过去)|前往|去一下|就去)")
+            .containsMatchIn(normalized) && !Regex("(不要|别|不用|先不|不想|停止|取消).{0,6}(导航|去|前往)")
+            .containsMatchIn(normalized)
+        if (!explicit && !(affirmative && askedToGo)) return null
+
+        val referential = Regex("(刚才那个位置|那个位置|刚才那里|刚才那个地方|这个地方|这个位置|这家|那家|那里|那儿|过去)")
+            .containsMatchIn(normalized)
+        val destination = (if (!referential) extractDestination(text) else null)
+            ?: extractDestination(priorAssistant)
+            ?: destinationMentionedBeforeQuestion(priorAssistant)
+            ?: freshNearby()?.name
+        if (destination.isNullOrBlank()) {
+            Dbg.log("导航兜底命中但无法从上下文确定目的地：$text")
+            return null
+        }
+
+        val args = org.json.JSONObject()
+            .put("action", "navigate")
+            .put("destination", destination)
+            .toString()
+        val result = navigationTool?.execute(args) ?: return null
+        // ★ ★ 关键（2026-11-04）：工具返回「搜到 N 个候选」时**不能**在这里接管。
+        //   那是**中间态**，不是导航结果 —— 接管了就等于跳过用户确认，
+        //   模型根本没机会问「是哪个」，用户看到的就是直接导航去了（用户反馈）。
+        //
+        //   这里返回 null，让流程继续走模型：
+        //     候选已经展示在地图的搜索框/列表里了（用户看得见），
+        //     候选也存进了 pendingPois，navContext() 会把它们列进 system prompt，
+        //     模型据此列 1、2、3 问用户。
+        if (isCandidateResult(result)) {
+            Dbg.log("导航兜底让位给模型（搜到候选，等用户确认）")
+            return null
+        }
+        Dbg.log("导航兜底已执行 destination=$destination result=${result.take(100)}")
+        return "好，正在导航去$destination。"
+    }
+
+    /**
+     * 工具返回的是不是「搜到候选」这种中间态。
+     *
+     * ★ 判定方式：看有没有「搜到 N 个」这个标记。
+     *   导航成功时返回的是「正在导航去X」/「正在改道去X」。
+     */
+    private fun isCandidateResult(result: String): Boolean =
+        result.contains("搜到") && result.contains("候选")
+
+    private fun destinationMentionedBeforeQuestion(text: String): String? {
+        val questionAt = listOf("要不要", "想不想", "去不去", "吗", "么", "？", "?")
+            .map { text.indexOf(it).takeIf { index -> index >= 0 } ?: Int.MAX_VALUE }
+            .minOrNull() ?: Int.MAX_VALUE
+        if (questionAt == Int.MAX_VALUE) return null
+        val prefix = text.substring(0, questionAt)
+        val pattern = Regex("(?:找到|搜到|查到|推荐(?:了|的是)?|地点是|目的地是|是|到|有)\\s*([\\u4e00-\\u9fffA-Za-z0-9·.-]{2,16})")
+        val raw = pattern.findAll(prefix).lastOrNull()?.groupValues?.getOrNull(1).orEmpty()
+        val value = raw.trimStart('了').trimEnd('的', '这', '那', '一', '家', '。', '，', ',')
+        return value.takeIf { isUsableNavigationTarget(it) }
+    }
+
+    private fun isUsableNavigationTarget(value: String): Boolean {
+        val target = value.trim()
+        if (target.length < 2) return false
+        if (target in setOf(
+                "过去", "那里", "那儿", "这儿", "这里", "这家", "那家",
+                "这个位置", "那个位置", "这个地方", "那个地方",
+                "目的地", "测试", "测试地点", "测试目的地", "某个地方", "一个地方"
+            )
+        ) return false
+        return !Regex("^(?:测试|某地|某个|一个)?(?:地方|位置|目的地)$").matches(target)
+    }
+
+    private fun extractDestination(text: String): String? {
+        val pattern = Regex("(?:导航(?:到|去)|带我(?:去|到)|带你去|前往|开到|开车去|去|到)\\s*([\\u4e00-\\u9fffA-Za-z0-9·.-]{2,24})")
+        val raw = pattern.find(text)?.groupValues?.getOrNull(1)?.trim().orEmpty()
+        val value = raw.trimEnd('吗', '么', '吧', '呢', '呀', '啊', '？', '?', '。', '，', ',', '！', '!')
+        return value.takeIf { isUsableNavigationTarget(it) }
+    }
+
+    /**
+     * 搜地点候选（同步）。
+     *
+     * ★ 用**高德 Web API**（PlaceWebSearch），不用 SDK 的 PoiSearch：
+     *   SDK 那边在工具链路上回调 8 秒都不来（实测），
+     *   工具必须同步拿到结果给模型，不能赌回调什么时候来。
+     *   Web API 同步 HTTP，简单可靠。
+     *
+     * ★ ★ 必须自己开子线程 —— 不能指望调用方在子线程：
+     *   除了模型的 Function Calling（那个在 tool- 线程里），
+     *   还有一条**本地兜底路径** interceptNavigation，
+     *   它在主线程直接调 navigationTool.execute() → 搜候选 → 发 HTTP
+     *   → NetworkOnMainThreadException（实测踩过）。
+     *   所以这里无条件切子线程，谁调都一样。
+     */
+    private fun searchPlaceCandidates(keyword: String): List<AmapSdkGeocoder.Poi> {
+        // ① 本市优先
+        val local = searchInBackground(keyword, nav?.currentCity, cityLimit = true)
+        if (local.size >= 2) {
+            Dbg.log("候选搜索「$keyword」→ 本市 ${local.size} 条")
+            return local
+        }
+        // ② 本市不够 → 全国
+        val all = searchInBackground(keyword, null, cityLimit = false)
+        val merged = (local + all).distinctBy { "${it.latitude},${it.longitude}" }.take(5)
+        Dbg.log("候选搜索「$keyword」→ 本市 ${local.size} 条 + 全国 ${all.size} 条 = ${merged.size} 条")
+        return merged
+    }
+
+    /**
+     * 在子线程里跑一次 Web API 搜索，等它返回。
+     *
+     * ★ 为什么自己开线程而不是依赖调用方：
+     *   navigate 工具会被两条路径调用 ——
+     *     ① 模型 Function Calling → tool- 线程（本来就在子线程）
+     *     ② 本地兜底 interceptNavigation → **主线程**
+     *   ② 那条路发 HTTP 会崩。这里统一处理，两条路都安全。
+     */
+    private fun searchInBackground(
+        keyword: String,
+        city: String?,
+        cityLimit: Boolean
+    ): List<AmapSdkGeocoder.Poi> {
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+            // 主线程来的 → 切子线程跑，再同步等它
+            val latch = java.util.concurrent.CountDownLatch(1)
+            val ref = java.util.concurrent.atomic.AtomicReference<List<AmapSdkGeocoder.Poi>>(emptyList())
+            Thread {
+                ref.set(doPlaceSearch(keyword, city, cityLimit))
+                latch.countDown()
+            }.apply { isDaemon = true; name = "place-search" }.start()
+            runCatching { latch.await(8, java.util.concurrent.TimeUnit.SECONDS) }
+            return ref.get()
+        }
+        // 已经在子线程 → 直接跑
+        return doPlaceSearch(keyword, city, cityLimit)
+    }
+
+    /** 真正发 HTTP 的地方。**只在子线程调** */
+    private fun doPlaceSearch(
+        keyword: String,
+        city: String?,
+        cityLimit: Boolean
+    ): List<AmapSdkGeocoder.Poi> = runCatching {
+        PlaceWebSearch.search(keyword, city, cityLimit = cityLimit, limit = 5)
+    }.getOrElse {
+        Dbg.log("地点搜索异常：${it.message}")
+        emptyList()
+    }
 
     /**
      * 工具实现：导航 / 改道。
@@ -294,12 +573,17 @@ class NavApp : Application() {
             //   所以 onNewIntent 会带着新目的地过来 —— 但那条路径要把整页
             //   重建一遍，路线和地图状态全丢（用户反馈「返回后导航消失」）。
             //   直接调控制器就没有这个问题。
-            controller.navigateTo(cleanDest)
+            //
+            // ★ ★ **等路线算完再返回**（2026-11-04）：
+            //   算路是异步的，不等的话工具返回「正在算路」这种中间态，
+            //   模型会照着念 —— 用户听到「正在规划张掖西站」，
+            //   但地图其实已经开始导航了，两边对不上（用户反馈）。
+            val routeInfo = controller.navigateAndAwait(cleanDest)
             destination = cleanDest
-            if (navigating) {
-                "正在改道去${cleanDest}（重新算路中，几秒后地图会更新）"
-            } else {
-                "正在导航去${cleanDest}（正在算路）"
+            buildString {
+                if (navigating) append("已改道去").append(cleanDest)
+                else append("已开始导航去").append(cleanDest)
+                if (routeInfo.isNotBlank()) append("，").append(routeInfo)
             }
         } else {
             // 导航页还没起来（极少见：语音服务在但 Activity 不在）
@@ -309,13 +593,72 @@ class NavApp : Application() {
         }
     }
 
+    /**
+     * 工具实现：按**候选 POI 的精确坐标**导航。
+     *
+     * ★ 为什么要单独一条路（2026-11-04）：
+     *   用户从候选列表里确认了某个地点，坐标已经拿到了。
+     *   再拿地名走一遍解析，可能落到**另一个同名地点**上
+     *   （「张掖西站」vs「张掖西站(南广场)」）。
+     *   直接用候选坐标，百分之百是用户选的那个。
+     */
+    private fun toolNavigateToPoi(poi: AmapSdkGeocoder.Poi): String {
+        Prefs.rememberDestination(poi.name)
+        val controller = nav
+        val navigating = controller?.isNavigating == true
+        lastNearby = null
+        destination = poi.name
+        if (controller == null) {
+            // 导航页没起来时只能退回按名字来
+            openNavigation(poi.name)
+            return "正在打开导航去${poi.name}（正在算路）"
+        }
+        // ★ **等路线算完再返回**（2026-11-04）—— 同 toolNavigate，
+        //   不等的话模型会念「正在规划…」，但地图早就开始导航了。
+        val routeInfo = controller.navigateToPointAndAwait(
+            poi.name, poi.latitude, poi.longitude, poi.address.ifBlank { poi.name }
+        )
+        return buildString {
+            if (navigating) append("已改道去").append(poi.name)
+            else append("已开始导航去").append(poi.name)
+            if (routeInfo.isNotBlank()) append("，").append(routeInfo)
+        }
+    }
+
     private fun toolStop(): String {
         val controller = nav
         if (controller == null || !controller.isNavigating) return "现在没在导航，不用停"
         controller.stop()
+        // ★ 通知界面把地图恢复成初始状态（2026-11-04）
+        //   工具跑在子线程，地图操作必须在主线程做。
+        android.os.Handler(android.os.Looper.getMainLooper()).post {
+            navStoppedObservers.forEach { it.onNavigationStopped() }
+        }
         // 故意不清 destination —— 底部按钮会变成「开始导航」，点一下能接着走，
         // 不用再让用户说一遍地名
         return "导航已停止。目的地还记着，之后说继续或者点「开始导航」就能接着走"
+    }
+
+    /**
+     * 「导航已停止」的观察者。
+     *
+     * ★ 为什么需要：
+     *   停止导航后地图要恢复初始状态（退出全程视图、镜头回当前位置）。
+     *   停止有两条路径（工具 / 高德 footer 的退出按钮），
+     *   都要触发这个恢复，所以做成观察者模式而不是在某处硬调。
+     */
+    interface NavStoppedUi {
+        fun onNavigationStopped()
+    }
+
+    private val navStoppedObservers = CopyOnWriteArrayList<NavStoppedUi>()
+
+    fun addNavStoppedUi(ui: NavStoppedUi) {
+        if (!navStoppedObservers.contains(ui)) navStoppedObservers.add(ui)
+    }
+
+    fun removeNavStoppedUi(ui: NavStoppedUi) {
+        navStoppedObservers.remove(ui)
     }
 
     /**
@@ -386,12 +729,39 @@ class NavApp : Application() {
         startActivity(intent)
     }
 
+/**
+     * 导航上下文，拼进 system prompt。
+     *
+     * ★ 待确认候选也要拼进去（2026-11-04）：
+     *   用户说「导航去XX」→ 兜底路径搜出候选 → 兜底让位给模型 →
+     *   模型必须知道有哪些候选才能列 1、2、3 问用户。
+     *   不拼的话模型看不到候选，只能瞎猜或者直接导航（用户反馈的现象）。
+     */
     private fun navContext(): String {
-        val c = nav ?: return ""
-        val dest = destination ?: return ""
-        val secs = c.remainingSeconds() ?: return ""
-        val meters = c.distanceToNextAction() ?: 0
-        return "正在导航去$dest，还有${secs / 60}分钟，下一个动作点在${meters}米后。"
+        val sb = StringBuilder()
+        // ① 待确认候选（优先级最高 —— 模型现在要做的就是这个）
+        val pending = pendingPois
+        if (pending.isNotEmpty()) {
+            sb.append("待用户确认的地点候选（关键词「").append(pendingKeyword).append("」）：")
+            pending.forEachIndexed { i, poi ->
+                sb.append('\n').append(i + 1).append(". ").append(poi.name)
+                if (poi.address.isNotBlank()) sb.append("（").append(poi.address).append("）")
+            }
+            sb.append("\n用户还没确认是哪一个。请用 1、2、3 列出来问他「是哪个」，")
+                .append("他回答后（回「2」或直接说名字）再调 navigate 工具，")
+                .append("destination 用候选的完整名称，并且 confirmed=true。")
+        }
+        // ② 正在导航的状态
+        val c = nav
+        val dest = destination
+        val secs = c?.remainingSeconds()
+        if (c != null && dest != null && secs != null) {
+            val meters = c.distanceToNextAction() ?: 0
+            if (sb.isNotEmpty()) sb.append('\n')
+            sb.append("正在导航去").append(dest).append("，还有")
+                .append(secs / 60).append("分钟，下一个动作点在").append(meters).append("米后。")
+        }
+        return sb.toString()
     }
 
     private companion object {

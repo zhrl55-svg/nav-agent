@@ -72,7 +72,14 @@ object AmapSdkGeocoder {
     )
 
     /** 周边搜索结果。distance 单位米，-1 表示没给。 */
-    data class Poi(val name: String, val distance: Int, val latitude: Double, val longitude: Double)
+    data class Poi(
+        val name: String,
+        val distance: Int,
+        val latitude: Double,
+        val longitude: Double,
+        /** 详细地址（POI 搜索才有）。搜索栏列表用它做副标题 */
+        val address: String = ""
+    )
 
     /** 定位结果 */
     data class Fix(val latitude: Double, val longitude: Double, val city: String)
@@ -80,6 +87,17 @@ object AmapSdkGeocoder {
     // ------------------------------------------------------------------ 初始化
 
     private var inited = false
+
+    /**
+     * 最近一次创建的 PoiSearch —— **必须持有强引用**。
+     *
+     * ★ 为什么（实测踩过）：
+     *   PoiSearch 是局部变量时，函数一返回它就没引用了，
+     *   GC 可能在 SDK 的异步搜索任务真正执行前把它回收，
+     *   表现是回调**迟迟不来**（候选搜索等了 8 秒超时才拿到结果）。
+     *   搜索栏里同样的调用几百毫秒就来，是因为那时还没被 GC 回收。
+     */
+    private var lastSearch: PoiSearch? = null
 
     /**
      * 高德 SDK 的隐私合规。**必须在任何 SDK 调用之前**做，否则定位和搜索都会失败。
@@ -310,6 +328,114 @@ object AmapSdkGeocoder {
             search.searchPOIAsyn()
         }.onFailure {
             Dbg.log("高德周边搜索异常：${it.message}")
+            onResult(emptyList())
+        }
+    }
+
+    // ------------------------------------------------------------------ 关键字搜索
+
+    /**
+     * 按关键字搜索 POI，给导航页顶部的地址搜索栏用。
+     *
+     * 和 [searchAroundList] 的区别：那个必须给圆心和半径（问"附近有什么"），
+     * 这个只给城市做偏置、按相关度排序（问"XX 在哪"）。
+     * 搜索结果不带圆心的话，用 `setCity` 限定在常驻城市，
+     * 否则搜"西站"会返回全国几十个西站。
+     *
+     * @param city 城市名，可空 —— 空则不限定，按全国相关度排
+     */
+    fun searchKeyword(
+        context: Context,
+        keyword: String,
+        city: String?,
+        limit: Int = 8,
+        onResult: (List<Poi>) -> Unit
+    ) = searchKeywordInternal(context, keyword, city, limit, false, onResult)
+
+    /**
+     * 跨城市关键字搜索 —— **不限定城市**。
+     *
+     * ★ 为什么需要单独一个：
+     *   `searchKeyword` 传了当前城市就等于给 POI 搜索加了 citylimit，
+     *   搜「景泰县条山路金星家园」时人在张掖 → 只搜张掖市 → **0 条**
+     *   （实测踩过：候选搜索返回 0，跨城地名根本搜不出来）。
+     *
+     *   记忆里那条「跨城市地名解析」的坑就是这个 —— 地理编码要动态开关 citylimit，
+     *   POI 搜索也一样。
+     *
+     * ★ 排序：不限城市时按**距离**排（离用户近的优先），
+     *   再叠加相关度。用户说「XX 那个地方」，近的那个多半是对的。
+     */
+    fun searchKeywordAnywhere(
+        context: Context,
+        keyword: String,
+        limit: Int = 8,
+        onResult: (List<Poi>) -> Unit
+    ) = searchKeywordInternal(context, keyword, "", limit, true, onResult)
+
+    private fun searchKeywordInternal(
+        context: Context,
+        keyword: String,
+        city: String?,
+        limit: Int,
+        anywhere: Boolean,
+        onResult: (List<Poi>) -> Unit
+    ) {
+        init(context)
+        val query = PoiSearch.Query(keyword, "", city.orEmpty())
+        query.pageSize = limit
+        query.pageNum = 1
+        // 有关键字时用相关度，不要距离排序 —— 用户找的是"那个地方"，不是"最近的"
+        query.setDistanceSort(false)
+        // ★ 跨城搜索必须显式关掉 citylimit。
+        //   Query 里传了 city 字符串不代表只搜这座城 —— 还要 setCityLimit(false)。
+        if (anywhere) {
+            runCatching { query.setCityLimit(false) }
+                .onFailure { Dbg.log("关闭 citylimit 失败：${it.message}") }
+        }
+        runCatching {
+            val search = PoiSearch(context.applicationContext, query)
+            // ★ ★ 必须持有强引用！
+            //   PoiSearch 是个局部变量的话，函数一返回它就没引用了，
+            //   GC 可能在 SDK 的异步任务执行前把它回收掉 ——
+            //   表现是回调**迟迟不来**（实测第一次搜索等了 8 秒超时，
+            //   而同样的调用放在搜索栏里几百毫秒就来，因为那时还没被 GC）。
+            //   存进字段里保命。
+            lastSearch = search
+            search.setOnPoiSearchListener(object : PoiSearch.OnPoiSearchListener {
+                override fun onPoiSearched(result: PoiResult?, code: Int) {
+                    if (code != 1000) {
+                        Dbg.log("高德关键字搜索失败 code=$code keyword=$keyword")
+                        onResult(emptyList())
+                        return
+                    }
+                    val pois = result?.pois.orEmpty().take(limit).map { item ->
+                        Poi(
+                            name = item.title ?: keyword,
+                            distance = item.distance,
+                            latitude = item.latLonPoint?.latitude ?: 0.0,
+                            longitude = item.latLonPoint?.longitude ?: 0.0,
+                            address = listOfNotNull(
+                                item.provinceName,
+                                item.cityName?.takeIf { it != item.provinceName },
+                                item.adName,
+                                item.snippet
+                            ).filter { it.isNotBlank() }.distinct().joinToString("")
+                        )
+                    }
+                    Dbg.log("高德关键字命中 ${pois.size} 个：${pois.joinToString { it.name }}")
+                    try {
+                        onResult(pois)
+                    } catch (t: Throwable) {
+                        Dbg.log("onResult 回调抛异常：${t.javaClass.simpleName}: ${t.message}")
+                    }
+                }
+
+                override fun onPoiItemSearched(item: PoiItem?, code: Int) {}
+            })
+            search.searchPOIAsyn()
+        }.onFailure {
+            Dbg.log("高德关键字搜索异常：${it.message}")
             onResult(emptyList())
         }
     }

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  导航页带文字的侧边按钮底（历史 / 对话）。
+
+  ★ 胶囊形（圆角矩形）而不是圆形：
+    圆形装不下两个汉字，文字会被裁掉。胶囊是文字按钮的常规形态。
+
+  ★ 底色跟语音 / 设置按钮（bg_side_btn）完全一致 —— 浅灰 #99666F78。
+    四颗按钮摆在一起必须同族，不然会显得东一颗西一颗。
+-->
+<ripple xmlns:android="http://schemas.android.com/apk/res/android"
+    android:color="#40FFFFFF">
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="#99666F78" />
+            <corners android:radius="23dp" />
+            <stroke
+                android:width="1dp"
+                android:color="#8C8A939C" />
+        </shape>
+    </item>
+</ripple>

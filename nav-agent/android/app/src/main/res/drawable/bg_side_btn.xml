@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  导航页侧边按钮的底（浅灰）。
+
+  ★ 为什么比搜索栏略实一点（#99 vs #80）：
+    这几个按钮是**悬浮**在地图上的独立控件，没有输入框那种边框感，
+    地图上的白色建筑、水面会让太透的按钮糊掉、点不准。
+    #99（约 60%）是「能看清轮廓但基本透出地图」的平衡点。
+
+  ★ 为什么用浅灰：
+    地图上还有高德自己的深色卡片（转向条、footer），
+    我们这排按钮如果也是深蓝黑，就是一堆深色疙瘩互相打架。
+    浅灰只有明度没有色相，看着像「工具按钮」，不跟高德的卡片抢。
+
+  ★ 圆形：语音 / 设置 是 46×46 的纯图标（2026-11-04 去掉文字），圆形跟它最配。
+    历史 / 对话带文字，用 bg_side_pill（胶囊形）。
+-->
+<ripple xmlns:android="http://schemas.android.com/apk/res/android"
+    android:color="#40FFFFFF">
+    <item>
+        <shape android:shape="oval">
+            <solid android:color="#99666F78" />
+            <stroke
+                android:width="1dp"
+                android:color="#8C8A939C" />
+        </shape>
+    </item>
+</ripple>

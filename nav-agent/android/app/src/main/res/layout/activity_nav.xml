@@ -10,9 +10,45 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
+    <!--
+      退出应用按钮（左上角）。
+
+      ★ 2026-11-04 加回来。
+        之前撤掉是因为底部高德 footer 里也有个「退出」——
+        但那两个根本不是一回事：
+          我们的 = 退出整个 app（停导航 + 停语音服务 + 杀进程）
+          高德的 = 只退出导航，app 还活着，语音还在后台听着麦克风。
+        用户要的是真能退出 app 的那个，不能被高德的顶替。
+
+      ★ 底色跟侧边按钮统一（灰色圆形），跟整排控件是一套。
+    -->
+    <LinearLayout
+        android:id="@+id/exit_nav"
+        android:layout_width="40dp"
+        android:layout_height="40dp"
+        android:layout_gravity="top|start"
+        android:layout_marginStart="12dp"
+        android:layout_marginTop="12dp"
+        android:background="@drawable/bg_side_btn"
+        android:clickable="true"
+        android:contentDescription="@string/nav_exit_desc"
+        android:elevation="6dp"
+        android:focusable="true"
+        android:gravity="center"
+        android:orientation="horizontal">
+
+        <ImageView
+            android:layout_width="16dp"
+            android:layout_height="16dp"
+            android:contentDescription="@null"
+            android:src="@drawable/ic_close" />
+    </LinearLayout>
+
     <!-- 顶部 HUD：转向箭头 + 距离 + 路名 + 全程剩余。
-         ★ marginStart 让开左上角退出按钮（按钮 48dp + 左右各 8dp = 64dp），
-           否则 HUD 卡片会压住按钮，两个都点不准。 -->
+         ★ 只在**关闭**高德内置界面时才画（内置界面开着时由高德画转向信息，
+           两套叠一起会重影）。
+         ★ marginStart 从 64dp 改回 10dp：原来那 64dp 是给左上角退出按钮让位的，
+           退出按钮 2026-11-04 已撤掉，不用再留空。 -->
     <LinearLayout
         android:id="@+id/hud"
         android:layout_width="match_parent"
@@ -21,7 +57,7 @@
         android:layout_marginTop="10dp"
         android:layout_marginEnd="10dp"
         android:layout_marginBottom="10dp"
-        android:layout_marginStart="64dp"
+        android:layout_marginStart="10dp"
         android:background="@drawable/bg_card"
         android:elevation="8dp"
         android:gravity="center_vertical"
@@ -70,209 +106,384 @@
     </LinearLayout>
 
     <!--
-      左上角退出按钮 —— 退出**整个应用**，不是退出导航。
+      顶部工具条：地址搜索 + 导航信号。
 
-      ★ 为什么需要它：高德内置界面的底栏（退出 / 继续导航 / 设置）被
-        setCrossLocation 裁到了屏幕外 —— 我们把底部让给了自己的面板，
-        官方那个「退出」就跟着没了。不给一个显式入口，用户只能靠系统返回键，
-        车机上（尤其车机把返回键收进菜单）等于没有出口。
+      ★ 2026-11-04 重排。原来还有一颗退出按钮，但底部底框取消之后，
+        高德内置的 footer（退出 / 剩余距离 / 剩余时间）会露出来 ——
+        那个「退出」在高德自己的导航流程里更完整（会弹二次确认），
+        所以我们的退出按钮撤掉，避免两个「退出」让用户不知道按哪个。
 
-      位置：贴状态栏下方、左边 8dp。topMargin 在代码里按状态栏实际高度设，
-            写死 12dp 在刘海屏上会被状态栏压掉。
-      z 序：放在 HUD 之后 → 盖在 HUD 和地图上面。
+      ★ 2026-11-04 再改：搜索栏从「屏幕顶部」挪到「高德转向条下方」。
+        原来它压在转向条上面，转向箭头被挡掉一半 ——
+        转向箭头是开车时最该看的一眼，不能被搜索框压住。
+        具体位置在代码里运行时算（见 positionSearchBelowBanner），
+        因为转向条高度不固定。
+
+      ★ 底色用 bg_input_translucent（半透明灰）：
+        压在地图上的控件不透明就是一块补丁，半透明才像「浮在地图上」。
     -->
-    <ImageButton
-        android:id="@+id/exit_nav"
-        android:layout_width="48dp"
-        android:layout_height="48dp"
-        android:layout_gravity="top|start"
-        android:layout_marginStart="8dp"
-        android:layout_marginTop="12dp"
-        android:background="@drawable/bg_nav_exit"
-        android:contentDescription="@string/nav_exit_desc"
-        android:elevation="6dp"
-        android:padding="14dp"
-        android:scaleType="fitCenter"
-        android:src="@drawable/ic_close" />
-
-    <!-- 底部：状态 + 输入框 + 按钮。
-         导航中唤醒聊天，回答不切页面 —— 地图不能离开视野，开车时也不看屏，主要靠 TTS。
-         输入框是为了不用说话也能发指令（旁边有人、或者语音识别不准的时候）。
-         ★ 导航页不显示聊天内容（气泡浮层已移除），只在状态行显示一行提示。 -->
     <LinearLayout
-        android:id="@+id/bottom_panel"
-        android:layout_width="match_parent"
+        android:id="@+id/top_container"
+        android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:layout_gravity="bottom"
-        android:background="#E6101820"
-        android:elevation="10dp"
-        android:orientation="vertical"
-        android:padding="14dp">
+        android:layout_gravity="top|center_horizontal"
+        android:layout_marginTop="12dp"
+        android:orientation="vertical">
 
-        <TextView
-            android:id="@+id/status"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="@string/hint_idle"
-            android:textColor="#E6EDF5"
-            android:textSize="14sp" />
+<!--
+          地址搜索栏。点击进入输入，回车或停顿自动搜。
+
+          ★ 2026-11-04：位置跟着高德的「中间信息区」**同一行**（middle_layout）。
+            原来在屏幕顶部，压着转向箭头 —— 转向箭头是开车时最该看的一眼。
+            挪到 middle_layout 之后，中间信息区（限速牌那层）就完整露出来了。
+
+          ★ 居中（2026-11-04）：用户要求不要靠右。
+            限速牌在中间信息区的左边，全程按钮在右边，
+            搜索栏放中间不跟任何一边打架。
+
+          ★ 宽度不占满：用 maxWidth 限制。
+            （不能用百分比 —— LinearLayout 的 layout_width 不支持 %，
+              也不能用 weight，那会重新占满整行。）
+        -->
+        <LinearLayout
+            android:id="@+id/search_box"
+            android:layout_width="wrap_content"
+            android:layout_height="40dp"
+            android:layout_gravity="center_horizontal"
+            android:maxWidth="200dp"
+            android:background="@drawable/bg_input_translucent"
+            android:elevation="6dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:paddingHorizontal="10dp"
+            android:shadowColor="#CC000000"
+            android:shadowDx="0"
+            android:shadowDy="1"
+            android:shadowRadius="3">
+
+            <ImageView
+                android:id="@+id/search_icon"
+                android:layout_width="16dp"
+                android:layout_height="16dp"
+                android:contentDescription="@null"
+                android:src="@drawable/ic_search" />
+
+            <EditText
+                android:id="@+id/search_input"
+                android:layout_width="0dp"
+                android:layout_height="match_parent"
+                android:layout_marginStart="6dp"
+                android:layout_weight="1"
+                android:autofillHints=""
+                android:background="@null"
+                android:hint="@string/nav_search_hint"
+                android:imeOptions="actionSearch"
+                android:inputType="text"
+                android:maxLines="1"
+                android:minWidth="60dp"
+                android:shadowColor="#CC000000"
+                android:shadowDx="0"
+                android:shadowDy="1"
+                android:shadowRadius="2"
+                android:textColor="#FFFFFF"
+                android:textColorHint="#C8D2DC"
+                android:textSize="13sp" />
+
+            <TextView
+                android:id="@+id/search_clear"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:paddingHorizontal="4dp"
+                android:paddingVertical="2dp"
+                android:text="✕"
+                android:textColor="#8FA8C0"
+                android:textSize="15sp"
+                android:visibility="gone" />
+        </LinearLayout>
 
         <!--
-          识别到的文字（临时提示）。
+          导航信号指示。
 
-          ★ 需求：输入框上方显示每次识别成功的文字，发送后自动消失。
-            纯语音界面没有消息列表，用户看不到「机器到底听成了什么」——
-            识别错了就无从发现（「导航去西站」被听成「导航去西战」，用户根本不知道）。
-            这里显示一次，让人能立刻确认或用输入框改。
+          ★ 2026-11-04 恢复显示（用户：「不要纠结导航信号的显示与否，
+            如果它能及时刷新，就让他显示」）。
 
-          生命周期：识别成功 → 显示 → 发送后清空。
-            不用聊天气泡那套（气泡会把整段历史都留在屏幕上，开车时干扰视线）。
+          ★ 为什么能及时刷新：
+            我们每秒轮询一次 nav.signalLevel()（看定位时间戳 + SDK 信号等级），
+            颜色和文字都跟着变 —— 不是高德内置那个**静态**的「卫星信号弱」
+            （进了弱信号就一直挂着不恢复，用户投诉过）。
+            高德内置那个已经被 removeView + 尺寸清零干掉了。
+
+          ★ 位置：搜索栏**正下方**，跟着搜索栏一起跑。
+            放屏幕顶部居中会被高德的转向条盖住（实测只剩半截）；
+            放这里刚好在「转向条 → 搜索栏 → 信号指示」的视觉流里，
+            而且限速牌在搜索栏左侧，不打架。
+
+          ★ 只留文字 + 阴影（2026-11-04 统一过配色）。
+            颜色区分状态：绿=信号好 / 黄=信号弱 / 红=无信号 / 灰=定位中。
         -->
         <TextView
-            android:id="@+id/recognized"
-            android:layout_width="match_parent"
+            android:id="@+id/gps_signal"
+            android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_marginTop="4dp"
-            android:maxLines="2"
-            android:ellipsize="end"
-            android:textColor="#7FB2DC"
-            android:textSize="14sp"
-            android:visibility="gone" />
+            android:layout_gravity="center_horizontal"
+            android:layout_marginTop="3dp"
+            android:gravity="center"
+            android:minWidth="58dp"
+            android:paddingHorizontal="8dp"
+            android:paddingVertical="2dp"
+            android:shadowColor="#CC000000"
+            android:shadowDx="0"
+            android:shadowDy="1"
+            android:shadowRadius="3"
+            android:text="定位中"
+            android:textColor="#8FA8C0"
+            android:textSize="12sp" />
 
-        <!-- 打字发指令 -->
-        <LinearLayout
-            android:layout_width="match_parent"
+        <!--
+          搜索结果浮层。
+
+          放在搜索栏下方的同一列里，位置天然跟着搜索栏走，不用算偏移。
+          默认 gone，搜索有结果才显示；点空白处或选中后收起。
+
+          ★ 宽度 220dp（比搜索栏宽，但不能太宽）：
+            搜索栏只有 150dp，候选列表要显示「名称 + 地址」两行，太窄会挤成一团；
+            但也不能太宽 —— 会压住右侧的「历史/对话」按钮（实测 280dp 就压住了）。
+
+          ★ 外层必须是 ScrollView：键盘弹出后可用高度只剩一半，
+            结果列表会顶到屏幕外面（实测第 5 条就被键盘盖住了）。
+            高度上限在代码里按屏幕比例设（见 setupSearchBar）。
+        -->
+        <ScrollView
+            android:id="@+id/search_results_scroll"
+            android:layout_width="240dp"
             android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
+            android:layout_gravity="center_horizontal"
+            android:layout_marginTop="6dp"
+            android:background="@drawable/bg_card"
+            android:clipToOutline="true"
+            android:elevation="8dp"
+            android:scrollbars="none"
+            android:visibility="gone">
+
+            <LinearLayout
+                android:id="@+id/search_results"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:paddingVertical="4dp" />
+        </ScrollView>
+    </LinearLayout>
+
+    <!--
+      导航信号指示 —— 已移除（2026-11-04）。
+
+      ★ 为什么整个删掉：
+        ① 高德内置的那个「卫星信号弱」是静态的，进了弱信号就一直挂着不恢复，
+           而且它跟我们的胶囊位置完全重叠（850~1146, 237~299），
+           两个叠一起像一串乱码。
+        ② 高德那个怎么都关不掉：
+           getIdentifier 查不到（jar 资源合并进我们 R 表）、setGPSViewVisible 调了没用
+           （SDK 每次 updateNaviInfo 都设回 VISIBLE）、
+           只能 removeView —— 但那属于跟 SDK 硬扛，代价大收益小。
+        ③ 用户反馈「信号可以不要」。
+
+      信号弱了地图自己会有反应（定位漂移、转向提示延迟），
+      语音播报也会照常继续 —— 不需要额外的 UI 提醒。
+
+      搜索栏的输入文字颜色见下面 search_input（改成高对比的白色 + 阴影）。
+    -->
+
+        <!--
+      左侧按钮列：上 = 语音，下 = 设置。
+
+      ★ 为什么竖排在左侧而不是底部一行：
+        底部要留给高德自己的 footer（退出 / 剩余距离 / 剩余时间），
+        我们的按钮再压上去就是两层叠一起，全都点不准。
+        左侧竖排贴着屏幕边，不占中间的地图。
+
+      ★ 语音按钮右边跟识别文本：
+        识别到的原文（「导航去西站」）必须能一眼看到 ——
+        纯语音界面没有消息列表，听错了用户无从发现。
+        跟在语音按钮右侧，喊完话余光就能扫到，2 秒后自动消失。
+    -->
+    <LinearLayout
+        android:id="@+id/side_left"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="left|center_vertical"
+        android:layout_marginStart="12dp"
+        android:orientation="vertical">
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
             android:gravity="center_vertical"
             android:orientation="horizontal">
 
-            <EditText
-                android:id="@+id/input"
-                android:layout_width="0dp"
-                android:layout_height="46dp"
-                android:layout_weight="1"
-                android:autofillHints=""
-                android:background="@drawable/bg_input"
-                android:hint="@string/chat_hint"
-                android:imeOptions="actionSend"
-                android:inputType="text"
-                android:maxLines="2"
-                android:paddingHorizontal="14dp"
-                android:textColor="#E6EDF5"
-                android:textColorHint="#5A6E82"
-                android:textSize="14sp" />
-
-            <Button
-                android:id="@+id/send"
-                android:layout_width="64dp"
-                android:layout_height="46dp"
-                android:layout_marginStart="8dp"
-                android:background="@drawable/bg_input"
-                    android:backgroundTint="@null"
-                    android:stateListAnimator="@null"
-                android:text="@string/send"
-                android:textColor="#E6EDF5"
-                android:textSize="13sp" />
-        </LinearLayout>
-
-        <!-- 五个按钮等宽，别让任何一个被挤掉。
-             「对话」进隐藏的 ChatActivity（看历史消息用），
-             「设置」进设置页 —— 2026-11-01 起设置入口从聊天页搬到了这里，
-             因为聊天页不再是主界面。 -->
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
-            android:orientation="horizontal">
-
             <!--
-              ★ 用 LinearLayout + ImageView + TextView，不用 Button 的 drawableStart。
+              ★ 用 LinearLayout + ImageView，不用 Button 的 drawableStart。
                 Button 的「图标+文字」组合居中不可控：实测 paddingStart=0 之后
-                左边留白 1dp、右边 8dp，整体明显偏左，图标和文字之间也松。
-                自己排就能把间距压到 3dp，并且真正居中。
+                左边留白 1dp、右边 8dp，整体明显偏左。
+
+              ★ 2026-11-04：**只留图标**，去掉「语音」文字。
+                按钮缩成 46×46 的圆形小按钮，不占横向空间，
+                地图露出来的面积更大。状态靠图标表达：
+                  麦克风 = 待命 / 聆听中（按一下说话）
+                  喇叭   = TTS 播报中（它在说话）
             -->
             <LinearLayout
                 android:id="@+id/talk"
-                android:layout_width="0dp"
-                android:layout_height="48dp"
-                android:layout_weight="1"
-                android:background="@drawable/bg_input"
+                android:layout_width="46dp"
+                android:layout_height="46dp"
+                android:background="@drawable/bg_side_btn"
                 android:clickable="true"
+                android:elevation="6dp"
                 android:focusable="true"
                 android:gravity="center"
                 android:orientation="horizontal">
 
                 <ImageView
                     android:id="@+id/talk_icon"
-                    android:layout_width="18dp"
-                    android:layout_height="18dp"
-                    android:contentDescription="@null"
-                    android:src="@drawable/ic_mic" />
-
-                <TextView
-                    android:id="@+id/talk_label"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:layout_marginStart="3dp"
-                    android:includeFontPadding="false"
-                    android:text="语音"
-                    android:textColor="#E6EDF5"
-                    android:textSize="13sp" />
+                    android:layout_width="20dp"
+                    android:layout_height="20dp"
+                    android:contentDescription="@string/voice"
+                    android:src="@drawable/ic_mic_active" />
             </LinearLayout>
 
-            <Button
-                android:id="@+id/stop_nav"
-                android:layout_width="0dp"
-                android:layout_height="48dp"
-                android:layout_marginStart="6dp"
-                android:layout_weight="1"
-                android:background="@drawable/bg_input"
-                    android:backgroundTint="@null"
-                    android:stateListAnimator="@null"
-                android:text="@string/nav_stop"
-                android:textColor="#E6EDF5"
-                android:textSize="13sp" />
+            <!--
+              识别到的文字。跟着语音按钮右侧，2 秒后自动消失。
 
-            <Button
-                android:id="@+id/history_nav"
-                android:layout_width="0dp"
-                android:layout_height="48dp"
-                android:layout_marginStart="6dp"
-                android:layout_weight="1"
-                android:background="@drawable/bg_input"
-                    android:backgroundTint="@null"
-                    android:stateListAnimator="@null"
-                android:text="历史"
-                android:textColor="#E6EDF5"
-                android:textSize="13sp" />
+              ★ 为什么要自动消失：它只是「机器听成了什么」的瞬时确认，
+                一直挂着会挡地图；2 秒足够用户读完并发现「哎说错了」，
+                之后注意力就该回到路上了。
 
-            <Button
-                android:id="@+id/back_to_chat"
-                android:layout_width="0dp"
-                android:layout_height="48dp"
+              ★ 2026-11-04：颜色改白色、字号加大到 15sp。
+                原来蓝色 13sp 在浅色地图上不够醒目 —— 用户得眯着眼才看得清
+                机器听成了什么，而这一眼恰恰是纠错的关键。
+                白色 + 稍大字号，在任何底色的地图上都清晰。
+            -->
+            <TextView
+                android:id="@+id/recognized"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
                 android:layout_marginStart="6dp"
-                android:layout_weight="1"
-                android:background="@drawable/bg_input"
-                    android:backgroundTint="@null"
-                    android:stateListAnimator="@null"
-                android:text="对话"
-                android:textColor="#E6EDF5"
-                android:textSize="13sp" />
-
-            <Button
-                android:id="@+id/nav_settings"
-                android:layout_width="0dp"
-                android:layout_height="48dp"
-                android:layout_marginStart="6dp"
-                android:layout_weight="1"
-                android:background="@drawable/bg_input"
-                    android:backgroundTint="@null"
-                    android:stateListAnimator="@null"
-                android:text="设置"
-                android:textColor="#E6EDF5"
-                android:textSize="13sp" />
+                android:background="@drawable/bg_status_chip"
+                android:ellipsize="end"
+                android:elevation="6dp"
+                android:maxLines="1"
+                android:maxWidth="190dp"
+                android:paddingHorizontal="10dp"
+                android:paddingVertical="6dp"
+                android:textColor="#FFFFFF"
+                android:textSize="15sp"
+                android:textStyle="bold"
+                android:visibility="gone" />
         </LinearLayout>
+
+        <!--
+          设置按钮（齿轮图标）。
+
+          ★ 2026-11-04：文字「设置」改成齿轮图标。
+            跟语音按钮一样是 46×46 的纯图标圆形按钮，
+            一排图标在侧边更整齐，也少占横向空间。
+            齿轮是设置的国际通用符号，不用认字。
+        -->
+        <LinearLayout
+            android:id="@+id/nav_settings"
+            android:layout_width="46dp"
+            android:layout_height="46dp"
+            android:layout_marginTop="40dp"
+            android:background="@drawable/bg_side_btn"
+            android:clickable="true"
+            android:contentDescription="@string/settings"
+            android:elevation="6dp"
+            android:focusable="true"
+            android:gravity="center"
+            android:orientation="horizontal">
+
+            <ImageView
+                android:layout_width="20dp"
+                android:layout_height="20dp"
+                android:contentDescription="@null"
+                android:src="@drawable/ic_settings" />
+        </LinearLayout>
+    </LinearLayout>
+
+    <!--
+      右侧按钮列：上 = 全程（路线图图标），中 = 历史，下 = 对话。
+
+      ★ 「全程」放最上面（2026-11-04）：
+        导航中最常用的操作 —— 看一眼整条路线有多长、往哪走。
+        放最上面手最好点，也最不容易跟高德自己的按钮撞。
+        没在导航时隐藏（没有路线，全程也没意义）。
+
+      ★ 「历史」看最近去过的目的地，「对话」进聊天页看消息记录。
+    -->
+    <LinearLayout
+        android:id="@+id/side_right"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="right|center_vertical"
+        android:layout_marginEnd="12dp"
+        android:orientation="vertical">
+
+        <!--
+          全程预览按钮（路线图图标）。
+
+          ★ 46×46 圆形，跟左边的语音/齿轮同一套规格。
+            点一下在「全程」和「当前位置」之间切换 ——
+            跟高德 App 的行为一致，第二次点回到跟随视角。
+        -->
+        <LinearLayout
+            android:id="@+id/route_overview"
+            android:layout_width="46dp"
+            android:layout_height="46dp"
+            android:background="@drawable/bg_side_btn"
+            android:clickable="true"
+            android:contentDescription="@string/route_overview_desc"
+            android:elevation="6dp"
+            android:focusable="true"
+            android:gravity="center"
+            android:orientation="horizontal"
+            android:visibility="gone">
+
+            <ImageView
+                android:id="@+id/route_overview_icon"
+                android:layout_width="20dp"
+                android:layout_height="20dp"
+                android:contentDescription="@null"
+                android:src="@drawable/ic_route_overview" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/history_nav"
+            android:layout_width="wrap_content"
+            android:layout_height="46dp"
+            android:layout_marginTop="40dp"
+            android:background="@drawable/bg_side_pill"
+            android:clickable="true"
+            android:elevation="6dp"
+            android:focusable="true"
+            android:gravity="center"
+            android:paddingHorizontal="14dp"
+            android:text="历史"
+            android:textColor="#F0F2F5"
+            android:textSize="13sp" />
+
+        <TextView
+            android:id="@+id/back_to_chat"
+            android:layout_width="wrap_content"
+            android:layout_height="46dp"
+            android:layout_marginTop="40dp"
+            android:background="@drawable/bg_side_pill"
+            android:clickable="true"
+            android:elevation="6dp"
+            android:focusable="true"
+            android:gravity="center"
+            android:paddingHorizontal="14dp"
+            android:text="对话"
+            android:textColor="#F0F2F5"
+            android:textSize="13sp" />
     </LinearLayout>
 
 </FrameLayout>

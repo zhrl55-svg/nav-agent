@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  小喇叭图标（TTS 播报中用）。
+
+  ★ 语义：喇叭 = 「它在说话」，麦克风 = 「在听你说话」。
+    导航页的语音按钮只有一个图标位，状态靠图标本身表达：
+      待命/识别 → ic_mic_active（麦克风，按一下说话）
+      播报中   → ic_speaker（喇叭，它在说话）
+    （ic_mic 这个名字下的文件历史上画的是喇叭，聊天页还在用，
+      所以这里另建 ic_speaker，不动它，避免影响聊天页。）
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="20dp"
+    android:height="20dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24"
+    android:tint="#F0F2F5">
+
+    <!-- 喇叭主体 -->
+    <path
+        android:fillColor="#F0F2F5"
+        android:pathData="M3,9v6h4l5,5V4L7,9H3z" />
+
+    <!-- 声波：两道弧 -->
+    <path
+        android:fillColor="#F0F2F5"
+        android:pathData="M16.5,12c0,-1.77 -1.02,-3.29 -2.5,-4.03v8.05c1.48,-0.73 2.5,-2.25 2.5,-4.02zM14,3.23v2.06c2.89,0.86 5,3.54 5,6.71s-2.11,5.85 -5,6.71v2.06c4.01,-0.91 7,-4.49 7,-8.77s-2.99,-7.86 -7,-8.77z" />
+</vector>

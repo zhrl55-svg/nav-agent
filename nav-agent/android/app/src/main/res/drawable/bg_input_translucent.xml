@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  半透明输入框 / 搜索栏底（浅灰）。
+
+  ★ 为什么单独做一个而不是给 bg_input 加 alpha：
+    bg_input 被聊天页的输入框、发送按钮一起用（activity_chat.xml）。
+    给它加透明度会让聊天页也跟着变淡 —— 聊天页是纯文字界面，背景是纯色，
+    变淡了会露出窗口底色（浅灰），很难看。
+    导航页是压在地图上的，半透明是刚需，两边诉求相反。
+
+  ★ 为什么用**浅灰**不用深蓝黑（#16222E）：
+    地图上散着高德自己的深色卡片（转向条、footer），
+    我们再来一排深色浮层，看起来就是「一堆深色疙瘩」，
+    每个控件都在抢注意力，反而没有主次。
+    浅灰只有明度没有色相，在浅色地图上是「工具」的感觉。
+
+  ★ 不透明度 #A6（约 65%）：
+    再低就看不见搜索框的边界了，输入框没有边框会「化」进地图；
+    而且 #80（50%）实测底下的地图颜色会透上来，
+    灰色文字（#E6EDF5）跟浅色地图对比不够，看不清占位提示。
+    #A6 + 浅灰底是「能看清轮廓和文字，但基本透出地图」的平衡点。
+-->
+<ripple xmlns:android="http://schemas.android.com/apk/res/android"
+    android:color="#33FFFFFF">
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="#A6666F78" />
+            <corners android:radius="22dp" />
+            <stroke
+                android:width="1dp"
+                android:color="#A08A939C" />
+        </shape>
+    </item>
+</ripple>

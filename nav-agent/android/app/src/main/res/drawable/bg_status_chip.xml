@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  识别文本胶囊的底（浅灰）。
+
+  ★ 跟左侧语音按钮并排，两个底色必须同族才像一组。
+    语音按钮用的是 bg_side_btn（浅灰 #99666F78），这里跟着用。
+
+  ★ 不透明度比侧边按钮略低（#80 vs #99）：
+    识别文本是**临时**信息，2 秒后就消失，
+    视觉权重应该比常驻按钮低一点。
+-->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <solid android:color="#805C656E" />
+    <corners android:radius="18dp" />
+    <stroke
+        android:width="1dp"
+        android:color="#8C8A939C" />
+</shape>
