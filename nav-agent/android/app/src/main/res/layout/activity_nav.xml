@@ -294,7 +294,7 @@
     -->
 
         <!--
-      左侧按钮列：上 = 语音，下 = 设置。
+      左侧按钮列：上 = 语音，中 = 导航播报模式，下 = 设置。
 
       ★ 为什么竖排在左侧而不是底部一行：
         底部要留给高德自己的 footer（退出 / 剩余距离 / 剩余时间），
@@ -379,6 +379,26 @@
                 android:textStyle="bold"
                 android:visibility="gone" />
         </LinearLayout>
+
+        <!--
+          导航播报模式。点击按「详细 → 标准 → 简洁 → 关闭」循环切换。
+          文字直接显示当前模式，开车时不用进设置页，也不用记图标含义。
+        -->
+        <TextView
+            android:id="@+id/nav_voice_mode"
+            android:layout_width="46dp"
+            android:layout_height="46dp"
+            android:layout_marginTop="40dp"
+            android:background="@drawable/bg_side_btn"
+            android:clickable="true"
+            android:elevation="6dp"
+            android:focusable="true"
+            android:gravity="center"
+            android:includeFontPadding="false"
+            android:text="详细"
+            android:textColor="#F0F2F5"
+            android:textSize="13sp"
+            android:textStyle="bold" />
 
         <!--
           设置按钮（齿轮图标）。

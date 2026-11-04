@@ -51,6 +51,7 @@ object Prefs {
     private const val K_TTS_VOICE = "tts_voice"
     private const val K_TTS_CLOUD_MODEL = "tts_cloud_model"
     private const val K_TTS_RATE = "tts_rate"
+    private const val K_NAV_VOICE_MODE = "nav_voice_mode"
     private const val K_WAKE_BEEP = "wake_beep"
     private const val K_NEARBY_RADIUS = "nearby_radius"
     private const val K_FILE_LOG = "file_log"
@@ -81,6 +82,12 @@ object Prefs {
     const val WEB_SEARCH_AUTO = "auto"
     const val WEB_SEARCH_ON = "on"
     const val WEB_SEARCH_OFF = "off"
+
+    /** 导航播报内容与频次。 */
+    const val NAV_VOICE_DETAILED = "detailed"
+    const val NAV_VOICE_STANDARD = "standard"
+    const val NAV_VOICE_CONCISE = "concise"
+    const val NAV_VOICE_OFF = "off"
 
     private lateinit var sp: SharedPreferences
 
@@ -304,6 +311,38 @@ object Prefs {
     var ttsRate: Float
         get() = sp.getFloat(K_TTS_RATE, 1.0f)
         set(v) = sp.edit().putFloat(K_TTS_RATE, v).apply()
+
+    /**
+     * 导航播报模式。
+     *
+     * 详细：完整播报高德下发的文本。
+     * 标准：过滤明显低价值提示和短时间重复文本。
+     * 简洁：只播转向、出口、并道、限速、拥堵改道等关键提示。
+     * 关闭：不播导航提示，但用户主动对话的语音回复不受影响。
+     */
+    var navVoiceMode: String
+        get() = sp.getString(K_NAV_VOICE_MODE, NAV_VOICE_DETAILED)
+            .orEmpty()
+            .takeIf { it in NAV_VOICE_MODES }
+            ?: NAV_VOICE_DETAILED
+        set(v) = sp.edit().putString(
+            K_NAV_VOICE_MODE,
+            v.takeIf { it in NAV_VOICE_MODES } ?: NAV_VOICE_DETAILED
+        ).apply()
+
+    fun navVoiceModeLabel(): String = when (navVoiceMode) {
+        NAV_VOICE_DETAILED -> "详细"
+        NAV_VOICE_CONCISE -> "简洁"
+        NAV_VOICE_OFF -> "关闭"
+        else -> "标准"
+    }
+
+    private val NAV_VOICE_MODES = setOf(
+        NAV_VOICE_DETAILED,
+        NAV_VOICE_STANDARD,
+        NAV_VOICE_CONCISE,
+        NAV_VOICE_OFF
+    )
 
     /** 播报结束后这么久内都不拾音（回声尾巴） */
     var echoGuardMs: Long

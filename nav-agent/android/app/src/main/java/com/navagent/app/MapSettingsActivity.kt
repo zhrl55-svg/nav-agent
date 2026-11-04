@@ -156,6 +156,26 @@ class MapSettingsActivity : AppCompatActivity() {
         }
 
         section("声音")
+        row(
+            "导航播报",
+            Prefs.navVoiceModeLabel(),
+            "详细、标准、简洁或关闭。关闭不会影响主动对话的语音回复"
+        ) {
+            choose(
+                "导航播报",
+                listOf(
+                    "详细（完整播报）" to Prefs.NAV_VOICE_DETAILED,
+                    "标准（过滤重复和低价值提示）" to Prefs.NAV_VOICE_STANDARD,
+                    "简洁（只播关键行驶提示）" to Prefs.NAV_VOICE_CONCISE,
+                    "关闭（不播导航提示）" to Prefs.NAV_VOICE_OFF
+                ),
+                Prefs.navVoiceMode
+            ) {
+                Prefs.navVoiceMode = it
+                NavigationVoicePolicy.reset()
+                applied()
+            }
+        }
         rowSwitch(
             "车载蓝牙播报", Prefs.carBluetoothAudio,
             "播报走蓝牙通话通道，车机才出得来声。关掉只改音频类型，个别车机仍可能没声"

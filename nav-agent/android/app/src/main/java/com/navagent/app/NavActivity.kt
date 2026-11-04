@@ -207,6 +207,11 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
         //   点一下看整条路线，再点一下回到当前位置 —— 跟高德 App 的行为一致。
         findViewById<View>(R.id.route_overview).setOnClickListener { toggleRouteOverview() }
 
+        findViewById<TextView>(R.id.nav_voice_mode).setOnClickListener {
+            cycleNavigationVoiceMode()
+        }
+        updateNavVoiceModeButton()
+
         setupSearchBar()
 
         val hasLocation = hasLocationPermission()
@@ -1214,6 +1219,47 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
             .show()
     }
 
+    /**
+     * 左侧「导航播报」按钮：不改句子，只按顺序切换现有四档策略。
+     *
+     * 放在导航页是为了开车时少一步操作；设置页和这里操作的是同一个
+     * SharedPreferences 值，所以两边会立刻同步。
+     */
+    private fun cycleNavigationVoiceMode() {
+        val modes = arrayOf(
+            Prefs.NAV_VOICE_DETAILED,
+            Prefs.NAV_VOICE_STANDARD,
+            Prefs.NAV_VOICE_CONCISE,
+            Prefs.NAV_VOICE_OFF
+        )
+        val currentIndex = modes.indexOf(Prefs.navVoiceMode).coerceAtLeast(0)
+        Prefs.navVoiceMode = modes[(currentIndex + 1) % modes.size]
+        NavigationVoicePolicy.reset()
+        updateNavVoiceModeButton()
+        toast(
+            if (Prefs.navVoiceMode == Prefs.NAV_VOICE_OFF) {
+                "导航播报已关闭，主动对话仍会正常播报"
+            } else {
+                "导航播报：${Prefs.navVoiceModeLabel()}"
+            }
+        )
+    }
+
+    private fun updateNavVoiceModeButton() {
+        val button = findViewById<TextView>(R.id.nav_voice_mode) ?: return
+        val label = Prefs.navVoiceModeLabel()
+        button.text = label
+        button.contentDescription = "导航播报模式：$label，点击切换"
+        button.setTextColor(
+            if (Prefs.navVoiceMode == Prefs.NAV_VOICE_OFF) {
+                Color.parseColor("#FF9B9B")
+            } else {
+                Color.WHITE
+            }
+        )
+        button.alpha = if (Prefs.navVoiceMode == Prefs.NAV_VOICE_OFF) 0.82f else 1f
+    }
+
     // ---------------------------------------------------------------- 信号指示
 
     /**
@@ -1854,6 +1900,8 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
         }
         // 从聊天页切回来时导航状态可能已经变了
         updateNavButton(nav.isNavigating)
+        // 从任一设置页返回时，左侧按钮要立即反映最新播报模式
+        updateNavVoiceModeButton()
         // 信号指示每秒刷一次（onPause 里必须摘掉，否则页面退到后台还在跑）
         // 从「地图与导航设置」返回时，视角/锁车/路况这些要立刻生效
         applyMapSettings()

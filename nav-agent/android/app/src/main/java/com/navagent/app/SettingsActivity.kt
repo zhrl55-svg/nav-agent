@@ -244,6 +244,30 @@ class SettingsActivity : AppCompatActivity() {
 
         section("语音播报")
         row(
+            "导航播报",
+            Prefs.navVoiceModeLabel(),
+            "控制高德导航提示的内容和频次；关闭后仍会正常播放你的主动对话"
+        ) {
+            choose(
+                "导航播报",
+                listOf(
+                    "详细（完整播报）" to Prefs.NAV_VOICE_DETAILED,
+                    "标准（过滤重复和低价值提示）" to Prefs.NAV_VOICE_STANDARD,
+                    "简洁（只播关键行驶提示）" to Prefs.NAV_VOICE_CONCISE,
+                    "关闭（不播导航提示）" to Prefs.NAV_VOICE_OFF
+                ),
+                Prefs.navVoiceMode
+            ) {
+                Prefs.navVoiceMode = it
+                NavigationVoicePolicy.reset()
+                if (it == Prefs.NAV_VOICE_OFF) {
+                    toast("导航提示已关闭，主动对话仍会正常播报")
+                }
+                applied()
+            }
+        }
+
+        row(
             "播报引擎", engineLabel(),
             "换引擎会重建合成器，正在播的那句会断"
         ) {

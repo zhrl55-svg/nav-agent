@@ -42,11 +42,17 @@ class VoiceGuide(
 
     enum class Priority { NAV, USER, CHAT }
 
-    private data class Utterance(val id: String, val text: String, val priority: Priority)
+    private data class Utterance(
+        val id: String,
+        val text: String,
+        val priority: Priority,
+        val order: Long
+    )
 
     private val queue = PriorityBlockingQueue(
         11,
         compareBy<Utterance> { it.priority.ordinal }
+            .thenBy { it.order }
     )
 
     private val appContext = context.applicationContext
@@ -54,7 +60,7 @@ class VoiceGuide(
     private var tts: TextToSpeech? = null
     private var ready = false
     private var current: Utterance? = null
-    private var seq = 0
+    private var seq = 0L
 
     /**
      * ★ 必须放在所有属性声明之后。
@@ -315,8 +321,11 @@ class VoiceGuide(
         current = null
         setSpeaking(false)
         lastSpokeEndMs = System.currentTimeMillis()
+        logger?.invoke("播报完成 id=${curLogId(utteranceId)} 队列=${queue.size}")
         drain()
     }
+
+    private fun curLogId(utteranceId: String?): String = utteranceId ?: "-"
 
     @Synchronized
     private fun drain() {
@@ -329,6 +338,7 @@ class VoiceGuide(
             current = next
             currentPriority = next.priority
             setSpeaking(true)
+            logger?.invoke("开始播报 id=${next.id} priority=${next.priority} chars=${next.text.length}")
             cloud.speak(
                 next.text,
                 onDone = { finishCurrent() },
@@ -352,6 +362,7 @@ class VoiceGuide(
         val params = android.os.Bundle().apply {
             putInt(TextToSpeech.Engine.KEY_PARAM_STREAM, android.media.AudioManager.STREAM_MUSIC)
         }
+        logger?.invoke("开始播报 id=${next.id} priority=${next.priority} chars=${next.text.length}")
         engine.speak(next.text, TextToSpeech.QUEUE_FLUSH, params, next.id)
     }
 
@@ -370,18 +381,29 @@ class VoiceGuide(
      *   现在 finishCurrent(utteranceId) 会按 id 匹配，
      *   老回调找不到对应的 current 就直接忽略，不会误伤新语音。
      */
+    @Synchronized
     fun speak(text: String, priority: Priority = Priority.CHAT) {
         if (!ready) return
         if (priority == Priority.NAV) {
             queue.removeAll { it.priority == Priority.CHAT }
-            // ① 先清 current（让 stop() 的回调找不到它，只能被忽略）
-            current = null
-            setSpeaking(false)
-            // ② 再打断引擎
-            tts?.stop()
-            cloudTts?.stop()
+            // 导航播报可以打断用户闲聊，但**不能打断另一条导航播报**。
+            // 高速上高德会连续下发「前方测速」「保持左侧」「进入服务区」等提示，
+            // 如果每条 NAV 都 stop()，前一条就会只播半句。
+            if (current?.priority != Priority.NAV) {
+                // ① 先清 current（让 stop() 的回调找不到它，只能被忽略）
+                current = null
+                setSpeaking(false)
+                // ② 再打断引擎
+                tts?.stop()
+                cloudTts?.stop()
+            }
         }
-        queue.offer(Utterance("u${++seq}", text, priority))
+        val order = ++seq
+        queue.offer(Utterance("u$order", text, priority, order))
+        logger?.invoke(
+            "播报入队 id=u$order priority=$priority chars=${text.length} " +
+                "current=${current?.id ?: "-"} 队列=${queue.size}"
+        )
         drain()
     }
 

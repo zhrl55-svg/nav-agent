@@ -3,11 +3,13 @@ package com.navagent.app
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import com.amap.api.location.AMapLocation
 import com.amap.api.location.AMapLocationClient
 import com.amap.api.location.AMapLocationClientOption
 import com.amap.api.navi.AMapNavi
+import com.amap.api.navi.enums.NaviTTSType
 import com.amap.api.navi.enums.NaviType
 import com.amap.api.navi.enums.PathPlanningStrategy
 import com.amap.api.navi.model.AMapCalcRouteResult
@@ -165,6 +167,10 @@ class AmapNavController(
     /** SDK 上报的 GPS 信号弱状态 */
     @Volatile private var gpsWeak = false
 
+    /** 同一句文本从两个兼容回调重复到达时，只处理第一次。 */
+    private var lastSdkVoiceText: String? = null
+    private var lastSdkVoiceAtMs = 0L
+
     /**
      * 当前导航信号等级，给 UI 每秒轮询刷新用。
      *
@@ -288,6 +294,7 @@ class AmapNavController(
         stopRequested = false
         cancelPendingRoute = false
         hasNavCoord = false
+        resetSdkVoiceState()
         // ★ 中间态不弹提示（2026-11-04）：
         //   原来「正在解析」+「正在规划到X的路线」+「导航中→X」三条连着弹，
         //   1.2 秒内刷四五个 toast，看着像出故障（用户反馈：「是不是打架的进程」）。
@@ -338,6 +345,7 @@ class AmapNavController(
         stopRequested = false
         cancelPendingRoute = false
         hasNavCoord = false
+        resetSdkVoiceState()
         onPlaceResolved(
             AmapSdkGeocoder.GeoPoint(
                 latitude = latitude,
@@ -1095,30 +1103,32 @@ class AmapNavController(
             logStructuredTrafficInfo()
         }
 
-        /** SDK 生成的导航播报文本，接管到我们自己的 TTS 队列（NAV 优先级最高） */
+        /** 新版本回调带 NaviTTSType，可按事件类型过滤。 */
+        override fun onGetNavigationText(p0: Int, p1: String?) {
+            handleSdkNavigationText(p0, p1)
+        }
+
+        /** 兼容旧版 SDK：没有事件类型时按普通导航提示处理。 */
         override fun onGetNavigationText(p0: String?) {
-            if (stopRequested) return
-            val text = p0?.takeIf { it.isNotBlank() } ?: return
-            Dbg.log("导航播报 chars=${text.length}")
-            voice.speak(text, VoiceGuide.Priority.NAV)
+            handleSdkNavigationText(NaviTTSType.NAVIINFO_TEXT, p0)
         }
 
         override fun onArriveDestination() {
             if (stopRequested) return
             navigating = false
             onState("已到达目的地")
-            voice.speak("已到达目的地", VoiceGuide.Priority.NAV)
+            speakNavigation(NaviTTSType.NAVI_END_TEXT, "已到达目的地")
             onHud(NavHud(navigating = false))
         }
 
         override fun onReCalculateRouteForYaw() {
             if (stopRequested) return
-            voice.speak("路线已重新规划", VoiceGuide.Priority.NAV)
+            speakNavigation(NaviTTSType.NAVI_YAW, "路线已重新规划")
         }
 
         override fun onReCalculateRouteForTrafficJam() {
             if (stopRequested) return
-            voice.speak("前方拥堵，已为你换路", VoiceGuide.Priority.NAV)
+            speakNavigation(NaviTTSType.NAVI_YAW, "前方拥堵，已为你换路")
         }
 
         /**
@@ -1139,11 +1149,54 @@ class AmapNavController(
         }
     }
 
+    /**
+     * 两种 onGetNavigationText 回调在各版本 SDK 中可能只来一种，也可能同时到达。
+     * 先挡掉 500ms 内的同文本重复，再交给用户选择的播报策略。
+     */
+    @Synchronized
+    private fun handleSdkNavigationText(type: Int, rawText: String?) {
+        if (stopRequested) return
+        val text = rawText?.takeIf { it.isNotBlank() } ?: return
+        val nowMs = SystemClock.elapsedRealtime()
+        if (text == lastSdkVoiceText && nowMs - lastSdkVoiceAtMs <= SDK_CALLBACK_DUPLICATE_MS) {
+            Dbg.log("忽略重复导航播报回调 type=$type chars=${text.length}")
+            return
+        }
+        lastSdkVoiceText = text
+        lastSdkVoiceAtMs = nowMs
+        speakNavigation(type, text, nowMs)
+    }
+
+    @Synchronized
+    private fun resetSdkVoiceState() {
+        lastSdkVoiceText = null
+        lastSdkVoiceAtMs = 0L
+        NavigationVoicePolicy.reset()
+    }
+
+    /** 所有导航语音都从这里进入，静音、简洁和标准模式才能覆盖完整。 */
+    @Synchronized
+    private fun speakNavigation(
+        type: Int,
+        text: String,
+        nowMs: Long = SystemClock.elapsedRealtime()
+    ) {
+        val mode = Prefs.navVoiceMode
+        val decision = NavigationVoicePolicy.decide(type, text, mode, nowMs)
+        Dbg.log(
+            "导航播报 type=$type mode=$mode speak=${decision.speak} " +
+                "reason=${decision.reason} chars=${text.length} text=$text"
+        )
+        if (decision.speak) voice.speak(text, VoiceGuide.Priority.NAV)
+    }
+
     private companion object {
         const val TAG = "AmapNav"
 
         /** 高德对没有正式名称的道路统一返回这个字符串 */
         const val UNNAMED_ROAD = "无名道路"
+
+        const val SDK_CALLBACK_DUPLICATE_MS = 500L
 
         /**
          * 等城市名解析出来的最长时间（毫秒）。
