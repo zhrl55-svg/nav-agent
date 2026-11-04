@@ -1,5 +1,7 @@
 package com.navagent.core
 
+import java.util.concurrent.Executors
+
 /**
  * 对话编排：一句话进来 → 交给模型 → 流式回复 + 播报。
  *
@@ -48,6 +50,8 @@ class ChatEngine(
     private val interceptAction: (String, List<ChatMessage>) -> String? = { _, _ -> null }
 ) {
 
+    private val lock = Any()
+
     private val history = ArrayList<ChatMessage>()
 
     /**
@@ -58,49 +62,65 @@ class ChatEngine(
      */
     private val pending = ArrayDeque<String>()
 
+    /**
+     * 单线程执行器。send() 只负责入队，拦截、模型请求、工具调用和结果写入都不占
+     * 调用方线程 —— 语音服务和 Activity 的主线程都不能被最长几十秒的网络请求卡住。
+     */
+    private val worker = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "chat-engine").apply { isDaemon = true }
+    }
+
+    /** reset() 时递增；旧请求晚到的结果不能写回新一轮对话。 */
+    private var generation = 0L
+
     @Volatile
     var busy: Boolean = false
         private set
 
     /** 返回 false 表示这句被忽略（空串） */
-    @Synchronized
     fun send(text: String): Boolean {
         val utterance = text.trim()
         if (utterance.isEmpty()) return false
-        if (busy) {
-            if (pending.size >= MAX_PENDING) pending.removeFirst()
-            pending.addLast(utterance)
+        synchronized(lock) {
+            if (busy) {
+                if (pending.size >= MAX_PENDING) pending.removeFirst()
+                pending.addLast(utterance)
+                return true
+            }
+            busy = true
+            worker.execute { process(utterance) }
             return true
         }
-        return process(utterance)
     }
 
-    private fun process(utterance: String): Boolean {
-        history += ChatMessage(ChatMessage.Role.USER, utterance)
-
-        busy = true
-        val intercepted = runCatching { interceptAction(utterance, history.toList()) }.getOrNull()
-        if (!intercepted.isNullOrBlank()) {
-            history += ChatMessage(ChatMessage.Role.ASSISTANT, intercepted)
-            onDelta(intercepted)
-            onReply(intercepted)
-            Thread {
-                runCatching { speak(intercepted) }
-                busy = false
-                drainPending()
-            }.apply { isDaemon = true; name = "chat-action" }.start()
-            return true
+    private fun process(utterance: String) {
+        val runGeneration = synchronized(lock) {
+            history += ChatMessage(ChatMessage.Role.USER, utterance)
+            generation
         }
+        try {
+            val intercepted = runCatching {
+                interceptAction(utterance, snapshot())
+            }.getOrNull()
+            if (!intercepted.isNullOrBlank()) {
+                if (isCurrent(runGeneration)) {
+                    appendAssistant(runGeneration, intercepted)
+                    onDelta(intercepted)
+                    onReply(intercepted)
+                    runCatching { speak(intercepted) }
+                }
+                return
+            }
 
-        val sb = StringBuilder()
-        // 边流边念：攒到一句话就立刻交给 TTS，别等整段生成完。
-        // 实测模型出首字 1~3s、整段 3~5s，逐句播报能把"听到第一声"提前 2 秒。
-        val spoken = StringBuilder()
-        Thread {
+            val sb = StringBuilder()
+            // 边流边念：攒到一句话就立刻交给 TTS，别等整段生成完。
+            // 实测模型出首字 1~3s、整段 3~5s，逐句播报能把"听到第一声"提前 2 秒。
+            val spoken = StringBuilder()
             var spokenAny = false
             // 一段增量同时喂三处：整段结果、界面、播报缓冲
             fun feed(piece: String) {
                 sb.append(piece)
+                if (!isCurrent(runGeneration)) return
                 onDelta(piece)
                 spoken.append(piece)
                 if (speakCompletedSentences(spoken)) spokenAny = true
@@ -120,7 +140,7 @@ class ChatEngine(
                 null
             }
 
-            var full = attempt(systemPrompt(), history.toList())
+            var full = attempt(systemPrompt(), snapshot())
 
             // ★ 2026-11-02：失败后**不再由 App 编一句兜底**，而是让模型自己说。
             //
@@ -140,7 +160,10 @@ class ChatEngine(
             // 只要模型明确报告失败就重试，哪怕已经念出了半句 ——
             // 那半句通常只是「我帮你查一下」，用户等的是后面的答案。
             if (full.isNullOrBlank()) {
-                full = attemptText(retryPrompt(sb.toString().trim()), history.takeLast(RETRY_HISTORY))
+                full = attemptText(
+                    retryPrompt(sb.toString().trim()),
+                    snapshot().takeLast(RETRY_HISTORY)
+                )
             }
 
             val answer = (full ?: sb.toString()).trim()
@@ -149,12 +172,14 @@ class ChatEngine(
             // 撤回刚加进去的用户消息（避免下一轮模型看到一句"没人回的问话"），
             // 然后用系统提示告知，**不伪造 AI 回复**。
             if (answer.isEmpty()) {
-                if (history.isNotEmpty()) history.removeAt(history.size - 1)
-                onFailure("这次没连上，稍后再试")
-                busy = false
-                drainPending()
-                return@Thread
+                if (isCurrent(runGeneration)) {
+                    removeLastUser(utterance, runGeneration)
+                    onFailure("这次没连上，稍后再试")
+                }
+                return
             }
+            if (!isCurrent(runGeneration)) return
+
             // 收尾：把没说完的半句念掉
             if (spoken.isNotBlank()) {
                 speak(spoken.toString().trim())
@@ -165,19 +190,47 @@ class ChatEngine(
             // 这里必须补上，否则界面上有字、耳朵里没声。
             if (!spokenAny) speak(answer)
 
-            history += ChatMessage(ChatMessage.Role.ASSISTANT, answer)
+            appendAssistant(runGeneration, answer)
             onReply(answer)
-            busy = false
-            drainPending()
-        }.apply { isDaemon = true; name = "chat-engine" }.start()
-        return true
+        } catch (t: Throwable) {
+            if (isCurrent(runGeneration)) {
+                removeLastUser(utterance, runGeneration)
+                onFailure("这次没连上，稍后再试")
+            }
+        } finally {
+            finishAndDrain()
+        }
     }
 
-    @Synchronized
-    private fun drainPending() {
-        if (busy) return
-        val next = pending.removeFirstOrNull() ?: return
-        process(next)
+    private fun isCurrent(expected: Long): Boolean = synchronized(lock) {
+        generation == expected
+    }
+
+    private fun appendAssistant(runGeneration: Long, text: String) {
+        synchronized(lock) {
+            if (generation == runGeneration) {
+                history += ChatMessage(ChatMessage.Role.ASSISTANT, text)
+            }
+        }
+    }
+
+    private fun removeLastUser(utterance: String, runGeneration: Long) {
+        synchronized(lock) {
+            if (generation != runGeneration || history.isEmpty()) return
+            val last = history.last()
+            if (last.role == ChatMessage.Role.USER && last.text == utterance) {
+                history.removeAt(history.lastIndex)
+            }
+        }
+    }
+
+    private fun finishAndDrain() {
+        val next = synchronized(lock) {
+            pending.removeFirstOrNull().also {
+                if (it == null) busy = false
+            }
+        }
+        if (next != null) worker.execute { process(next) }
     }
 
     /**
@@ -198,11 +251,14 @@ class ChatEngine(
     }
 
     fun reset() {
-        history.clear()
-        pending.clear()
+        synchronized(lock) {
+            generation++
+            history.clear()
+            pending.clear()
+        }
     }
 
-    fun snapshot(): List<ChatMessage> = history.toList()
+    fun snapshot(): List<ChatMessage> = synchronized(lock) { history.toList() }
 
     private fun systemPrompt(): String = buildString {
         append("你是「${assistantName()}」，一个在车里陪用户说话的语音助手。")

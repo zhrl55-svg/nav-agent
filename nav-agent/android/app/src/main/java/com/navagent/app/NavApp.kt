@@ -246,7 +246,7 @@ class NavApp : Application() {
      * [VoiceService.reloadWake] 重建，由设置页自己触发。
      */
     fun applySettings() {
-        Dbg.enabled = Prefs.fileLog
+        Dbg.enabled = BuildConfig.DEBUG && Prefs.fileLog
         voice.setRate(Prefs.ttsRate)
         Dbg.log(
             "设置生效 chat=${Prefs.chatModel} asr=${Prefs.asrModel} " +
@@ -382,7 +382,7 @@ class NavApp : Application() {
     fun freshLastConfirmedPoi(): AmapSdkGeocoder.Poi? {
         val poi = lastConfirmedPoi ?: return null
         if (System.currentTimeMillis() - lastConfirmedAt > CONFIRMED_TTL_MS) {
-            Dbg.log("已确认的候选过期：${poi.name}")
+            Dbg.log("已确认的候选过期 chars=${poi.name.length}")
             return null
         }
         return poi
@@ -411,7 +411,7 @@ class NavApp : Application() {
         if (selected != null) {
             lastConfirmedPoi = selected
             lastConfirmedAt = System.currentTimeMillis()
-            Dbg.log("记住已确认的候选：${selected.name} (${selected.latitude},${selected.longitude})")
+            Dbg.log("记住已确认的候选 chars=${selected.name.length}")
         }
         // ★ 通知界面把候选列表收起来（2026-11-04）。
         //   语音确认走的是「模型调工具」这条路，不经过点击处理，
@@ -423,7 +423,7 @@ class NavApp : Application() {
 
     /** 语音识别的结果统一从这里进 */
     fun submit(text: String) {
-        Dbg.log("submit: $text")
+        Dbg.log("submit chars=${text.length}")
         // 先让界面把"用户说了什么"显示出来，再进大脑
         chatObservers.forEach { it.onUser(text) }
         if (!chat.send(text)) {
@@ -457,7 +457,7 @@ class NavApp : Application() {
             ?: destinationMentionedBeforeQuestion(priorAssistant)
             ?: freshNearby()?.name
         if (destination.isNullOrBlank()) {
-            Dbg.log("导航兜底命中但无法从上下文确定目的地：$text")
+            Dbg.log("导航兜底命中但无法从上下文确定目的地 chars=${text.length}")
             return null
         }
 
@@ -465,7 +465,7 @@ class NavApp : Application() {
             .put("action", "navigate")
             .put("destination", destination)
             .toString()
-        val result = navigationTool?.execute(args) ?: return null
+        val result = navigationTool?.executeDetailed(args) ?: return null
         // ★ ★ 关键（2026-11-04）：工具返回「搜到 N 个候选」时**不能**在这里接管。
         //   那是**中间态**，不是导航结果 —— 接管了就等于跳过用户确认，
         //   模型根本没机会问「是哪个」，用户看到的就是直接导航去了（用户反馈）。
@@ -474,22 +474,23 @@ class NavApp : Application() {
         //     候选已经展示在地图的搜索框/列表里了（用户看得见），
         //     候选也存进了 pendingPois，navContext() 会把它们列进 system prompt，
         //     模型据此列 1、2、3 问用户。
-        if (isCandidateResult(result)) {
+        if (result.status == NavigationToolResult.Status.CANDIDATES) {
             Dbg.log("导航兜底让位给模型（搜到候选，等用户确认）")
             return null
         }
-        Dbg.log("导航兜底已执行 destination=$destination result=${result.take(100)}")
-        return "好，正在导航去$destination。"
+        Dbg.log(
+            "导航兜底已执行 destinationChars=${destination.length} " +
+                "status=${result.status} resultChars=${result.text.length}"
+        )
+        return when (result.status) {
+            NavigationToolResult.Status.STARTED,
+            NavigationToolResult.Status.REROUTED -> result.userText ?: "好，正在导航。"
+            // 失败也必须如实说，不能把「没搜到 / 没定位 / 算路失败」说成已开始导航。
+            NavigationToolResult.Status.FAILED,
+            NavigationToolResult.Status.NEEDS_CLARIFICATION -> result.userText
+            else -> null
+        }
     }
-
-    /**
-     * 工具返回的是不是「搜到候选」这种中间态。
-     *
-     * ★ 判定方式：看有没有「搜到 N 个」这个标记。
-     *   导航成功时返回的是「正在导航去X」/「正在改道去X」。
-     */
-    private fun isCandidateResult(result: String): Boolean =
-        result.contains("搜到") && result.contains("候选")
 
     private fun destinationMentionedBeforeQuestion(text: String): String? {
         val questionAt = listOf("要不要", "想不想", "去不去", "吗", "么", "？", "?")
@@ -530,12 +531,9 @@ class NavApp : Application() {
      *   工具必须同步拿到结果给模型，不能赌回调什么时候来。
      *   Web API 同步 HTTP，简单可靠。
      *
-     * ★ ★ 必须自己开子线程 —— 不能指望调用方在子线程：
-     *   除了模型的 Function Calling（那个在 tool- 线程里），
-     *   还有一条**本地兜底路径** interceptNavigation，
-     *   它在主线程直接调 navigationTool.execute() → 搜候选 → 发 HTTP
-     *   → NetworkOnMainThreadException（实测踩过）。
-     *   所以这里无条件切子线程，谁调都一样。
+     * ChatEngine 已把拦截、模型和工具统一放到后台单线程执行器里。
+     * 这里仍防御性检查调用线程：万一以后有人从主线程误调，直接返回失败，
+     * 绝不在 UI 线程上同步等待 HTTP。
      */
     private fun searchPlaceCandidates(keyword: String): List<AmapSdkGeocoder.Poi> {
         // ★ 一次请求就够：city=当前城市 + citylimit=false（city 只作偏置）。
@@ -545,36 +543,20 @@ class NavApp : Application() {
         //   之前自己分两段搜（先 citylimit=true 再 false）反而错 ——
         //   citylimit=true 搜不到跨城地名，本市又只有「金星灯饰」这种碰巧含「金星」的店。
         val pois = searchInBackground(keyword, nav?.currentCity, cityLimit = false)
-        Dbg.log("候选搜索「$keyword」→ ${pois.size} 条：${pois.joinToString { it.name }}")
+        Dbg.log("候选搜索 chars=${keyword.length} → ${pois.size} 条")
         return pois
     }
 
-    /**
-     * 在子线程里跑一次 Web API 搜索，等它返回。
-     *
-     * ★ 为什么自己开线程而不是依赖调用方：
-     *   navigate 工具会被两条路径调用 ——
-     *     ① 模型 Function Calling → tool- 线程（本来就在子线程）
-     *     ② 本地兜底 interceptNavigation → **主线程**
-     *   ② 那条路发 HTTP 会崩。这里统一处理，两条路都安全。
-     */
+    /** 在后台线程跑一次 Web API 搜索。 */
     private fun searchInBackground(
         keyword: String,
         city: String?,
         cityLimit: Boolean
     ): List<AmapSdkGeocoder.Poi> {
         if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
-            // 主线程来的 → 切子线程跑，再同步等它
-            val latch = java.util.concurrent.CountDownLatch(1)
-            val ref = java.util.concurrent.atomic.AtomicReference<List<AmapSdkGeocoder.Poi>>(emptyList())
-            Thread {
-                ref.set(doPlaceSearch(keyword, city, cityLimit))
-                latch.countDown()
-            }.apply { isDaemon = true; name = "place-search" }.start()
-            runCatching { latch.await(8, java.util.concurrent.TimeUnit.SECONDS) }
-            return ref.get()
+            Dbg.log("拒绝在主线程同步搜索地点")
+            return emptyList()
         }
-        // 已经在子线程 → 直接跑
         return doPlaceSearch(keyword, city, cityLimit)
     }
 
@@ -599,11 +581,10 @@ class NavApp : Application() {
      * 为什么要说"正在算路"：`navigateTo` 是异步的（要 geocode + 算路，几百毫秒），
      * 工具返回时还没算完。说成"已经好了"会让模型答"到了"，用户白等。
      */
-    private fun toolNavigate(dest: String): String {
+    private fun toolNavigate(dest: String): NavigationToolResult {
         val cleanDest = dest.trim()
         Prefs.rememberDestination(cleanDest)
         val controller = nav
-        val navigating = controller?.isNavigating == true
         lastNearby = null
         return if (controller != null) {
             // ★ 导航页已经活着（它是主界面，几乎总是这样），
@@ -617,18 +598,41 @@ class NavApp : Application() {
             //   算路是异步的，不等的话工具返回「正在算路」这种中间态，
             //   模型会照着念 —— 用户听到「正在规划张掖西站」，
             //   但地图其实已经开始导航了，两边对不上（用户反馈）。
-            val routeInfo = controller.navigateAndAwait(cleanDest)
-            destination = cleanDest
-            buildString {
-                if (navigating) append("已改道去").append(cleanDest)
-                else append("已开始导航去").append(cleanDest)
-                if (routeInfo.isNotBlank()) append("，").append(routeInfo)
+            val attempt = controller.navigateAndAwait(cleanDest)
+            if (!attempt.succeeded) {
+                val reason = attempt.message.ifBlank { "路线规划没有完成" }
+                return NavigationToolResult(
+                    text = "导航没有开始：$reason。请如实告诉用户，不要声称已经在导航。",
+                    status = NavigationToolResult.Status.FAILED,
+                    userText = "导航没有开始，$reason。"
+                )
             }
+            destination = cleanDest
+            val prefix =
+                if (attempt.status == NavigationAttempt.Status.REROUTED) "已改道去" else "已开始导航去"
+            NavigationToolResult(
+                text = buildString {
+                    append(prefix).append(cleanDest)
+                    if (attempt.routeInfo.isNotBlank()) append("，").append(attempt.routeInfo)
+                },
+                status = if (attempt.status == NavigationAttempt.Status.REROUTED) {
+                    NavigationToolResult.Status.REROUTED
+                } else {
+                    NavigationToolResult.Status.STARTED
+                },
+                userText = if (attempt.status == NavigationAttempt.Status.REROUTED) {
+                    "好，已改道。"
+                } else {
+                    "好，正在导航。"
+                }
+            )
         } else {
             // 导航页还没起来（极少见：语音服务在但 Activity 不在）
             openNavigation(cleanDest)
-            destination = cleanDest
-            "正在打开导航去${cleanDest}（正在算路）"
+            NavigationToolResult(
+                text = "正在打开导航页去${cleanDest}，路线尚未开始。",
+                status = NavigationToolResult.Status.MAP_OPENED
+            )
         }
     }
 
@@ -641,27 +645,50 @@ class NavApp : Application() {
      *   （「张掖西站」vs「张掖西站(南广场)」）。
      *   直接用候选坐标，百分之百是用户选的那个。
      */
-    private fun toolNavigateToPoi(poi: AmapSdkGeocoder.Poi): String {
+    private fun toolNavigateToPoi(poi: AmapSdkGeocoder.Poi): NavigationToolResult {
         Prefs.rememberDestination(poi.name)
         val controller = nav
-        val navigating = controller?.isNavigating == true
         lastNearby = null
-        destination = poi.name
         if (controller == null) {
             // 导航页没起来时只能退回按名字来
             openNavigation(poi.name)
-            return "正在打开导航去${poi.name}（正在算路）"
+            return NavigationToolResult(
+                text = "正在打开导航页去${poi.name}，路线尚未开始。",
+                status = NavigationToolResult.Status.MAP_OPENED
+            )
         }
         // ★ **等路线算完再返回**（2026-11-04）—— 同 toolNavigate，
         //   不等的话模型会念「正在规划…」，但地图早就开始导航了。
-        val routeInfo = controller.navigateToPointAndAwait(
+        val attempt = controller.navigateToPointAndAwait(
             poi.name, poi.latitude, poi.longitude, poi.address.ifBlank { poi.name }
         )
-        return buildString {
-            if (navigating) append("已改道去").append(poi.name)
-            else append("已开始导航去").append(poi.name)
-            if (routeInfo.isNotBlank()) append("，").append(routeInfo)
+        if (!attempt.succeeded) {
+            val reason = attempt.message.ifBlank { "路线规划没有完成" }
+            return NavigationToolResult(
+                text = "导航没有开始：$reason。请如实告诉用户，不要声称已经在导航。",
+                status = NavigationToolResult.Status.FAILED,
+                userText = "导航没有开始，$reason。"
+            )
         }
+        destination = poi.name
+        val prefix =
+            if (attempt.status == NavigationAttempt.Status.REROUTED) "已改道去" else "已开始导航去"
+        return NavigationToolResult(
+            text = buildString {
+                append(prefix).append(poi.name)
+                if (attempt.routeInfo.isNotBlank()) append("，").append(attempt.routeInfo)
+            },
+            status = if (attempt.status == NavigationAttempt.Status.REROUTED) {
+                NavigationToolResult.Status.REROUTED
+            } else {
+                NavigationToolResult.Status.STARTED
+            },
+            userText = if (attempt.status == NavigationAttempt.Status.REROUTED) {
+                "好，已改道。"
+            } else {
+                "好，正在导航。"
+            }
+        )
     }
 
     private fun toolStop(): String {
@@ -768,7 +795,7 @@ class NavApp : Application() {
         startActivity(intent)
     }
 
-/**
+    /**
      * 导航上下文，拼进 system prompt。
      *
      * ★ 待确认候选也要拼进去（2026-11-04）：

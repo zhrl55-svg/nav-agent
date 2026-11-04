@@ -187,7 +187,7 @@ object BluetoothAutoStart {
             Dbg.log("蓝牙自动启动：启动语音服务失败 ${it.message}")
         }
 
-        // 2) 发常驻通知，点它能进聊天页
+        // 2) 发常驻通知，点它能进导航页
         runCatching {
             notifyReady(app, deviceName)
         }.onFailure {
@@ -208,7 +208,7 @@ object BluetoothAutoStart {
 
         val open = PendingIntent.getActivity(
             context, 1,
-            Intent(context, ChatActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            Intent(context, NavActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 

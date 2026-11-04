@@ -151,12 +151,17 @@ object ModelStore {
         return try {
             target.deleteRecursively()
             target.mkdirs()
+            val root = target.canonicalFile
             ZipInputStream(zip.inputStream().buffered()).use { zis ->
                 while (true) {
                     val e = zis.nextEntry ?: break
-                    val name = e.name.substringAfter('/', e.name).trimEnd('/')
+                    val normalizedName = e.name.replace('\\', '/')
+                    val name = normalizedName.substringAfter('/', normalizedName).trimEnd('/')
                     if (name.isEmpty()) continue
-                    val out = File(target, name)
+                    val out = File(root, name).canonicalFile
+                    if (out != root && !out.path.startsWith(root.path + File.separator)) {
+                        throw SecurityException("ZIP entry escapes target directory")
+                    }
                     if (e.isDirectory) {
                         out.mkdirs()
                     } else {
@@ -168,6 +173,7 @@ object ModelStore {
             }
             true
         } catch (t: Throwable) {
+            target.deleteRecursively()
             Dbg.log("解压失败 ${t.javaClass.simpleName}: ${t.message}")
             false
         }

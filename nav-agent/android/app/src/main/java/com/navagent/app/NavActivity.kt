@@ -46,13 +46,16 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
     private lateinit var hudRemain: TextView
     private lateinit var nav: AmapNavController
 
+    private var mapStarted = false
+    private var voiceServiceStarted = false
+
     /** 识别文本的自动消失计时器 */
     private val recognizedHandler = android.os.Handler(android.os.Looper.getMainLooper())
 
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        Dbg.log("NavActivity onCreate dest=" + intent?.getStringExtra(EXTRA_DEST))
+        Dbg.log("NavActivity onCreate destinationChars=" + intent?.getStringExtra(EXTRA_DEST)?.length)
 
         // 高德合规接口：必须在任何 SDK 调用之前
         MapsInitializer.updatePrivacyShow(this, true, true)
@@ -73,7 +76,12 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
         // 比自己维护一套 HUD 划算得多。重叠问题用 **setCrossLocation** 解决 ——
         // 告诉高德「你的 HUD 只能画在这个矩形里」，把底部让给我们的聊天浮层和按钮。
         val options = naviView.viewOptions
-        options.isLayoutVisible = Prefs.amapBuiltinUi
+        // ★ 只有**正在导航**才显示高德内置 UI（2026-11-04）。
+        //   写成 `= Prefs.amapBuiltinUi` 的话，刚打开 app、没导航时
+        //   底部也会挂着「2.6公里 9分钟」这种上回的残留（实测）。
+        //   建页时拿不到 nav（它在下面才创建），所以先看 intent 里有没有导航请求。
+        val wantsNavi = !intent?.getStringExtra(EXTRA_DEST).isNullOrBlank()
+        options.isLayoutVisible = Prefs.amapBuiltinUi && wantsNavi
         // ★ 自动锁车：车标固定在地图中心，地图随车平移/旋转。
         //
         //   2026-11-03 之前这里写死 false，结果就是用户说的
@@ -138,83 +146,12 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
                 }
             }.onFailure { Dbg.log("车辆模型设置失败：${it.message}") }
         }
+        options.isAutoDisplayOverview = false
         naviView.viewOptions = options
-
-        // ★ 接高德视图的点击回调 —— 主要是「退出导航」那一下。
-        //   底部 footer 的「退出」是高德自己画的按钮，点它弹高德内置对话框
-        //   （退出导航 / 取消）。用户选「退出导航」时 SDK 回调 onNaviCancel()。
-        //   不接这个回调，那个对话框就是假的：点了没反应，路线还在、播报还在
-        //   （用户反馈：「点击退出导航无作用」）。
-        runCatching {
-            naviView.setAMapNaviViewListener(NaviViewListener {
-                // 退出导航：停掉高德，但**留在地图页**（还能重新规划）
-                nav.stop()
-                app.destination = null
-                // ★ 地图恢复到初始状态（2026-11-04）：
-                //   退出导航后如果镜头还停在全程视图、或者停在路线某一段，
-                //   用户看到的是一张「导航没了但地图不对」的界面。
-                //   恢复成「打开 app 时的样子」：跟随视角 + 当前位置。
-                resetMapToInitialState()
-                toast("已退出导航 · 说个目的地重新开始")
-                Dbg.log("用户确认退出导航")
-            })
-        }.onFailure { Dbg.log("设置高德视图监听失败：${it.message}") }
-
-        // ★ 关掉地图原生缩放按钮 —— 它在右下角，被我们的底部面板压住了一半，
-        //   点不到也看不清（用户反馈）。
-        //   只关按钮，**保留手势缩放**（setZoomGesturesEnabled 默认开着），
-        //   双指缩放照常能用，比按按钮方便。
-        runCatching {
-            naviView.map.uiSettings.setZoomControlsEnabled(false)
-        }.onFailure { Dbg.log("缩放按钮关闭失败：${it.message}") }
-
-        // ★ 地图样式 / 图层要在**地图加载完成后**设。
-        //
-        //   官方文档给的入口是 `setOnMapLoadedListener(AMap.OnMapLoadedListener)`
-        //   ——「设置自定义导航view中地图的加载完成事件监听」。
-        //   之前在 onCreate 里直接设 mapType / setMapStyle，
-        //   那时地图还没初始化完，设置被吃掉了（实测地图一直是浅色）。
-        //
-        //   所以这里挂个监听，等地图真的加载好再设样式。
-        naviView.setOnMapLoadedListener {
-            Dbg.log("地图加载完成 → 应用夜间样式与图层")
-            runCatching {
-                naviView.map.mapType = if (isNightMode()) {
-                    com.amap.api.maps.AMap.MAP_TYPE_NAVI_NIGHT
-                } else {
-                    com.amap.api.maps.AMap.MAP_TYPE_NAVI
-                }
-                Dbg.log("地图类型已设 night=" + isNightMode())
-            }.onFailure { Dbg.log("地图类型设置失败：${it.message}") }
-            // ★ 未导航时在中心画一个方向箭头。
-            //   不导航的时候 SDK 不画车标，地图上只有一个十字路口，看不出"我在哪、朝哪"。
-            //   高德的定位图层能补上这个空档，而且箭头会跟着方向转。
-            updateLocationArrow(!nav.isNavigating)
-        }
-
-        // ★ 路况线 / 红绿灯：都跟着设置走，不再写死。
-        //   原来这两项一直开着，用户在设置里关不掉，夜间跑高速时线太花。
-        runCatching { naviView.setTrafficLine(Prefs.navTrafficLine) }
-            .onFailure { Dbg.log("路况线开关失败：${it.message}") }
-
-        // ★ 红绿灯。
-        //   HiCar 那张图路口有红绿灯倒计时，SDK 里对应这两个方法：
-        //     setTrafficLightsVisible    —— 地图上显示红绿灯图标
-        //     setShowTrafficLightView   —— 额外的红绿灯提示视图
-        //   倒计时秒数由 SDK 自己按路口数据画，有数据才显示；
-        //   数据源用 AMapNavi.setTrafficSignalEnable 打开（见 AmapNavController.start）。
-        runCatching {
-            naviView.setTrafficLightsVisible(Prefs.navTrafficLight)
-            naviView.setShowTrafficLightView(Prefs.navTrafficLight)
-        }.onFailure { Dbg.log("红绿灯开关失败：${it.message}") }
-
-        // ★ 导航视角：车头朝上 / 正北朝上。
-        //   未锁车时还要把地图摆到定位点，否则刚打开会停在北京。
-        runCatching {
-            naviView.setNaviMode(
-                if (Prefs.navCarUp) AMapNaviView.CAR_UP_MODE else AMapNaviView.NORTH_UP_MODE
-            )
-        }.onFailure { Dbg.log("导航视角设置失败：${it.message}") }
+        // 与真实 View 状态保持一致。之前写死 true，空闲启动时 options 实际是 false，
+        // 开始导航后 setNaviHudVisible(true) 会误判“状态没变”而直接返回，
+        // 内置红绿灯倒计时视图也一直恢复不了。
+        naviHudVisible = options.isLayoutVisible
 
         hud = findViewById(R.id.hud)
         hudIcon = findViewById(R.id.hud_icon)
@@ -222,19 +159,13 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
         hudRoad = findViewById(R.id.hud_road)
         hudRemain = findViewById(R.id.hud_remain)
 
-        // TTS 是 Application 级单例，导航播报和聊天回复共用一条队列
-        nav = AmapNavController(
-            context = this,
-            voice = app.voice,
-            onState = { msg -> runOnUiThread { toast(msg) } },
-            onHud = { h -> runOnUiThread { renderHud(h) } },
-            onFirstFix = { lat, lon -> runOnUiThread { centerOn(lat, lon) } },
-            // 算路完成 → 先看全程，5 秒后回当前位置（2026-11-04）
-            onRouteReady = { meters, seconds, isReroute ->
-                runOnUiThread { showRouteOverviewBriefly(meters, seconds, isReroute) }
-            }
-        )
+        // TTS 是 Application 级单例，导航播报和聊天回复共用一条队列。
+        nav = createNavController()
         app.nav = nav
+
+        // 退出回调、地图加载回调、路况和红绿灯都集中在这里绑定。
+        // AMapNaviView.reInit() 会替换内部渲染核心，这些监听必须能重复绑定。
+        bindNaviViewRuntime(wantsNavi)
 
         // 调试：固定算路起点，排除室内 GPS 漂移的干扰
         //   am start ... --es dest 张掖西站 --es slat 38.945004 --es slon 100.418646
@@ -244,8 +175,15 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
         findViewById<View>(R.id.talk).setOnClickListener {
             if (app.voice.isSpeaking) {
                 app.voice.silence()
+            } else if (!hasMicrophonePermission()) {
+                ActivityCompat.requestPermissions(
+                    this,
+                    arrayOf(Manifest.permission.RECORD_AUDIO),
+                    REQ_MICROPHONE
+                )
+                toast("允许录音后才能使用语音，地图和文字输入仍可用")
             } else {
-                VoiceService.start(this)
+                startVoiceServiceOnce()
                 VoiceService.wake(this)
             }
         }
@@ -271,20 +209,13 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
 
         setupSearchBar()
 
-        if (hasLocationPermission()) {
-            nav.start()
-            startVoiceService()
-            // 调试入口：冷启动时也要能接 --es say。
-            // ★ 之前只在 onNewIntent 里接了，onCreate 漏了 —— 结果
-            //   `am start ... --es say "..."` 在 app 没运行时静默失效，白排查半天。
-            consumeSayExtra(intent)
-            if (intent?.getStringExtra(EXTRA_DEST).isNullOrBlank()) {
-                toast("地图已打开 · 说个目的地就开始导航")
-            } else {
-                consumeDest(intent)
-            }
-        } else {
-            ActivityCompat.requestPermissions(
+        val hasLocation = hasLocationPermission()
+        val hasMicrophone = hasMicrophonePermission()
+        if (hasLocation) startMapOnce()
+        if (hasMicrophone) startVoiceServiceOnce()
+
+        when {
+            !hasLocation && !hasMicrophone -> ActivityCompat.requestPermissions(
                 this,
                 arrayOf(
                     Manifest.permission.ACCESS_FINE_LOCATION,
@@ -293,6 +224,56 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
                 ),
                 REQ_PERMS
             )
+            !hasLocation -> ActivityCompat.requestPermissions(
+                this,
+                arrayOf(
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION
+                ),
+                REQ_LOCATION
+            )
+            !hasMicrophone -> ActivityCompat.requestPermissions(
+                this,
+                arrayOf(Manifest.permission.RECORD_AUDIO),
+                REQ_MICROPHONE
+            )
+        }
+    }
+
+    /**
+     * 每次导航会话使用独立控制器。
+     *
+     * 高德退出只 stop 导航时，AMapNavi 单例会继续持有路线和多路径选择状态；
+     * 因此退出后必须释放旧控制器，再创建新会话。
+     */
+    private fun createNavController(): AmapNavController =
+        AmapNavController(
+            context = this,
+            voice = app.voice,
+            onState = { msg -> runOnUiThread { toast(msg) } },
+            onHud = { h -> runOnUiThread { renderHud(h) } },
+            onFirstFix = { lat, lon -> runOnUiThread { centerOn(lat, lon) } },
+            // 算路完成 → 先看全程，5 秒后回当前位置（2026-11-04）
+            onRouteReady = { meters, seconds, isReroute ->
+                runOnUiThread {
+                    prepareNaviSurfaceForRoute()
+                    nav.setTrafficLightEnabled(Prefs.navTrafficLight)
+                    showRouteOverviewBriefly(meters, seconds, isReroute)
+                }
+            }
+        )
+
+    /** 定位权限到手后只初始化地图一次。 */
+    private fun startMapOnce() {
+        if (mapStarted || !hasLocationPermission()) return
+        mapStarted = true
+        nav.start()
+        // 调试入口：冷启动时也要能接 --es say。
+        consumeSayExtra(intent)
+        if (intent?.getStringExtra(EXTRA_DEST).isNullOrBlank()) {
+            toast("地图已打开 · 说个目的地就开始导航")
+        } else {
+            consumeDest(intent)
         }
     }
 
@@ -312,6 +293,8 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
      * 不钉住起点，任何「改配置有没有用」的对比都是假的（实测被坑过一次）。
      */
     private fun readDebugStart(intent: Intent?) {
+        nav.debugEmulator = intent?.getBooleanExtra(EXTRA_EMULATOR, false) == true
+        if (nav.debugEmulator) Dbg.log("NavActivity 使用模拟导航")
         val lat = intent?.getStringExtra(EXTRA_SLAT)?.toDoubleOrNull() ?: return
         val lon = intent.getStringExtra(EXTRA_SLON)?.toDoubleOrNull() ?: return
         nav.debugStart = lat to lon
@@ -321,6 +304,13 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
     private fun startVoiceService() {
         runCatching { VoiceService.start(this) }
             .onFailure { Dbg.log("语音服务启动失败：${it.message}") }
+    }
+
+    /** 录音权限到手后才启动语音前台服务，避免麦克风权限被拒时仍占着服务。 */
+    private fun startVoiceServiceOnce() {
+        if (voiceServiceStarted || !hasMicrophonePermission()) return
+        voiceServiceStarted = true
+        startVoiceService()
     }
 
     /**
@@ -644,13 +634,18 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
                 findViewById<View>(R.id.search_clear)?.visibility = View.GONE
                 searchHandler.removeCallbacksAndMessages(null)
                 // ★ 候选已确认，清掉暂存 —— 否则下一次导航会误命中这批旧候选
-                app.clearPendingPois()
+                app.clearPendingPois(poi)
                 Prefs.rememberDestination(poi.name)
                 app.destination = poi.name
-                nav.navigateTo(poi.name)
+                nav.navigateToPoint(
+                    poi.name,
+                    poi.latitude,
+                    poi.longitude,
+                    poi.address.ifBlank { poi.name }
+                )
                 // 不弹「正在规划…」—— 中间态 1 秒就过去了，
                 // 弹出来只是闪一下，还会跟高德的「准备出发」播报抢注意力
-                Dbg.log("搜索栏选择 → ${poi.name} (${poi.latitude},${poi.longitude})")
+                Dbg.log("搜索栏选择 chars=${poi.name.length}")
             }
             list.addView(
                 row,
@@ -670,6 +665,326 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
     }
 
     /**
+     * 绑定会随 AMapNaviView 内部渲染核心一起销毁的监听和运行时设置。
+     *
+     * `reInit()` 会调用旧核心的 onDestroy，再创建一个新核心。旧核心上的
+     * AMapNaviViewListener / OnMapLoadedListener 不会自动带到新核心，所以
+     * Activity 初次创建和退出导航后重建时必须走同一个绑定入口。
+     */
+    private fun bindNaviViewRuntime(routeRequested: Boolean) {
+        // 底部 footer 的「退出」由高德绘制，用户确认后回调到这里。
+        runCatching {
+            naviView.setAMapNaviViewListener(NaviViewListener {
+                nav.stop()
+                app.destination = null
+                resetMapToInitialState()
+                toast("已退出导航 · 说个目的地重新开始")
+                Dbg.log("用户确认退出导航")
+            })
+        }.onFailure { Dbg.log("设置高德视图监听失败：${it.message}") }
+
+        // 只关按钮，保留双指缩放。
+        runCatching {
+            naviView.map.uiSettings.setZoomControlsEnabled(false)
+        }.onFailure { Dbg.log("缩放按钮关闭失败：${it.message}") }
+
+        // 地图样式必须在地图加载完成后应用，否则初始化阶段会被 SDK 覆盖。
+        naviView.setOnMapLoadedListener {
+            Dbg.log("地图加载完成 → 应用夜间样式与图层")
+            runCatching {
+                naviView.map.mapType = if (isNightMode()) {
+                    com.amap.api.maps.AMap.MAP_TYPE_NAVI_NIGHT
+                } else {
+                    com.amap.api.maps.AMap.MAP_TYPE_NAVI
+                }
+                Dbg.log("地图类型已设 night=" + isNightMode())
+            }.onFailure { Dbg.log("地图类型设置失败：${it.message}") }
+            updateLocationArrow(!nav.isNavigating)
+            applyTrafficLightView(nav.isNavigating)
+            restoreIdleMapView()
+        }
+
+        runCatching { naviView.setTrafficLine(Prefs.navTrafficLine && routeRequested) }
+            .onFailure { Dbg.log("路况线开关失败：${it.message}") }
+        applyTrafficLightView(routeRequested)
+        runCatching {
+            naviView.setNaviMode(
+                if (Prefs.navCarUp) AMapNaviView.CAR_UP_MODE else AMapNaviView.NORTH_UP_MODE
+            )
+        }.onFailure { Dbg.log("导航视角设置失败：${it.message}") }
+    }
+
+    /**
+     * 退出导航后重建同一个 AMapNaviView 的渲染核心。
+     *
+     * 真机已经确认：stopNavi() 后 map.clear(true)、隐藏路线图层和切回跟随视角
+     * 都会执行成功，但 Eyrie 渲染缓存仍然把旧路线和多路线选择页画回来。
+     * `reInit()` 是 SDK 自带的同实例重建入口，会移除旧核心和所有内部子 View，
+     * 并创建新的空闲导航地图。这里不添加 MapView，也不重建 Activity。
+     */
+    private fun rebuildNaviViewAfterExit() {
+        val token = ++naviViewRebuildToken
+        runCatching { naviView.onPause() }
+            .onFailure { Dbg.log("退出前暂停导航视图失败：${it.message}") }
+
+        window.decorView.postDelayed({
+            if (token != naviViewRebuildToken || isFinishing || isDestroyed) return@postDelayed
+            runCatching {
+                Dbg.log("退出导航 → 重置 AMapNavi 会话")
+                // 先销毁 View 核心，释放它占用的定位管理器；否则紧接着的
+                // AMapNavi.releaseLocManager() 会阻塞主线程并触发 ANR。
+                naviView.onDestroy()
+                resetNavigationEngineAfterExit()
+                Dbg.log("退出导航 → reInit 同一个 AMapNaviView")
+                naviView.reInit(null)
+                applyNaviViewOptionsAfterReInit()
+                bindNaviViewRuntime(routeRequested = false)
+                naviView.onResume()
+                setNaviHudVisible(false, force = true)
+                applyTrafficLightView(false)
+                runCatching { naviView.setCarOverlayVisible(false) }
+                updateLocationArrow(true)
+                restoreIdleMapView()
+                idleRecenteringLocation?.let { centerOn(it.first, it.second) }
+                Dbg.log("AMapNaviView 渲染核心已重建为空闲地图")
+            }.onFailure {
+                Dbg.log("AMapNaviView 重建失败：${it.javaClass.simpleName}: ${it.message}")
+                // 至少把可见的导航残留压回初始状态；下一次进入页面仍可恢复。
+                restoreIdleMapView()
+            }
+        }, NAVI_VIEW_REBUILD_DELAY_MS)
+    }
+
+    /**
+     * 真正结束高德导航会话。
+     *
+     * `stopNavi()` 不会销毁 AMapNavi 单例，单例仍保留当前路径和多路径切换数据。
+     * 这里先释放旧控制器（移除监听、停定位、AMapNavi.destroy），再创建一个
+     * 不携带任何路线的新控制器。App 和导航页仍留在原处。
+     */
+    private fun resetNavigationEngineAfterExit() {
+        val previous = nav
+        if (app.nav === previous) app.nav = null
+        previous.release()
+
+        nav = createNavController()
+        app.nav = nav
+        readDebugStart(intent)
+        nav.start()
+        Dbg.log("AMapNavi 会话已销毁并重新创建")
+    }
+
+    /**
+     * reInit 后新核心拿到的是 SDK 默认 options，必须重新推一遍。
+     *
+     * 多路线选择页、导航 HUD 和路线图层都由这个核心维护。退出态强制关闭
+     * 内置布局，避免它把规划阶段的候选路线面板按缓存重新画出来。
+     */
+    private fun applyNaviViewOptionsAfterReInit() {
+        val options = naviView.viewOptions
+        options.isLayoutVisible = false
+        options.isAutoLockCar = Prefs.navAutoLock
+        options.isAutoChangeZoom = Prefs.navAutoZoom
+        runCatching { options.setAutoZoomRange(15f, 18f) }
+        if (Prefs.amapBuiltinUi) {
+            val area = android.graphics.Rect(
+                0,
+                statusBarHeight(),
+                resources.displayMetrics.widthPixels,
+                resources.displayMetrics.heightPixels - bottomPanelHeight()
+            )
+            options.setCrossLocation(area, area)
+        }
+        options.setMapStyle(com.amap.api.navi.enums.MapStyle.AUTO, "")
+        options.isLaneInfoShow = true
+        options.isTrafficBarEnabled = true
+        options.isTrafficLayerEnabled = true
+        options.isTrafficLine = false
+        options.isRouteListButtonShow = false
+        options.isSettingMenuEnabled = false
+        options.isAutoDisplayOverview = false
+        runCatching {
+            val d = androidx.core.content.ContextCompat.getDrawable(this, R.drawable.car_model)
+            if (d != null) {
+                val size = dp(48)
+                val bmp = android.graphics.Bitmap.createBitmap(
+                    size,
+                    size,
+                    android.graphics.Bitmap.Config.ARGB_8888
+                )
+                d.setBounds(0, 0, size, size)
+                d.draw(android.graphics.Canvas(bmp))
+                options.setCarBitmap(bmp)
+            }
+        }
+        naviView.viewOptions = options
+        naviHudVisible = false
+    }
+
+    /**
+     * 清掉地图上的导航路线 + 强制 SDK 重绘。
+     *
+     * ★ 为什么要清三次（2026-11-04 实测）：
+     *   单次 `map.clear()` 之后，SDK 的渲染循环还会把路线画回来 ——
+     *   日志说「已清除」但画面上绿线和车道级箭头一个没少。
+     *   `onPause()` + `onResume()` 也没用。
+     *
+     * ★ 真正的解法：**把导航态的 HUD 容器整个藏掉**（见 setNaviHudVisible），
+     *   路线本身靠 `map.clear()` 多次清。两件事要一起做 ——
+     *   HUD 藏了但路线还在，画面还是花的。
+     */
+    private fun clearRouteOverlays() {
+        val times = longArrayOf(0L, ROUTE_CLEAR_DELAY_MS, ROUTE_CLEAR_DELAY_MS * 3, 1_800L)
+        times.forEachIndexed { i, delay ->
+            routeClearHandler.postDelayed({
+                // 用户在残留回调清理完成前已经发起新导航时，不能把新路线藏掉。
+                if (nav.isNavigating) return@postDelayed
+                runCatching {
+                    // ★ clear(true) 而不是 clear()（2026-11-04 关键）：
+                    //   无参 clear() 只清**可见**的 overlay。
+                    //   导航路线的分段 polyline 里有一堆是被 SDK 设成
+                    //   visible=false 的（用彩色分段线替代了），
+                    //   所以 clear() 之后那条绿线还在 —— 实测踩了很久。
+                    //   clear(true) 会把隐藏的也一起清掉。
+                    naviView.map.clear(true)
+                    Dbg.log("已清除地图上的路线 overlay（第 ${i + 1} 次，delay=${delay}ms）")
+                }.onFailure { Dbg.log("清除路线失败：${it.message}") }
+                setSdkRouteVisible(false)
+                setNaviHudVisible(false, force = true)
+                applyTrafficLightView(false)
+                runCatching { naviView.setCarOverlayVisible(false) }
+                runCatching { naviView.setShowMode(3) }
+                updateLocationArrow(true)
+                if (delay > 0 && !nav.isNavigating) {
+                    nav.currentLocation()?.let { centerOn(it.first, it.second) }
+                }
+            }, delay)
+        }
+    }
+    /**
+     * 显示/隐藏高德的**导航态 HUD**。
+     *
+     * ★ 为什么必须手动管（2026-11-04）：
+     *   高德 App 退出导航是**换页面**（回地图页），
+     *   我们这个「留在地图页原地重置」的场景 SDK 根本不支持 ——
+     *   `stopNavi()` 会播「导航结束」，但 UI 层的这些东西一个都不撤：
+     *     · 底部「2.6公里 9分钟 / 16:23到达」
+     *     · 「非机动车道」路名条
+     *     · 左下的平行路切换按钮
+     *     · 限速牌（在中间信息区里）
+     *   实测截图确认（2026-11-04），所以只能自己藏。
+     *
+     * ★ 藏了不影响下次导航：
+     *   开始导航时 renderHud 会调 [setNaviHudVisible] 恢复；
+     *   而且 SDK 每次 updateNaviInfo 也会自己设某些子视图的可见性。
+     */
+    private fun setNaviHudVisible(visible: Boolean, force: Boolean = false) {
+        // ★ 状态没变就直接返回 —— renderHud 是每帧调用的，
+        //   每次都遍历一遍 view 树太浪费。
+        //   退出导航后 SDK 会再次改子视图可见性，所以空闲恢复可以 force。
+        if (!force && naviHudVisible == visible) return
+        naviHudVisible = visible
+
+        // ★★ 真正的总开关（2026-11-04）：
+        //   `AMapNaviViewOptions.isLayoutVisible` 控制高德内置 UI 整体显示。
+        //   它一直是 true（我们导航时要转向条和限速牌），
+        //   所以即使 `stopNavi()` 之后、甚至 `AMapNavi.destroy()` + 重建页面之后，
+        //   naviView 里那些布局（底部里程、限速牌、「非机动车道」）
+        //   照样 inflate 出来显示着 —— 数据是上回的缓存，看着像还在导航。
+        //   之前逐个藏容器没用，因为 SDK 每次刷新会把它们设回 VISIBLE。
+        runCatching {
+            val options = naviView.viewOptions
+            options.isLayoutVisible = if (visible) Prefs.amapBuiltinUi else false
+            naviView.viewOptions = options
+        }.onFailure { Dbg.log("切换内置 UI 失败：${it.message}") }
+
+        val want = if (visible) View.VISIBLE else View.GONE
+        NAVI_HUD_IDS.forEach { id ->
+            runCatching {
+                val v = findViewByIdName(naviView, id) ?: return@runCatching
+                if (v.visibility != want) {
+                    v.visibility = want
+                }
+            }
+        }
+        if (!visible) {
+            // 路况线也关掉 —— 退出导航后地图上那一堆绿色车道线是它画的
+            runCatching { naviView.setTrafficLine(false) }
+            applyTrafficLightView(false)
+            Dbg.log("导航 HUD 已全部隐藏（isLayoutVisible=false）")
+        } else {
+            runCatching { naviView.setTrafficLine(Prefs.navTrafficLine) }
+            applyTrafficLightView(true)
+            Dbg.log("导航 HUD 已恢复")
+        }
+    }
+
+    /**
+     * 红绿灯图标与倒计时视图只在导航中显示。
+     *
+     * 官方倒计时视图的数据源由 AmapNavController.setTrafficLightEnabled 打开；
+     * 这里控制 View 层。地图加载完成、开始导航、设置页返回时都会重新推一次。
+     */
+    private fun applyTrafficLightView(navigating: Boolean) {
+        runCatching {
+            val enabled = Prefs.navTrafficLight && navigating
+            naviView.setTrafficLightsVisible(enabled)
+            naviView.setShowTrafficLightView(enabled)
+            Dbg.log("红绿灯视图 → $enabled")
+        }.onFailure { Dbg.log("红绿灯视图开关失败：${it.message}") }
+    }
+
+    /**
+     * 高德 V11.3 的 NaviView 没有公开的“移除当前路线”API。
+     *
+     * stopNavi() 只停止导航，内部 Eyrie 渲染器仍会保留上一条路线。
+     * 这里调用同一 SDK 版本内用于切换路线显示的内部方法；反射失败时
+     * 仍会继续执行 HUD 隐藏和 map.clear()，不会阻断退出流程。
+     */
+    private fun setSdkRouteVisible(visible: Boolean): Boolean {
+        return runCatching {
+            val coreField = AMapNaviView::class.java.getDeclaredField("core").apply {
+                isAccessible = true
+            }
+            val core = coreField.get(naviView)
+            val controllerField = core.javaClass.getDeclaredField("j").apply {
+                isAccessible = true
+            }
+            val controller = controllerField.get(core)
+            val method = controller.javaClass.getMethod("m", Boolean::class.javaPrimitiveType)
+            method.invoke(controller, visible)
+            Dbg.log("SDK 路线图层 → $visible")
+            true
+        }.getOrElse {
+            Dbg.log("SDK 路线图层切换失败：${it.message}")
+            false
+        }
+    }
+
+    /** 开始新导航时恢复被空闲态关闭的路线图层与车标。 */
+    private fun prepareNaviSurfaceForRoute() {
+        // 如果上一次退出的延迟重建还没执行，新导航开始时立即作废它。
+        naviViewRebuildToken++
+        runCatching { naviView.setCarOverlayVisible(true) }
+        setSdkRouteVisible(true)
+    }
+
+    /** 导航态 HUD 当前是否可见（避免 renderHud 每帧重复遍历） */
+    @Volatile
+    private var naviHudVisible = false
+
+    /**
+     * 退出后 reInit 的版本号。
+     *
+     * 用户在延迟重建前又发起导航时，递增这个值即可作废旧任务，
+     * 防止新路线刚画出来又被空闲地图重置。
+     */
+    private var naviViewRebuildToken = 0
+
+    /** 旧导航会话销毁前最后的位置，重建空闲地图后用它把镜头放回用户附近。 */
+    private var idleRecenteringLocation: Pair<Double, Double>? = null
+
+    /**
      * 地图恢复到初始状态（退出导航时调用）。
      *
      * ★ 要恢复的三样：
@@ -686,39 +1001,37 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
     private fun resetMapToInitialState() {
         // ① 退出全程视图，恢复跟随视角
         runCatching {
-            if (naviView.isRouteOverviewNow) naviView.recoverLockMode()
+            naviView.recoverLockMode()
+            naviView.setShowMode(3)
         }.onFailure { Dbg.log("退出全程视图失败：${it.message}") }
 
         // ② 镜头回到当前位置
         val loc = nav.currentLocation()
+        idleRecenteringLocation = loc
         if (loc != null) {
             centerOn(loc.first, loc.second)
         } else {
             Dbg.log("退出导航时还没定位，镜头先不动")
         }
 
-        // ③ 路线残留 —— SDK 的 stopNavi() **不清路线**（实测退出后地图上还挂着
-        //   那条绿色路径，底部还显示「2.6公里 9分钟」，像是还在导航）。
-        //
-        //   ★ 反射找 SDK 内部的 RouteOverLay 失败了（深度 6 都没找到，
-        //     它不在 naviView 的实例字段树里，大概在某个静态单例里）。
-        //   ★ 改用「延迟清地图」：stopNavi() 之后 SDK 还会再画一帧，
-        //     立刻 clear 会被它覆盖 —— 隔 300ms 再清就干净了。
-        //
-        //   ★ 用**独立的 handler**：overviewHandler 在下面会被
-        //     removeCallbacksAndMessages(null) 清掉（停掉 5 秒自动回切），
-        //     同一个 handler 会把这个延迟任务一起干掉。
-        routeClearHandler.postDelayed({
-            runCatching {
-                naviView.map.clear()
-                Dbg.log("已清除地图上的路线 overlay")
-            }.onFailure { Dbg.log("清除路线失败：${it.message}") }
-        }, ROUTE_CLEAR_DELAY_MS)
+        // ③ 路线、车标和多路线选择页残留。
+        //   stopNavi + map.clear(true) + 反射隐藏路线图层在真机上都执行成功，
+        //   但 Eyrie 渲染缓存仍会把旧画面恢复。改用 SDK 自带的同实例 reInit，
+        //   替换整个内部渲染核心，旧路线和规划候选面板会一起消失。
+        routeClearHandler.removeCallbacksAndMessages(null)
+        rebuildNaviViewAfterExit()
 
         // ④ 高德转向条在退出导航后**不会自己消失** ——
         //   实测退出后它还挂着「74米 进入 无名道路」，像是还在导航。
         //   统一交给 updateBannerVisibility 管（它也是导航中才显示）。
         updateBannerVisibility(false)
+
+        // ④b 导航态 HUD 全藏（底部里程/时间、路名条、限速牌、平行路按钮）。
+        //     SDK 的 stopNavi() 只播「导航结束」，UI 一个都不撤（实测）。
+        setNaviHudVisible(false, force = true)
+        applyTrafficLightView(false)
+        setSdkRouteVisible(false)
+        runCatching { naviView.setCarOverlayVisible(false) }
 
         // ⑤ 全程按钮隐藏（没导航就没有全程）
         findViewById<View>(R.id.route_overview)?.visibility = View.GONE
@@ -729,7 +1042,7 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
         // ⑦ 计时器停掉（别让 5 秒后的自动回切去动一个已经停了的导航）
         overviewHandler.removeCallbacksAndMessages(null)
 
-        Dbg.log("地图已恢复到初始状态")
+        Dbg.log("地图正在恢复为空闲状态（同页重建渲染核心）")
     }
 
     /**
@@ -1146,6 +1459,14 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
         // ★ 而且**没导航时必须藏着** —— SDK 会画一个空的黑色卡片
         //   （转向箭头位置空着，但整块背景是黑的），很难看（用户反馈）。
         updateBannerVisibility(h.navigating)
+        // ★ 导航中要把 HUD 放回来 —— 退出导航时我们全藏了（见 setNaviHudVisible）。
+        //   SDK 管的是它内部子视图，容器我们藏了它不会自己恢复。
+        if (h.navigating) {
+            setNaviHudVisible(true)
+            applyTrafficLightView(true)
+        } else {
+            applyTrafficLightView(false)
+        }
         // 用高德内置界面时，顶部转向信息由高德画，我们的 HUD 卡片要让位，
         // 否则两套转向提示叠在一起。
         if (!h.navigating || Prefs.amapBuiltinUi) {
@@ -1321,20 +1642,26 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
         ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) ==
             PackageManager.PERMISSION_GRANTED
 
+    private fun hasMicrophonePermission(): Boolean =
+        ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+
     override fun onRequestPermissionsResult(
         requestCode: Int,
         permissions: Array<out String>,
         grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode != REQ_PERMS) return
+        if (requestCode !in setOf(REQ_PERMS, REQ_LOCATION, REQ_MICROPHONE)) return
         if (hasLocationPermission()) {
-            nav.start()
-            // 语音服务也在这里补启动 —— 首次安装时权限是弹窗后才有的
-            startVoiceService()
-            consumeDest(intent)
+            startMapOnce()
         } else {
             toast("没有定位权限，导航不可用")
+        }
+        if (hasMicrophonePermission()) {
+            startVoiceServiceOnce()
+        } else {
+            toast("没有录音权限，只能使用地图和文字输入")
         }
     }
 
@@ -1530,6 +1857,7 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
         // 信号指示每秒刷一次（onPause 里必须摘掉，否则页面退到后台还在跑）
         // 从「地图与导航设置」返回时，视角/锁车/路况这些要立刻生效
         applyMapSettings()
+        restoreIdleMapView()
         // ★ 布局完成后量一次转向条高度，把搜索栏摆到它下面。
         //   onCreate 里量不到 —— 那时 naviView 还没完成布局，bannerBottom() 返回 -1。
         window.decorView.postDelayed({ positionSearchBelowBanner() }, 500)
@@ -1561,9 +1889,10 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
             naviView.viewOptions = options
         }.onFailure { Dbg.log("应用地图设置失败：${it.message}") }
         runCatching {
-            naviView.setTrafficLine(Prefs.navTrafficLine)
-            naviView.setTrafficLightsVisible(Prefs.navTrafficLight)
-            naviView.setShowTrafficLightView(Prefs.navTrafficLight)
+            // 路况线同样要跟导航状态绑（不导航时开着它像还在导航）
+            naviView.setTrafficLine(Prefs.navTrafficLine && nav.isNavigating)
+            applyTrafficLightView(nav.isNavigating)
+            nav.setTrafficLightEnabled(Prefs.navTrafficLight)
             naviView.setNaviMode(
                 if (Prefs.navCarUp) AMapNaviView.CAR_UP_MODE else AMapNaviView.NORTH_UP_MODE
             )
@@ -1576,6 +1905,25 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
                 nav.currentLocation()?.let { centerOn(it.first, it.second) }
             }
         }.onFailure { Dbg.log("应用导航视图设置失败：${it.message}") }
+    }
+
+    /**
+     * 退出导航重建后，明确把地图摆回空闲状态。
+     *
+     * 仅清掉 savedInstanceState 还不够：部分 SDK/ROM 会在 AMapNaviView.onResume 时
+     * 恢复上一次锁车/全程视角。这里再主动退锁车、关导航图层、回到当前位置。
+     */
+    private fun restoreIdleMapView() {
+        if (nav.isNavigating) return
+        runCatching { naviView.recoverLockMode() }
+            .onFailure { Dbg.log("空闲地图恢复跟随视角失败：${it.message}") }
+        runCatching { naviView.setTrafficLine(false) }
+        applyTrafficLightView(false)
+        updateLocationArrow(true)
+        val loc = nav.currentLocation() ?: return
+        window.decorView.postDelayed({
+            if (!nav.isNavigating && !isFinishing) centerOn(loc.first, loc.second)
+        }, 300)
     }
 
     override fun onPause() {
@@ -1608,8 +1956,10 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
             app.nav = null
             app.destination = null
         }
-        nav.release()
+        // 必须先销毁 View 核心，再释放 AMapNavi；顺序反了会让
+        // releaseLocManager() 等待仍被 View 占用的定位管理器。
         naviView.onDestroy()
+        nav.release()
     }
 
     companion object {
@@ -1617,7 +1967,10 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
         const val EXTRA_SAY = "say"
         const val EXTRA_SLAT = "slat"
         const val EXTRA_SLON = "slon"
+        const val EXTRA_EMULATOR = "emulator"
         private const val REQ_PERMS = 1002
+        private const val REQ_LOCATION = 1003
+        private const val REQ_MICROPHONE = 1004
 
         /**
          * 高德 SDK 的资源包名。
@@ -1641,6 +1994,24 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
          * 搜索栏要放在这一层的**下面** —— 只挪到转向条下方会压住限速牌。
          */
         private const val MIDDLE_LAYOUT_ID = "navi_sdk_lbs_navi_middle_layout"
+
+        /**
+         * 高德的**导航态 HUD** 容器名。
+         *
+         * ★ 退出导航时这些全要藏（SDK 自己不会撤，见 setNaviHudVisible 的说明）：
+         *   - navi_sdk_lbs_navi_middle_layout        中间信息区（限速牌、转向信息）
+         *   - navi_sdk_lbs_road_name_container_container  底部路名条（「非机动车道」）
+         *   - navigation_info_layout                 底部剩余里程/时间
+         *   - navigation_road_switches_container     左下平行路切换按钮
+         *
+         * 名字来自真机 uiautomator dump（2026-11-04），改 SDK 版本后要重新确认。
+         */
+        private val NAVI_HUD_IDS = listOf(
+            "navi_sdk_lbs_navi_middle_layout",
+            "navi_sdk_lbs_road_name_container_container",
+            "navigation_info_layout",
+            "navigation_road_switches_container"
+        )
         private const val FIX_TIMEOUT_MS = 60_000L
 
         /**
@@ -1685,6 +2056,12 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
         private const val OVERVIEW_ENTER_DELAY_MS = 1_500L
 
         /**
+         * 退出导航后等待高德退出动画和最后一次 NaviInfo 回调结束，再重建渲染核心。
+         * 在退出回调内部立刻销毁 View 会打断 SDK 自己的回调链。
+         */
+        private const val NAVI_VIEW_REBUILD_DELAY_MS = 250L
+
+        /**
          * 退出导航后延迟多久清地图上的路线（毫秒）。
          *
          * ★ 为什么延迟：
@@ -1693,5 +2070,6 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
          *   隔 300ms 再清才干净。
          */
         private const val ROUTE_CLEAR_DELAY_MS = 300L
+
     }
 }

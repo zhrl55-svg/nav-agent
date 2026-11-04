@@ -29,8 +29,8 @@ NavActivity（主界面 LAUNCHER）
 
 | 设备 | 系统 | 结果 |
 |---|---|---|
-| Huawei P40 Pro（ELS-AN00 / `MDX0220A21035172`） | HarmonyOS 4.0，API 31 | ✅ 构建安装和定位/导航链路已有历史验证；当前「小度」唤醒命中未做真人声学复测 |
-| vivo X20 Plus A（PD1710 / `9c80900a`） | Android 8.1，API 27 | 旧版本全链路/TTS 曾验证；本轮导航历史/返回栈及新唤醒逻辑未验证 |
+| Huawei P40 Pro（ELS-AN00） | HarmonyOS 4.0，API 31 | ✅ 构建安装和定位/导航链路已有历史验证；当前「小度」唤醒命中未做真人声学复测 |
+| vivo X20 Plus A（PD1710） | Android 8.1，API 27 | 旧版本全链路/TTS 曾验证；本轮导航历史/返回栈及新唤醒逻辑未验证 |
 
 实测数据（张掖市区 → 张掖西站）：定位 `38.945019,100.418638` → 地理编码 `38.923036,100.428341`
 → 算路成功 `2671m / 420s` → 播报「准备出发，全程二点六公里，大约需要七分钟，七十米后左转」。
@@ -43,8 +43,7 @@ NavActivity（主界面 LAUNCHER）
 | Gradle | `D:\Android\gradle\gradle-8.14.6`（腾讯镜像下载） |
 | JDK | Android Studio 自带 JBR 21（`D:\Program Files\Android\Android Studio\jbr`） |
 | AGP / Kotlin | 8.13.2 / 2.4.21 |
-| 调试签名 | `C:\Users\zhrl5\.android\debug.keystore`（alias `androiddebugkey`，密码 `android`） |
-| 调试 SHA1 | `26:F6:15:CD:A0:6C:08:F4:7A:4B:BA:70:A3:20:DD:07:47:D7:91:7A` |
+| 调试签名 | Android Studio 自动生成的 debug.keystore（请勿提交） |
 
 ## 构建 / 安装 / 调试
 
@@ -69,7 +68,7 @@ adb shell "pm install-commit $SID"
 绕过语音直接验证整条链路（调试入口）：
 
 ```bash
-adb shell am start -n com.navagent/com.navagent.app.MainActivity --es dest 张掖西站
+adb shell am start -n com.navagent/com.navagent.app.NavActivity --es dest 张掖西站
 adb shell cat /sdcard/Android/data/com.navagent/files/nav.log
 ```
 

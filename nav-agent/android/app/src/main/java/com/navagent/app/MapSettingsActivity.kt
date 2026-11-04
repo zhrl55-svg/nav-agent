@@ -118,7 +118,7 @@ class MapSettingsActivity : AppCompatActivity() {
         ) {
             choose(
                 "缩放级别",
-                listOf("15 级（近，看路口）" to 15, "16 级（推荐）" to 16, "17 级（远，看全局）" to 17),
+                listOf("15 级（远，看全局）" to 15, "16 级（推荐）" to 16, "17 级（近，看路口）" to 17),
                 Prefs.navZoom
             ) { Prefs.navZoom = it; applied() }
         }

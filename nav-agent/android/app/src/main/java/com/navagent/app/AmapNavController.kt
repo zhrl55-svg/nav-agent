@@ -16,6 +16,26 @@ import com.amap.api.navi.model.NaviLatLng
 import com.navagent.core.NavController
 import com.navagent.core.VoiceGuide
 import java.util.Locale
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
+
+/**
+ * 一次算路请求的真实结果。
+ *
+ * 只有 STARTED / REROUTED 能对用户说「已开始导航」。FAILED / TIMEOUT 必须如实返回，
+ * 不能再用「正在导航」掩盖引擎未就绪、地点不存在或算路失败。
+ */
+data class NavigationAttempt(
+    val status: Status,
+    val routeInfo: String = "",
+    val message: String = ""
+) {
+    enum class Status { STARTED, REROUTED, FAILED, TIMEOUT }
+
+    val succeeded: Boolean
+        get() = status == Status.STARTED || status == Status.REROUTED
+}
 
 /**
  * 真实导航实现：高德 AMapNavi + AMapLocationClient。
@@ -100,8 +120,18 @@ class AmapNavController(
      *   工具侧 await 这个 latch，拿到的就是**真实**结果：
      *   「已导航到张掖西站，全程 2.6 公里，约 9 分钟」。
      */
+    private class RouteWait {
+        val latch = CountDownLatch(1)
+        val result = AtomicReference<NavigationAttempt?>()
+    }
+
     @Volatile
-    private var routeReadyLatch: java.util.concurrent.CountDownLatch? = null
+    private var routeWait: RouteWait? = null
+
+    /** 超时取消后，忽略 SDK 稍晚才到的算路成功回调。 */
+    @Volatile
+    private var cancelPendingRoute = false
+
     @Volatile private var stepRemainMeters = 0
     @Volatile private var pathRemainSeconds = 0
     @Volatile private var pathRemainMeters = 0
@@ -165,17 +195,16 @@ class AmapNavController(
                 // 关掉内置语音，否则会和我们自己的 TTS 双重播报
                 it.setUseInnerVoice(false)
 
-                // ★ 红绿灯信号数据。
-                //   只开 View 上的 setTrafficLightsVisible 只能画图标，
-                //   倒计时/剩余灯数要靠这里打开信号源（V11.x 才有的开关）。
-                runCatching { it.setTrafficSignalEnable(Prefs.navTrafficLight) }
-                    .onFailure { e -> Dbg.log("红绿灯信号开关失败：${e.message}") }
+                // ★ 红绿灯信号数据。V11.3 里 setTrafficSignalEnable 只打开数据源；
+                //   官方倒计时视图还需要 setIsOpenTrafficLight("TLTRUE")。
+                setTrafficLightEnabled(Prefs.navTrafficLight)
 
-                // ★ 不要开 setMultipleRouteNaviMode(true)。
-                //   官方语义是「多路径导航模式」：导航中 SDK 会实时比较所有候选路线的路况，
-                //   **自动切换到更快的那条**。实测在市区短途会来回跳（候选路线长度还都一样），
-                //   表现就是导航频繁改道、播报反复说「已为你换路」。
-                //   2026-11-01 加过又撤了，别再开。
+                // 多路径选择在算路成功后开启。此时候选路线已经就绪，SDK 才能把
+                // 可点击的路线分支和切换入口挂到当前 AMapNaviView 上。
+                runCatching { it.setMultipleRouteNaviMode(true) }
+                    .onFailure { error ->
+                        Dbg.log("多路径导航模式开启失败：${error.message}")
+                    }
 
                 // ★ 车辆信息：开启车行限制。详见 [applyCarInfo]。
                 applyCarInfo(it)
@@ -227,14 +256,16 @@ class AmapNavController(
     }
 
     override fun navigateTo(destination: String) {
-        Dbg.log("navigateTo($destination) hasFix=$hasFix city=$currentCity")
+        Dbg.log("navigateTo chars=${destination.length} hasFix=$hasFix citySet=${!currentCity.isNullOrBlank()}")
         val n = navi
         if (n == null) {
+            failCurrentAttempt("导航引擎未就绪")
             onState("导航引擎未就绪")
             voice.speak("导航引擎还没准备好", VoiceGuide.Priority.USER)
             return
         }
         if (!hasFix) {
+            failCurrentAttempt("还没有定位")
             onState("正在定位，请稍候再试")
             voice.speak("还没定位到当前位置，稍等一下再说", VoiceGuide.Priority.USER)
             return
@@ -243,12 +274,13 @@ class AmapNavController(
         pendingPlace = null
         // 新的一次导航 → 解除「停止中」标志
         stopRequested = false
+        cancelPendingRoute = false
         // ★ 中间态不弹提示（2026-11-04）：
         //   原来「正在解析」+「正在规划到X的路线」+「导航中→X」三条连着弹，
         //   1.2 秒内刷四五个 toast，看着像出故障（用户反馈：「是不是打架的进程」）。
         //   中间态 1~2 秒就过去了，弹出来只是闪一下；
         //   真正的反馈是语音播报 + 最后的「导航中 → X」。
-        Dbg.log("解析目的地「$destination」…")
+        Dbg.log("开始解析目的地 chars=${destination.length}")
         // ★ 城市偏置要等城市名解析出来。
         //   定位回调里坐标是先到的，`loc.city` 要靠 setNeedAddress(true) 反查地址，
         //   慢一拍（实测差几百毫秒）。hasFix 一变 true 就去搜索的话，
@@ -274,14 +306,16 @@ class AmapNavController(
      *   直接用候选的坐标，百分之百是用户选的那个。
      */
     fun navigateToPoint(name: String, latitude: Double, longitude: Double, formatted: String = name) {
-        Dbg.log("navigateToPoint($name) $latitude,$longitude hasFix=$hasFix")
+        Dbg.log("navigateToPoint chars=${name.length} hasFix=$hasFix")
         val n = navi
         if (n == null) {
+            failCurrentAttempt("导航引擎未就绪")
             onState("导航引擎未就绪")
             voice.speak("导航引擎还没准备好", VoiceGuide.Priority.USER)
             return
         }
         if (!hasFix) {
+            failCurrentAttempt("还没有定位")
             onState("正在定位，请稍候再试")
             voice.speak("还没定位到当前位置，稍等一下再说", VoiceGuide.Priority.USER)
             return
@@ -289,6 +323,7 @@ class AmapNavController(
         pendingDestination = name
         // 新的一次导航 → 解除「停止中」标志
         stopRequested = false
+        cancelPendingRoute = false
         onPlaceResolved(
             AmapSdkGeocoder.GeoPoint(
                 latitude = latitude,
@@ -348,6 +383,7 @@ class AmapNavController(
                 )
                 if (geo == null) {
                     post {
+                        failCurrentAttempt("找不到目的地")
                         onState("找不到「$destination」这个地方")
                         voice.speak("找不到$destination，换个说法试试", VoiceGuide.Priority.USER)
                     }
@@ -365,7 +401,11 @@ class AmapNavController(
      * POI 命中和 geocode 兜底都要汇到同一段算路逻辑。
      */
     private fun onPlaceResolved(point: AmapSdkGeocoder.GeoPoint) {
-        val n = navi ?: return
+        val n = navi
+        if (n == null) {
+            failCurrentAttempt("导航引擎未就绪")
+            return
+        }
 
         // ★ ★ 距离兜底（2026-11-04）：
         //   地名解析可能跑到**同名的外地地点**上。
@@ -400,6 +440,7 @@ class AmapNavController(
                         "（${km}公里），但用户没提到这个城市/区县"
                 )
                 pendingPlace = null
+                failCurrentAttempt("目的地可能不在当前城市")
                 onState("「$dest」搜到了${km}公里外${point.city}的同名地方，可能不对")
                 voice.speak(
                     "$dest 搜到了${km}公里外${point.city}的同名地方，可能不是你要的，" +
@@ -459,6 +500,7 @@ class AmapNavController(
             if (ok) {
                 Dbg.log("正在规划到 ${point.formatted} 的路线…")
             } else {
+                failCurrentAttempt("算路请求发送失败")
                 onState("算路请求发送失败")
                 voice.speak("路线规划失败，换个说法试试", VoiceGuide.Priority.USER)
             }
@@ -552,25 +594,10 @@ class AmapNavController(
      *
      * @return 路线信息描述（真实结果），超时则返回中间态描述
      */
-    fun navigateAndAwait(destination: String, timeoutMs: Long = 8_000): String {
-        val latch = java.util.concurrent.CountDownLatch(1)
-        routeReadyLatch = latch
+    fun navigateAndAwait(destination: String, timeoutMs: Long = 15_000): NavigationAttempt {
+        val wait = beginRouteWait()
         navigateTo(destination)
-        val ok = runCatching {
-            latch.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
-        }.getOrDefault(false)
-        routeReadyLatch = null
-        if (!ok) {
-            Dbg.log("等待路线超时（${timeoutMs}ms）")
-            return ""
-        }
-        val meters = pathRemainMeters
-        val seconds = pathRemainSeconds
-        return if (meters > 0 && seconds > 0) {
-            "全程${meters}米，约${Math.max(1, seconds / 60)}分钟"
-        } else {
-            ""
-        }
+        return awaitAttempt(wait, timeoutMs)
     }
 
     /**
@@ -581,26 +608,87 @@ class AmapNavController(
         latitude: Double,
         longitude: Double,
         formatted: String = name,
-        timeoutMs: Long = 8_000
-    ): String {
-        val latch = java.util.concurrent.CountDownLatch(1)
-        routeReadyLatch = latch
+        timeoutMs: Long = 15_000
+    ): NavigationAttempt {
+        val wait = beginRouteWait()
         navigateToPoint(name, latitude, longitude, formatted)
-        val ok = runCatching {
-            latch.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
-        }.getOrDefault(false)
-        routeReadyLatch = null
-        if (!ok) {
-            Dbg.log("等待路线超时（${timeoutMs}ms）")
-            return ""
+        return awaitAttempt(wait, timeoutMs)
+    }
+
+    private fun beginRouteWait(): RouteWait {
+        val wait = RouteWait()
+        val previous = routeWait
+        routeWait = wait
+        completeRouteWait(previous, NavigationAttempt(
+            NavigationAttempt.Status.FAILED,
+            message = "新的导航请求已开始"
+        ))
+        return wait
+    }
+
+    private fun awaitAttempt(wait: RouteWait, timeoutMs: Long): NavigationAttempt {
+        val completed = try {
+            wait.latch.await(timeoutMs, TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
         }
-        val meters = pathRemainMeters
-        val seconds = pathRemainSeconds
-        return if (meters > 0 && seconds > 0) {
-            "全程${meters}米，约${Math.max(1, seconds / 60)}分钟"
+        if (!completed) {
+            if (routeWait === wait) routeWait = null
+            wait.result.compareAndSet(
+                null,
+                NavigationAttempt(NavigationAttempt.Status.TIMEOUT, message = "等待路线超时")
+            )
+            cancelPendingRoute = true
+            if (!navigating) {
+                stopRequested = true
+                runCatching { navi?.stopNavi() }
+            }
+            Dbg.log("等待路线超时（${timeoutMs}ms）")
+        }
+        return wait.result.get()
+            ?: NavigationAttempt(NavigationAttempt.Status.FAILED, message = "没有收到算路结果")
+    }
+
+    private fun completeRouteWait(wait: RouteWait?, attempt: NavigationAttempt) {
+        if (wait == null) return
+        if (routeWait === wait) routeWait = null
+        wait.result.compareAndSet(null, attempt)
+        wait.latch.countDown()
+    }
+
+    private fun failCurrentAttempt(message: String) {
+        completeRouteWait(
+            routeWait,
+            NavigationAttempt(NavigationAttempt.Status.FAILED, message = message)
+        )
+    }
+
+    private fun routeInfo(): String =
+        if (pathRemainMeters > 0 && pathRemainSeconds > 0) {
+            "全程${pathRemainMeters}米，约${Math.max(1, pathRemainSeconds / 60)}分钟"
         } else {
             ""
         }
+
+    /**
+     * 开关高德红绿灯信号源。
+     *
+     * `setTrafficSignalEnable(true)` 打开数据订阅；
+     * `setIsOpenTrafficLight("TLTRUE")` 才是 V11.3 官方倒计时视图的总开关。
+     */
+    fun setTrafficLightEnabled(enabled: Boolean) {
+        val n = navi ?: return
+        // 三个开关相互独立，某一个失败时不能让后面的开关也被跳过。
+        runCatching { n.setTrafficSignalEnable(enabled) }
+            .onFailure { Dbg.log("红绿灯信号订阅失败：${it.message}") }
+        runCatching { n.setTrafficStatusUpdateEnabled(enabled) }
+            .onFailure { Dbg.log("红绿灯状态更新失败：${it.message}") }
+        if (enabled) {
+            runCatching { n.setIsOpenTrafficLight("TLTRUE") }
+                .onFailure { Dbg.log("红绿灯倒计时开关失败：${it.message}") }
+        }
+        Dbg.log("红绿灯信号源 → $enabled")
     }
 
     override fun stop() {
@@ -612,9 +700,12 @@ class AmapNavController(
         //
         //   置了标志，算路成功回调里就会忽略这次重算。
         stopRequested = true
+        cancelPendingRoute = true
+        failCurrentAttempt("导航已停止")
         runCatching { navi?.stopNavi() }
         navigating = false
         pendingDestination = null
+        remainLights = 0
         stepRemainMeters = 0
         pathRemainSeconds = 0
         pathRemainMeters = 0
@@ -668,6 +759,19 @@ class AmapNavController(
     @Volatile
     var debugStart: Pair<Double, Double>? = null
 
+    /**
+     * 调试用：使用模拟导航。
+     *
+     * 真车不可能为了验证一次红绿灯倒计时专门开过多个路口；模拟导航可按固定
+     * 速度推进，配合 `getStructuredInfoInNavi()` 的日志确认 SDK 是否真的下发秒数。
+     */
+    @Volatile
+    var debugEmulator: Boolean = false
+
+    /** 结构化红绿灯数据的日志限频，避免每个导航回调都写大段 JSON。 */
+    @Volatile
+    private var lastStructuredTrafficLogMs = 0L
+
     /** 当前坐标，给周边搜索用；没定位返回 null */
     fun currentLocation(): Pair<Double, Double>? =
         if (hasFix) lastLat to lastLon else null
@@ -679,18 +783,51 @@ class AmapNavController(
     val currentPlaceName: String?
         get() = pendingPlace?.let { describePlace(it) } ?: pendingDestination
 
-    /** 释放：Activity onDestroy 调用 */
+    /** 释放：正常退出 Activity 时调用 */
     fun release() {
+        failCurrentAttempt("导航页面已关闭")
         runCatching {
             navi?.removeAMapNaviListener(listener)
             navi?.stopNavi()
         }
-        runCatching { locationClient?.stopLocation(); locationClient?.onDestroy() }
-        locationClient = null
+        detachLocation()
+        // AMapNavi.destroy() 在定位管理器仍被占用时会静默返回，单例和旧路线
+        // 都会继续存活。必须先释放定位管理器，再销毁导航单例。
+        runCatching { AMapNavi.releaseLocManager() }
+            .onFailure { Dbg.log("释放高德定位管理器失败：${it.message}") }
         runCatching { AMapNavi.destroy() }
+            .onFailure { Dbg.log("销毁高德导航单例失败：${it.message}") }
         navi = null
         navigating = false
     }
+
+    private fun detachLocation() {
+        runCatching { locationClient?.stopLocation(); locationClient?.onDestroy() }
+        locationClient = null
+    }
+
+    /**
+     * 记录高德下发的红绿灯结构化数据。
+     *
+     * `NaviInfo.getRouteRemainLightCount()` 只是前方灯数，没有倒计时秒数。
+     * V11.3 把倒计时和灯色放在结构化 JSON 中，回调频率较高，因此限频为
+     * 2 秒一次，并在日志里截断超长字段。真机确认字段后，UI 才有可靠数据源。
+     */
+    private fun logStructuredTrafficInfo() {
+        val n = navi ?: return
+        val now = System.currentTimeMillis()
+        if (now - lastStructuredTrafficLogMs < STRUCTURED_TRAFFIC_LOG_INTERVAL_MS) return
+        lastStructuredTrafficLogMs = now
+        val route = runCatching { n.structuredInfoInRoute }.getOrNull()
+        val inNavi = runCatching { n.structuredInfoInNavi }.getOrNull()
+        Dbg.log(
+            "结构化导航数据 route=${route.limitForLog()} " +
+                "nav=${inNavi.limitForLog()}"
+        )
+    }
+
+    private fun String?.limitForLog(): String =
+        if (this.isNullOrBlank()) "<empty>" else take(4_000)
 
     private val listener = object : NavListenerAdapter() {
 
@@ -699,18 +836,29 @@ class AmapNavController(
         }
 
         override fun onInitNaviFailure() {
+            failCurrentAttempt("导航引擎初始化失败")
             onState("导航引擎初始化失败")
             voice.speak("导航引擎初始化失败", VoiceGuide.Priority.USER)
         }
 
         override fun onCalculateRouteSuccess(p0: AMapCalcRouteResult?) {
-            val n = navi ?: return
+            val n = navi
+            if (n == null) {
+                failCurrentAttempt("导航引擎未就绪")
+                return
+            }
             // ★ 用户已经请求停止导航了 —— 这次算路结果**作废**。
             //   SDK 的 stopNavi() 是软停止（先播「导航结束」再真正停），
             //   这中间位置更新会触发一次重算，如果照单全收就会又播一遍
             //   「准备出发」—— 用户听到的就是「退出导航后又重新开始导航」（用户反馈）。
             if (stopRequested) {
                 Dbg.log("算路结果作废（用户已请求停止导航）")
+                failCurrentAttempt("算路结果已取消")
+                return
+            }
+            if (cancelPendingRoute) {
+                cancelPendingRoute = false
+                Dbg.log("算路结果作废（等待方已超时取消）")
                 return
             }
             // 只记录候选数量，**不要**去 selectRouteId 遍历。
@@ -722,12 +870,10 @@ class AmapNavController(
             pathRemainSeconds = path?.allTime ?: 0
             pathRemainMeters = path?.allLength ?: 0
 
-            // ★ 通知等待方「路线算好了」（2026-11-04）
-            //   工具那边在等这个 —— 不等的话工具返回的是「正在算路」这种中间态，
-            //   模型会照着念，用户听到「正在规划张掖西站」，
-            //   但地图其实早就开始导航了，两边对不上（用户反馈）。
-            routeReadyLatch?.countDown()
-            routeReadyLatch = null
+            // 候选路线刚生成时再开启一次。部分版本在初始化阶段还没有路线数据，
+            // 只在 start() 调用会导致导航中仍只保留主路线。
+            runCatching { n.setMultipleRouteNaviMode(true) }
+                .onFailure { Dbg.log("多路径导航模式开启失败：${it.message}") }
 
             // ★ 路线诊断：打出每段走哪条路。
             //   路线跟高德 App 不一致时，靠这个直接看是「走的路不同」还是「起终点不同」。
@@ -749,9 +895,37 @@ class AmapNavController(
             //   如果直接把 navigating 赋成返回值，就会把自己标成"没在导航"，
             //   然后 HUD 消失、问"还有多久"回答"现在没在导航"。实测踩过。
             val wasNavigating = navigating
-            val started = n.startNavi(NaviType.GPS)
+            if (debugEmulator) {
+                n.setEmulatorNaviSpeed(80)
+            }
+            val started = n.startNavi(
+                if (debugEmulator) NaviType.EMULATOR else NaviType.GPS
+            )
             navigating = started || wasNavigating
             Dbg.log("startNavi=$started pathLen=${path?.allLength} pathTime=${path?.allTime} wasNav=$wasNavigating")
+
+            if (!started && !wasNavigating) {
+                failCurrentAttempt("启动导航失败")
+                onState("启动导航失败")
+                onHud(NavHud(navigating = false))
+                return
+            }
+
+            // 部分机型/版本在算路完成后才建立信号订阅，启动导航后再推一次。
+            // 这是官方倒计时气泡能拿到数据的必要开关，重复调用是幂等的。
+            setTrafficLightEnabled(Prefs.navTrafficLight)
+
+            completeRouteWait(
+                routeWait,
+                NavigationAttempt(
+                    status = if (wasNavigating) {
+                        NavigationAttempt.Status.REROUTED
+                    } else {
+                        NavigationAttempt.Status.STARTED
+                    },
+                    routeInfo = routeInfo()
+                )
+            )
 
             // ★ 算路完成 → 通知界面「先看全程」（2026-11-04）
             //   改道重算时**不打断**：用户正开着导航呢，突然切全程很烦。
@@ -781,7 +955,7 @@ class AmapNavController(
                 //     我们 tts.stop() 拦不住它 —— 实测我们的提醒 0.65 秒就被打断。
                 //     而且高德那句「全程1516公里，17小时」本身就会让用户意识到是长途，
                 //     界面提示「导航中 → 石家庄市桥西区石家庄站」也带了城市全称。
-                Dbg.log("导航播报交给高德（我们不重复）=$where 跨市=$farAway 改道=$wasNavigating")
+                Dbg.log("导航播报交给高德（我们不重复）跨市=$farAway 改道=$wasNavigating destinationChars=${where.length}")
                 onHud(
                     NavHud(
                         navigating = true,
@@ -793,19 +967,39 @@ class AmapNavController(
         }
 
         override fun onCalculateRouteFailure(p0: AMapCalcRouteResult?) {
+            if (stopRequested || cancelPendingRoute) {
+                Dbg.log("算路失败回调作废（导航已停止或请求已取消）")
+                return
+            }
             val code = p0?.errorCode ?: -1
             val desc = p0?.errorDescription ?: "未知错误"
             Dbg.log("算路失败 code=$code desc=$desc")
             Log.w(TAG, "算路失败 code=$code desc=$desc")
             navigating = false
+            completeRouteWait(
+                routeWait,
+                NavigationAttempt(
+                    NavigationAttempt.Status.FAILED,
+                    message = desc
+                )
+            )
             onState("算路失败：$desc（$code）")
             voice.speak("路线规划失败，$desc", VoiceGuide.Priority.USER)
             onHud(NavHud(navigating = false))
         }
 
         override fun onNaviInfoUpdate(p0: NaviInfo?) {
+            if (stopRequested) {
+                Dbg.log("忽略退出后的 NaviInfo 回调")
+                return
+            }
             val info = p0 ?: return
-            Dbg.log("NaviInfo step=${info.curStepRetainDistance} road=${info.nextRoadName} remain=${info.pathRetainDistance}/${info.pathRetainTime}")
+            logStructuredTrafficInfo()
+            Dbg.log(
+                "NaviInfo step=${info.curStepRetainDistance} road=${info.nextRoadName} " +
+                    "remain=${info.pathRetainDistance}/${info.pathRetainTime} " +
+                    "lights=${info.routeRemainLightCount}"
+            )
             stepRemainMeters = info.curStepRetainDistance
             pathRemainSeconds = info.pathRetainTime
             pathRemainMeters = info.pathRetainDistance
@@ -828,14 +1022,21 @@ class AmapNavController(
             )
         }
 
+        override fun onTrafficStatusUpdate() {
+            if (stopRequested) return
+            logStructuredTrafficInfo()
+        }
+
         /** SDK 生成的导航播报文本，接管到我们自己的 TTS 队列（NAV 优先级最高） */
         override fun onGetNavigationText(p0: String?) {
+            if (stopRequested) return
             val text = p0?.takeIf { it.isNotBlank() } ?: return
-            Dbg.log("播报: $text")
+            Dbg.log("导航播报 chars=${text.length}")
             voice.speak(text, VoiceGuide.Priority.NAV)
         }
 
         override fun onArriveDestination() {
+            if (stopRequested) return
             navigating = false
             onState("已到达目的地")
             voice.speak("已到达目的地", VoiceGuide.Priority.NAV)
@@ -843,10 +1044,12 @@ class AmapNavController(
         }
 
         override fun onReCalculateRouteForYaw() {
+            if (stopRequested) return
             voice.speak("路线已重新规划", VoiceGuide.Priority.NAV)
         }
 
         override fun onReCalculateRouteForTrafficJam() {
+            if (stopRequested) return
             voice.speak("前方拥堵，已为你换路", VoiceGuide.Priority.NAV)
         }
 
@@ -881,6 +1084,8 @@ class AmapNavController(
          * 不等的话城市偏置是 null，跨城市地名会解析错。
          */
         const val CITY_WAIT_MS = 3_000L
+
+        const val STRUCTURED_TRAFFIC_LOG_INTERVAL_MS = 2_000L
 
         /**
          * 解析结果离当前位置多远算「可疑」（米）。

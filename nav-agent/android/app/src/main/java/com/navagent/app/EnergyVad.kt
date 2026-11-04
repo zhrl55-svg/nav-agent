@@ -149,6 +149,14 @@ class EnergyVad(
         val bargeMs = bargeBuffer.size * 1000 / AudioCapture.SAMPLE_RATE
         if (bargeMs < BARGE_IN_CHECK_MS) return false
 
+        // 声纹只负责确认“是谁”；先确认确实有连续人声，否则 TTS 的低能量尾巴、
+        // 路噪或偶发咔哒声也可能凑够 0.6 秒并被声纹模型误判。
+        if (bargeFrames < BARGE_IN_FRAMES) {
+            bargeBuffer.clear()
+            bargeFrames = 0
+            return false
+        }
+
         // 攒够了，交给声纹判定（阻塞调用，约 0.1s，在音频线程上）
         val pcm = bargeBuffer.toShortArray()
         val allowed = bargeInCheck?.invoke(pcm) ?: true

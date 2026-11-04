@@ -116,7 +116,7 @@ class VoiceService : Service() {
 
         val open = PendingIntent.getActivity(
             this, 0,
-            Intent(this, ChatActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            Intent(this, NavActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
@@ -124,7 +124,7 @@ class VoiceService : Service() {
         val wake = Prefs.primaryWakeWord()
         val notif: Notification = Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("语音待命")
-            .setContentText("说「$wake」唤醒，点这里回到对话")
+            .setContentText("说「$wake」唤醒，点这里回到导航")
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setContentIntent(open)
             .setOngoing(true)

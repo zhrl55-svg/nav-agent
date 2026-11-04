@@ -38,7 +38,7 @@ object Dbg {
         val f = File(dir, FILE_NAME)
         if (f.exists() && f.length() > MAX_BYTES) f.delete()
         file = f
-        enabled = Prefs.fileLog
+        enabled = BuildConfig.DEBUG && Prefs.fileLog
         log("==== 启动 v${BuildConfig.VERSION_NAME} ====")
     }
 

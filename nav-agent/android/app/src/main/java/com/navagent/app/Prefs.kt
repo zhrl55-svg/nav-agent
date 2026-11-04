@@ -2,11 +2,9 @@ package com.navagent.app
 
 import android.content.Context
 import android.content.SharedPreferences
-import com.navagent.app.BuildConfig.MINIMAX_API_KEY
 import com.navagent.app.BuildConfig.MINIMAX_ASR_MODEL
 import com.navagent.app.BuildConfig.MINIMAX_BASE_URL
 import com.navagent.app.BuildConfig.MINIMAX_CHAT_MODEL
-import com.navagent.app.BuildConfig.TAVILY_API_KEY
 import com.navagent.app.BuildConfig.WAKE_WORDS
 
 /**
@@ -16,8 +14,8 @@ import com.navagent.app.BuildConfig.WAKE_WORDS
  * 设置页改完立刻生效，不用重启。只有**唤醒词**是例外，改完必须重建 vosk Recognizer，
  * 走 [VoiceEngine.reloadWake]。
  *
- * 默认值一律取自 BuildConfig：这样 local.properties / build.gradle.kts 里的配置仍然是
- * "出厂默认"，用户改坏了点恢复默认就能回到编译时的值。
+ * 地址、模型名等非敏感默认值可取 BuildConfig；API Key 只保存在设置中，
+ * 不进入 APK。
  *
  * ★ init() 必须在 Dbg.init() 之前调用，因为 Dbg 要读 [fileLog] 决定开不开。
  */
@@ -182,7 +180,7 @@ object Prefs {
      *
      * 为什么要这一层：BuildConfig 里的 Key 是编译时烧进 APK 的，换 Key 就得重新
      * 构建一次；装到别人手机上也没法用他自己的额度。有了这个字段，
-     * 装好的 APK 直接在设置页填自己的 Key 就能跑，清空就退回出厂默认。
+     * 装好的 APK 直接在设置页填自己的 Key 就能跑；清空后需要 Key 的服务会停用。
      *
      * ★ 2026-11-02 起它只管**语音**。对话大脑有独立的 Key/地址（见下面的 chat*），
      *   因为本地模型接的是 `http://192.168.x.x:1234/v1`，跟语音服务根本不是一个服务。
@@ -197,14 +195,14 @@ object Prefs {
         get() = sp.getString(K_API_BASE, "").orEmpty().trim()
         set(v) = sp.edit().putString(K_API_BASE, v.trim()).apply()
 
-    /** 语音服务实际生效的 Key：用户填了用用户的，没填用出厂的 */
-    fun voiceApiKey(): String = voiceKeyRaw.ifEmpty { MINIMAX_API_KEY }
+    /** 语音服务实际生效的 Key。Key 只来自设置页。 */
+    fun voiceApiKey(): String = voiceKeyRaw
 
     /** 语音服务实际生效的地址：用户填了用用户的，没填用出厂的 */
     fun voiceBaseUrl(): String = voiceBaseRaw.ifEmpty { MINIMAX_BASE_URL }
 
-    /** 当前用的是不是用户自己填的 Key（设置页显示状态用） */
-    fun voiceUsingCustomKey(): Boolean = voiceKeyRaw.isNotEmpty()
+    /** 是否已配置语音服务 Key（设置页显示状态用） */
+    fun voiceKeyConfigured(): Boolean = voiceKeyRaw.isNotEmpty()
 
     // ------------------------------------------------------------ 对话大脑
 
@@ -450,13 +448,13 @@ object Prefs {
     // ------------------------------------------------------------ 联网
 
     /**
-     * Tavily 搜索 Key。默认用编译时注入的，设置页可以覆盖（换 Key 不用重新打包）。
+     * Tavily 搜索 Key。只从设置页读取，不进入 APK。
      *
      * 为什么是 Tavily：MiniMax API 没有内置联网，通用搜索只能接第三方；
      * 实测手机能直连 api.tavily.com（10ms），不像 Serper 那样要挂代理。
      */
     var tavilyKey: String
-        get() = sp.getString(K_TAVILY_KEY, TAVILY_API_KEY).orEmpty().ifBlank { TAVILY_API_KEY }
+        get() = sp.getString(K_TAVILY_KEY, "").orEmpty().trim()
         set(v) = sp.edit().putString(K_TAVILY_KEY, v.trim()).apply()
 
     fun clearTavilyKeyOverride() = sp.edit().remove(K_TAVILY_KEY).apply()

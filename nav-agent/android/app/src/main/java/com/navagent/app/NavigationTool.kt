@@ -3,6 +3,23 @@ package com.navagent.app
 import com.navagent.core.LlmTool
 import org.json.JSONObject
 
+data class NavigationToolResult(
+    val text: String,
+    val status: Status,
+    val userText: String? = null
+) {
+    enum class Status {
+        STARTED,
+        REROUTED,
+        CANDIDATES,
+        NEEDS_CLARIFICATION,
+        FAILED,
+        STOPPED,
+        MAP_OPENED,
+        SLEEP
+    }
+}
+
 /**
  * 导航控制工具。
  *
@@ -39,9 +56,9 @@ import org.json.JSONObject
  */
 class NavigationTool(
     /** 导航/改道（按地名）。返回给模型看的结果描述 */
-    private val navigateTo: (String) -> String,
+    private val navigateTo: (String) -> NavigationToolResult,
     /** 导航到**已确认的候选 POI**（用它的精确坐标，不重新解析地名） */
-    private val navigateToPoi: (AmapSdkGeocoder.Poi) -> String = { navigateTo(it.name) },
+    private val navigateToPoi: (AmapSdkGeocoder.Poi) -> NavigationToolResult = { navigateTo(it.name) },
     private val stop: () -> String,
     private val openMap: () -> String,
     /** 模型没给目的地时，用上一次周边搜索的结果兜底 */
@@ -146,9 +163,18 @@ class NavigationTool(
         return null
     }
 
-    override fun execute(argumentsJson: String): String {
+    override fun execute(argumentsJson: String): String = executeDetailed(argumentsJson).text
+
+    /**
+     * 结构化执行入口。本地确定性兜底靠 status 判断是否真的开始导航，
+     * 不再从中文结果里猜「已开始 / 搜到候选 / 失败」。
+     */
+    fun executeDetailed(argumentsJson: String): NavigationToolResult {
         val obj = runCatching { JSONObject(argumentsJson) }.getOrNull()
-            ?: return "参数解析失败，重试一次"
+            ?: return NavigationToolResult(
+                "参数解析失败，重试一次",
+                NavigationToolResult.Status.FAILED
+            )
 
         return when (obj.optString("action").trim()) {
             "navigate" -> {
@@ -156,7 +182,11 @@ class NavigationTool(
                 // 模型有时候只给 action 不给地名（用户说「就去这家」），用最近一次周边结果兜
                 val dest = asked.ifBlank { lastNearbyName()?.trim().orEmpty() }
                 if (dest.isBlank() || !isConcreteDestination(dest)) {
-                    "目的地还不具体，先问用户要去哪个明确地点；不要猜测或启动导航。"
+                    NavigationToolResult(
+                        text = "目的地还不具体，先问用户要去哪个明确地点；不要猜测或启动导航。",
+                        status = NavigationToolResult.Status.NEEDS_CLARIFICATION,
+                        userText = "要去哪个具体地点？"
+                    )
                 } else {
                     // ★ ★ 用户确认了吗？
                     //   confirmed=true 是模型在说「用户已经选了某个候选」。
@@ -186,47 +216,75 @@ class NavigationTool(
                         //   模型看到历史里的目的地就自己调了 navigate，
                         //   结果跑到石家庄同名地点，1517 公里（用户反馈）。
                         if (recent == null) {
-                            return "用户还没确认过是哪个地点，不能直接导航。" +
-                                "请调一次 navigate（**不带** confirmed）来搜索候选，" +
-                                "用 1、2、3 列出来问用户「是哪个」；" +
-                                "等用户选了之后，再调一次（destination 用完整名称、confirmed=true）。"
+                            return NavigationToolResult(
+                                text = "用户还没确认过是哪个地点，不能直接导航。" +
+                                    "请调一次 navigate（**不带** confirmed）来搜索候选，" +
+                                    "用 1、2、3 列出来问用户「是哪个」；" +
+                                    "等用户选了之后，再调一次（destination 用完整名称、confirmed=true）。",
+                                status = NavigationToolResult.Status.NEEDS_CLARIFICATION,
+                                userText = "你还没选具体地点，我先帮你列出候选。"
+                            )
                         }
                         clearCandidates(null)
                         // ★ 明确告诉模型「候选没了」，别让它自作主张再导航一次。
-                        return "刚才的候选已经失效了（用户没确认或已结束导航）。" +
-                            "请先调一次 navigate（不带 confirmed）重新搜索候选，问用户是哪个；" +
-                            "**不要**直接调 confirmed=true 导航。"
+                        return NavigationToolResult(
+                            text = "刚才的候选已经失效了（用户没确认或已结束导航）。" +
+                                "请先调一次 navigate（不带 confirmed）重新搜索候选，问用户是哪个；" +
+                                "**不要**直接调 confirmed=true 导航。",
+                            status = NavigationToolResult.Status.FAILED,
+                            userText = "刚才的地点候选已经失效了，我再搜一次。"
+                        )
                     }
 
                     // ★ 没确认 → 先搜候选，不直接导航
                     val pois = searchPlaces(dest)
                     if (pois.isEmpty()) {
                         // 搜不到就明说，让模型问用户换个说法，别瞎猜一个地方导航过去
-                        "没搜到「$dest」。请让用户换个说法或说更详细的地名（加上城市、区县、门牌号），不要猜测、不要直接导航。"
+                        NavigationToolResult(
+                            text = "没搜到「$dest」。请让用户换个说法或说更详细的地名" +
+                                "（加上城市、区县、门牌号），不要猜测、不要直接导航。",
+                            status = NavigationToolResult.Status.FAILED,
+                            userText = "没搜到「$dest」，请换一个更具体的地名。"
+                        )
                     } else {
                         showCandidates(dest, pois)
-                        buildString {
-                            append("搜到 ${pois.size} 个「$dest」的候选：\n")
-                            pois.forEachIndexed { i, poi ->
-                                append("${i + 1}. ${poi.name}")
-                                if (poi.address.isNotBlank()) append("（${poi.address}）")
-                                if (poi.distance > 0) append(" 距你 ${poi.distance}米")
-                                append('\n')
-                            }
-                            append("这些候选已经填进地图上的搜索框并显示列表了。")
-                            append("请用 1、2、3 列给用户，问「是哪个」。")
-                            append("用户回答后，再调一次 navigate，destination 用**候选项的完整名称**，")
-                            append("并且 confirmed=true（表示用户已经确认过）。")
-                            append("★ 现在**不要**自己调用 navigate 去导航 —— 用户还没确认。")
-                        }
+                        NavigationToolResult(
+                            text = buildString {
+                                append("搜到 ${pois.size} 个「$dest」的候选：\n")
+                                pois.forEachIndexed { i, poi ->
+                                    append("${i + 1}. ${poi.name}")
+                                    if (poi.address.isNotBlank()) append("（${poi.address}）")
+                                    if (poi.distance > 0) append(" 距你 ${poi.distance}米")
+                                    append('\n')
+                                }
+                                append("这些候选已经填进地图上的搜索框并显示列表了。")
+                                append("请用 1、2、3 列给用户，问「是哪个」。")
+                                append("用户回答后，再调一次 navigate，destination 用**候选项的完整名称**，")
+                                append("并且 confirmed=true（表示用户已经确认过）。")
+                                append("★ 现在**不要**自己调用 navigate 去导航 —— 用户还没确认。")
+                            },
+                            status = NavigationToolResult.Status.CANDIDATES
+                        )
                     }
                 }
             }
 
-            "stop" -> stop()
-            "open_map" -> openMap()
-            "sleep" -> sleep()
-            else -> "不认识的 action：${obj.optString("action")}"
+            "stop" -> NavigationToolResult(
+                stop(),
+                NavigationToolResult.Status.STOPPED
+            )
+            "open_map" -> NavigationToolResult(
+                openMap(),
+                NavigationToolResult.Status.MAP_OPENED
+            )
+            "sleep" -> NavigationToolResult(
+                sleep(),
+                NavigationToolResult.Status.SLEEP
+            )
+            else -> NavigationToolResult(
+                "不认识的 action：${obj.optString("action")}",
+                NavigationToolResult.Status.FAILED
+            )
         }
     }
 }

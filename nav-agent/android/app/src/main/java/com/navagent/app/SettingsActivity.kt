@@ -212,12 +212,12 @@ class SettingsActivity : AppCompatActivity() {
 
         row(
             "语音 API Key", voiceKeyLabel(),
-            "识别和合成共用。填自己的额度，不用重新编译；清空恢复内置"
+            "识别和合成共用。Key 只保存在本机设置中，清空后会停用云端语音"
         ) {
             editText("语音 API Key", Prefs.voiceKeyRaw, "sk-...", masked = true) {
                 Prefs.voiceKeyRaw = it
                 applied()
-                toast(if (it.isBlank()) "已恢复内置 Key" else "已切换到自定义 Key")
+                toast(if (it.isBlank()) "已清空语音 API Key" else "语音 API Key 已保存")
             }
         }
 
@@ -937,16 +937,22 @@ class SettingsActivity : AppCompatActivity() {
 
     private fun chatKeyLabel(): String {
         val k = Prefs.chatApiKey()
-        if (k.isBlank()) return "未填（不发 Key）"
+        if (k.isBlank()) {
+            return if (Prefs.chatEndpointIsCustom()) {
+                "未填（不发 Key）"
+            } else {
+                "未配置（请填写语音 API Key）"
+            }
+        }
         return if (Prefs.chatEndpointIsCustom()) {
             "自定义 ${Prefs.maskedChatKey()}"
         } else {
-            "内置 ${Prefs.maskedChatKey()}"
+            "沿用语音 Key ${Prefs.maskedChatKey()}"
         }
     }
 
     private fun voiceKeyLabel(): String =
-        if (Prefs.voiceUsingCustomKey()) "自定义 ${Prefs.maskedVoiceKey()}" else "内置 ${Prefs.maskedVoiceKey()}"
+        if (Prefs.voiceKeyConfigured()) "已配置 ${Prefs.maskedVoiceKey()}" else "未配置"
 
     private fun webSearchLabel(): String = when (Prefs.webSearchMode) {
         Prefs.WEB_SEARCH_ON -> "开启（Tavily）"
@@ -965,7 +971,7 @@ class SettingsActivity : AppCompatActivity() {
         Prefs.chatProvider = provider
         when (provider) {
             Prefs.PROVIDER_MINIMAX -> {
-                // 空 = 跟随语音服务，老配置和内置 Key 都能直接用
+                // 空 = 跟随语音服务；未填 Key 时由设置页明确提示未配置
                 Prefs.chatBaseRaw = ""
                 Prefs.chatKeyRaw = ""
                 Prefs.chatModel = "minimax-m3.1-flash"

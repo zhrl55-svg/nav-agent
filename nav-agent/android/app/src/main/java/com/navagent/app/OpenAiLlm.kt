@@ -136,8 +136,14 @@ class OpenAiLlm(
             }
             val results = ArrayList<Pair<Call, String>>(done.size)
             for ((c, task) in done) {
-                val out = runCatching { task.get(8, java.util.concurrent.TimeUnit.SECONDS) }
-                    .getOrElse { "工具超时或失败：${it.javaClass.simpleName}" }
+                val out = runCatching {
+                    task.get(TOOL_TIMEOUT_SECONDS, java.util.concurrent.TimeUnit.SECONDS)
+                }.getOrElse {
+                    // 超时后必须取消任务，否则工具线程可能继续算路并在模型已收到
+                    // 「工具超时」之后突然启动导航。
+                    task.cancel(true)
+                    "工具超时或失败：${it.javaClass.simpleName}"
+                }
                 results += c to out
                 messages.put(
                     JSONObject()
@@ -400,10 +406,10 @@ class OpenAiLlm(
             Dbg.log("未知工具 ${c.name}")
             return "没有叫 ${c.name} 的工具"
         }
-        Dbg.log("工具调用 ${c.name}(${c.args.toString().take(200)})")
+        Dbg.log("工具调用 ${c.name} argsChars=${c.args.length}")
         val out = runCatching { tool.execute(c.args.toString()) }
             .getOrElse { "工具执行失败：${it.message ?: it.javaClass.simpleName}" }
-        Dbg.log("工具返回 ${out.take(200)}")
+        Dbg.log("工具返回 ${c.name} chars=${out.length}")
         return out
     }
 
@@ -643,5 +649,8 @@ class OpenAiLlm(
 
         /** 文本工具调用在 calls 里的起始下标，避开原生分片的 0/1/2 */
         const val TEXT_CALL_BASE = 100
+
+        /** 覆盖地点搜索 + 城市等待 + 高德算路的最长链路 */
+        const val TOOL_TIMEOUT_SECONDS = 30L
     }
 }
