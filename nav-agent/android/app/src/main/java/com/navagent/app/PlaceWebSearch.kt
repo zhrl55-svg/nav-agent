@@ -82,10 +82,16 @@ object PlaceWebSearch {
     ): List<AmapSdkGeocoder.Poi> {
         val q = keyword.trim()
         if (q.isEmpty()) return emptyList()
+        val started = System.currentTimeMillis()
         val tail = buildString {
             append("?key=").append(BuildConfig.AMAP_WEB_KEY)
             append("&keywords=").append(java.net.URLEncoder.encode(q, "UTF-8"))
-            append("&extensions=all")
+            // ★ extensions=base 而不是 all（2026-11-04）：
+            //   all 会带回 photos/featured_reviews/biz_ext 这些用不上的字段，
+            //   响应体 5757B vs 2329B（少 60%）。
+            //   我们需要的 name/cityname/adname/pname/address/location/distance
+            //   base 里全都有 —— 开车用流量，省一半是实打实的。
+            append("&extensions=base")
             append("&offset=").append(limit)
             append("&page=1")
             if (!city.isNullOrBlank()) append("&city=").append(java.net.URLEncoder.encode(city, "UTF-8"))
@@ -126,26 +132,46 @@ object PlaceWebSearch {
                 )
             )
         }
-        Dbg.log("地点搜索「$q」cityLimit=$cityLimit → ${out.size} 条：${out.joinToString { it.name }}")
+        Dbg.log(
+            "地点搜索「$q」cityLimit=$cityLimit 耗时${System.currentTimeMillis() - started}ms" +
+                " → ${out.size} 条：${out.joinToString { it.name }}"
+        )
         return out
     }
 
+    /**
+     * 发一次 HTTP GET，拿 JSON。
+     *
+     * ★ ★ 不要 `disconnect()`（2026-11-04）：
+     *   HttpURLConnection 内部有连接池，`disconnect()` 会把连接**关掉**，
+     *   下次请求就得重新做 TLS 握手 —— 实测每次多花 120~620ms。
+     *   搜索栏每打几个字就搜一次，这个开销直接变成「候选列表出得太慢」。
+     *
+     *   只要把 inputStream 读干净并 close（下面用了 `use`），
+     *   连接就会回到池子里复用，第二次开始省掉整个 TLS 握手。
+     */
     private fun query(tail: String): JSONObject? {
-        var conn: HttpURLConnection? = null
         return try {
             val url = "https://restapi.amap.com/v3/place/text$tail"
-            conn = (URL(url).openConnection() as HttpURLConnection).apply {
+            val conn = (URL(url).openConnection() as HttpURLConnection).apply {
                 requestMethod = "GET"
                 connectTimeout = 6_000
                 readTimeout = 6_000
+                // 显式声明复用 —— 有些系统实现要看到这个头才走 keep-alive
+                setRequestProperty("Connection", "keep-alive")
+                // 高德返回的是 JSON，gzip 能省一半传输量
+                setRequestProperty("Accept-Encoding", "gzip")
             }
-            val body = conn.inputStream.bufferedReader().use { it.readText() }
+            val stream = conn.inputStream
+            val body = if (conn.contentEncoding?.contains("gzip", true) == true) {
+                java.util.zip.GZIPInputStream(stream).bufferedReader().use { it.readText() }
+            } else {
+                stream.bufferedReader().use { it.readText() }
+            }
             JSONObject(body)
         } catch (t: Throwable) {
             Dbg.log("地点搜索异常 ${t.javaClass.simpleName}: ${t.message}")
             null
-        } finally {
-            conn?.disconnect()
         }
     }
 }

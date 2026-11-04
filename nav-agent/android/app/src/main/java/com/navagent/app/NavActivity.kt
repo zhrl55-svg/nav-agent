@@ -569,7 +569,9 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
     private fun doSearch(raw: String) {
         val keyword = raw.trim()
         if (keyword.isEmpty()) return
-        toast("搜索「$keyword」…")
+        // ★ 不弹「搜索「X」…」toast（2026-11-04）：
+        //   列表本身 0.4 秒后就出来了，那个 toast 只会让人更觉得慢
+        //   （它先出现、然后列表才来，中间那段空窗被放大了）。
         Dbg.log("搜索栏搜索：$keyword")
         // 序号防串台：输入快时旧请求可能后到，不能让它覆盖新结果
         val seq = ++searchSeq
@@ -1641,8 +1643,25 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
         private const val MIDDLE_LAYOUT_ID = "navi_sdk_lbs_navi_middle_layout"
         private const val FIX_TIMEOUT_MS = 60_000L
 
-        /** 输入停顿多久才开始搜。太短会在打字中间乱搜，太长又显得卡 */
-        private const val SEARCH_DEBOUNCE_MS = 800L
+        /**
+         * 输入停顿多久才开始搜。太短会在打字中间乱搜，太长又显得卡。
+         *
+         * ★ 2026-11-04：800 → 300。
+         *   用户反馈「搜索框输入完显示候选列表等的时间过长」。
+         *   800ms 防抖 + 请求本身 200~700ms（那时每次还要重做 TLS 握手）
+         *   = 从停手到看见列表要 1~1.5 秒，体感就是卡。
+         *
+         *   现在 300ms 防抖 + 连接复用后的 50~120ms 请求
+         *   = 停手后 ~0.4 秒出列表。
+         *   300ms 也足够区分「还在打字」和「打完了」——
+         *   正常人打字间隔在 150~250ms。
+         *
+         * ★ 2026-11-04 再调：300 → 200。
+         *   实测请求本身要 270ms（高德服务器的网络往返，客户端优化不掉），
+         *   防抖是唯一还能压的一环。200ms 对「打完了」的判定仍然够用
+         *   （打字间隔 150~250ms，200 刚好在边界上，靠序号防串台兜住）。
+         */
+        private const val SEARCH_DEBOUNCE_MS = 200L
 
         /** 识别文本停留多久后自动消失（毫秒） */
         private const val RECOGNIZED_HOLD_MS = 2_000L
