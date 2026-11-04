@@ -573,7 +573,9 @@ private const val K_VOICEPRINT_BARGE_TH = "voiceprint_barge_threshold"
      * 实测手机能直连 api.tavily.com（10ms），不像 Serper 那样要挂代理。
      */
     var tavilyKey: String
-        get() = sp.getString(K_TAVILY_KEY, "").orEmpty().trim()
+        // 设置页没填就退回编译期注入的默认值（local.properties 里的 TAVILY_API_KEY）。
+        // 没有默认值时降级链照样能搜（国内引擎不需要 Key）。
+        get() = sp.getString(K_TAVILY_KEY, "").orEmpty().trim().ifBlank { BuildConfig.TAVILY_API_KEY }
         set(v) = sp.edit().putString(K_TAVILY_KEY, v.trim()).apply()
 
     fun clearTavilyKeyOverride() = sp.edit().remove(K_TAVILY_KEY).apply()

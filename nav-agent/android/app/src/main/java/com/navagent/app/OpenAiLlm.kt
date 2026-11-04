@@ -32,8 +32,8 @@ import java.util.TreeMap
  * 两轮请求的顺序：
  *   第 1 轮带 tools 流式跑，边流边播（模型通常先说"我帮你查一下"）
  *   有 tool_calls 就执行，把结果作为 role=tool 回填
- *   第 2 轮不带 tools 再流式跑，接着播报答案
- *   最多 [MAX_TOOL_ROUNDS] 轮，防止模型自己跟自己绕圈
+ *   第 2 轮仍带 tools 但设置 tool_choice=none，接着播报答案
+ *   工具只允许在第一轮调用；拿到结果后只做一次自然语言总结，防止模型绕圈。
  */
 class OpenAiLlm(
     private val tools: List<LlmTool> = emptyList()
@@ -94,9 +94,14 @@ class OpenAiLlm(
             val r = (outcome as Attempt.Ok).round
             answer.append(r.text)
 
-            if (r.calls.isEmpty() || round >= MAX_TOOL_ROUNDS) {
-                lastDigest = null
-                return answer.toString().trim().ifEmpty { null }
+            // 工具结果回填后，即使服务端仍返回 tool_calls 也不能执行：
+            // 这一轮请求已经声明 tool_choice=none，继续执行只会重复搜索。
+            if (r.calls.isEmpty() || round > 0) {
+                val text = answer.toString().trim()
+                // 总结为空时保留工具结果，让 ChatEngine 的重试可以通过
+                // chatText() 直接基于已经搜到的资料回答，避免白搜一次。
+                if (text.isNotEmpty()) lastDigest = null
+                return text.ifEmpty { null }
             }
 
             // 这里故意不补「我查一下」之类的过渡语 —— 用户嫌啰嗦，宁可静默等结果。
@@ -250,8 +255,8 @@ class OpenAiLlm(
 
         // 工具调用总开关：本地小模型不会 function calling 时关掉，退化成纯聊天
         val active = activeTools()
-        val withTools = allowTools && active.isNotEmpty() && Prefs.toolsEnabled
-        if (withTools) {
+        val toolsAvailable = active.isNotEmpty() && Prefs.toolsEnabled
+        if (toolsAvailable) {
             payload.put(
                 "tools",
                 JSONArray().apply {
@@ -270,7 +275,10 @@ class OpenAiLlm(
                     }
                 }
             )
-            payload.put("tool_choice", "auto")
+            // 工具定义在总结轮仍要保留，否则部分 OpenAI 兼容服务会退回原始
+            // chat template，输出 `]<]minimax[>[<tool_call>` 这类协议碎片。
+            // tool_choice=none 明确告诉模型：可以看见工具，但本轮禁止调用。
+            payload.put("tool_choice", if (allowTools) "auto" else "none")
         }
 
         val base = Prefs.chatBaseUrl().trimEnd('/')
@@ -278,7 +286,7 @@ class OpenAiLlm(
 
         Dbg.log(
             "LLM 请求 $base model=${Prefs.chatModel} tokens=${Prefs.maxTokens} " +
-                "turns=${Prefs.historyTurns} tools=${if (withTools) active.size else 0} " +
+                "turns=${Prefs.historyTurns} tools=${if (toolsAvailable) active.size else 0} " +
                 "auth=${if (apiKey.isBlank()) "无" else "有"}"
         )
 
@@ -319,7 +327,7 @@ class OpenAiLlm(
 
             conn.inputStream.bufferedReader().use { reader ->
                 var firstToken = true
-                val filter = StreamFilter()
+                val filter = StreamFilter(active.map { it.name }.toSet())
                 while (true) {
                     val line = reader.readLine() ?: break
                     if (!line.startsWith("data:")) continue
@@ -352,7 +360,6 @@ class OpenAiLlm(
                     val text = delta.optString("content").orEmpty()
                     if (text.isEmpty()) continue
                     rawChars += text.length
-
                     // ★ 必须在这里剥 think，不能等收尾。
                     // ChatEngine 是边流边念的（攒到句号就交给 TTS），等整段回来再剥，
                     // 思考内容早就朗读出去了 —— 用户实测就是听到英文 thinking。
@@ -373,14 +380,23 @@ class OpenAiLlm(
                     onDelta(tail)
                 }
                 // ③ 文本形式的工具调用（本地模型常见）
-                if (filter.toolText.isNotBlank()) {
-                    val n = parseTextToolCalls(filter.toolText.toString(), calls)
+                if (allowTools && toolsAvailable && filter.toolText.isNotBlank()) {
+                    // ★ 工具调用正文里也可能夹着 MiniMax 标记，清掉再解析。
+                    //   实测真机原文：`]<]minimax[>[<tool_call>{...}<tool_call>
+                    //   标记在标签外面，不影响 JSON 括号配对，但留着会污染 name 字段。
+                    val cleanToolText = MINIMAX_MARK_RE_OUTER.replace(filter.toolText.toString(), "")
+                    val n = parseTextToolCalls(cleanToolText, calls)
                     Dbg.log("文本形式的工具调用：解析到 $n 个")
                 }
             }
 
-            Dbg.log("LLM 完成 ${sb.length}字（原始 ${rawChars}字）toolCalls=${calls.size}")
-            return Attempt.Ok(Round(sb.toString(), calls.values.toList()))
+            val acceptedCalls = if (allowTools && toolsAvailable) {
+                calls.values.toList()
+            } else {
+                emptyList()
+            }
+            Dbg.log("LLM 完成 ${sb.length}字（原始 ${rawChars}字）toolCalls=${acceptedCalls.size}")
+            return Attempt.Ok(Round(sb.toString(), acceptedCalls))
         } catch (t: Throwable) {
             Dbg.log("LLM 异常 ${t.javaClass.simpleName}: ${t.message}")
             return Attempt.Err(0, t.message.orEmpty())
@@ -465,11 +481,88 @@ class OpenAiLlm(
             c.id = "text-${calls.size}"
             c.name = name
             c.args.append(argsText)
-            calls[TEXT_CALL_BASE + n] = c
+            calls[nextTextCallIndex(calls)] = c
             n++
         }
-        return n
+        return n + parseXmlToolCalls(text, calls)
     }
+
+    /**
+     * MiniMax 的 M2/M3 系列在部分兼容接口上会退回 XML 工具协议：
+     *
+     *   <invoke name="web_search">
+     *     <topic>news</topic>
+     *     <time_range>day</time_range>
+     *     <query>今天的国际新闻</query>
+     *   </invoke>
+     *
+     * 原生 tool_calls 为空时，这段以前只会被当成正文。这里把它转换成与
+     * JSON 文本调用相同的 [Call]，让首轮仍能真正执行搜索。
+     */
+    private fun parseXmlToolCalls(text: String, calls: TreeMap<Int, Call>): Int {
+        if (!text.contains("<invoke", ignoreCase = true)) return 0
+
+        val invokeRegex = Regex(
+            """<invoke\s+name\s*=\s*["']([^"']+)["'][^>]*>(.*?)</invoke>""",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
+        )
+        val parameterRegex = Regex(
+            """<([A-Za-z_][A-Za-z0-9_.:-]*)([^>]*)>(.*?)</\1>""",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
+        )
+        val nameAttrRegex = Regex(
+            """name\s*=\s*["']([^"']+)["']""",
+            RegexOption.IGNORE_CASE
+        )
+
+        var count = 0
+        for (invoke in invokeRegex.findAll(text)) {
+            val name = invoke.groupValues[1].trim()
+            if (activeTools().none { it.name == name }) continue
+
+            val args = JSONObject()
+            for (parameter in parameterRegex.findAll(invoke.groupValues[2])) {
+                val tagName = parameter.groupValues[1]
+                val key = if (tagName.equals("parameter", ignoreCase = true)) {
+                    nameAttrRegex.find(parameter.groupValues[2])
+                        ?.groupValues?.get(1)
+                        ?.trim()
+                        .orEmpty()
+                } else {
+                    tagName
+                }
+                if (key.isEmpty()) continue
+                args.put(key, xmlUnescape(parameter.groupValues[3].trim()))
+            }
+
+            val argsText = if (args.length() > 0) {
+                args.toString()
+            } else {
+                invoke.groupValues[2].trim().takeIf { it.startsWith("{") } ?: continue
+            }
+            val call = Call().apply {
+                id = "xml-${calls.size}"
+                this.name = name
+                this.args.append(argsText)
+            }
+            calls[nextTextCallIndex(calls)] = call
+            count++
+        }
+        return count
+    }
+
+    private fun nextTextCallIndex(calls: TreeMap<Int, Call>): Int {
+        var index = TEXT_CALL_BASE
+        while (calls.containsKey(index)) index++
+        return index
+    }
+
+    private fun xmlUnescape(value: String): String =
+        value.replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&")
 
     /**
      * 从任意文本里切出完整的 JSON 对象。
@@ -531,7 +624,7 @@ class OpenAiLlm(
      * 为什么必须是状态机而不是 replace：SSE 的 delta 是任意切的，
      * 实测能看到 `<thi` + `nk>` 把标签拆两帧，`<tool_c` + `all>` 同理。
      */
-    private class StreamFilter {
+    private class StreamFilter(private val toolNames: Set<String>) {
 
         /** 还没判断完的尾巴：可能是半个开标签，也可能是正在吞的内容 */
         private val pending = StringBuilder()
@@ -540,10 +633,42 @@ class OpenAiLlm(
         /** 被吞掉的工具调用正文，上层解析 */
         val toolText = StringBuilder()
 
+        /**
+         * 有些兼容接口会丢掉 `<tool_call><invoke ` 开头，只从参数体开始返回：
+         *   name="web_search"><topic>news</topic>...
+         * 这些片段也必须进入工具正文模式，不能进入界面或 TTS。
+         */
+        private val orphanToolMarkers: List<String> = buildList {
+            for (name in toolNames) {
+                add("name=\"$name\"")
+                add("name='$name'")
+                add("\"name\":\"$name\"")
+                add("\"name\": \"$name\"")
+            }
+            addAll(ORPHAN_TOOL_HINTS)
+        }
+
         /** @return 这一段里可以安全上屏/朗读的部分 */
         fun feed(piece: String): String {
             pending.append(piece)
+
+            // ★★ 第一步：先在 pending 上整体剥离 MiniMax 标记。
+            //
+            //   为什么必须在 pending 这一层做，而不是在「吐出去的片段」上做：
+            //   标记会被 SSE 切成任意几帧（实测真机：
+            //     帧1: ]<]minimax[>[
+            //     帧2: <tool_call>...
+            //     帧3: ]minimax[>[
+            //   ）。如果只在单个片段上 replace，
+            //   跨帧的那部分永远匹配不上 → 标记漏进 TTS，
+            //   用户听到的就是「竖线右方括号 小猪 左方括号」。
+            //
+            //   在 pending 上做的话，只要标记凑齐就整段消失，
+            //   跨多少帧都无所谓。
+            stripMinimaxMarks()
+
             val out = StringBuilder()
+
             while (true) {
                 if (mode == MODE_THINK) {
                     val idx = pending.indexOf(CLOSE_THINK)
@@ -557,38 +682,80 @@ class OpenAiLlm(
                     continue
                 }
                 if (mode == MODE_TOOL) {
-                    val idx = pending.indexOf(CLOSE_TOOL)
-                    if (idx < 0) {
-                        val keep = suffixLen(pending, CLOSE_TOOL)
+                    // 不同服务商的文本工具协议并不完全一致。除了 </tool_call>，
+                    // MiniMax 的 XML 模板还会用 </invoke> 收尾；只认前者会让
+                    // 后面的 </invoke> 漏进正文。
+                    val close = earliestToken(pending, TOOL_CLOSE_TAGS)
+                    if (close == null) {
+                        val keep = maxOf(
+                            maxSuffixLen(pending.toString(), TOOL_CLOSE_TAGS),
+                            minimaxPrefixLen(pending.toString())
+                        )
                         toolText.append(pending, 0, pending.length - keep)
                         pending.delete(0, pending.length - keep)
                         break
                     }
-                    toolText.append(pending, 0, idx)
-                    pending.delete(0, idx + CLOSE_TOOL.length)
+                    // 保留闭标签，XML 工具解析需要完整的 <invoke>…</invoke>。
+                    toolText.append(pending, 0, close.first + close.second.length)
+                    pending.delete(0, close.first + close.second.length)
                     mode = MODE_TEXT
                     continue
                 }
 
-                // 正文：找下一个开标签，谁先出现就进哪个模式
+                // 正文：找下一个协议片段。除了正常开标签，还要处理服务端
+                // 丢掉开标签后留下的 name="web_search"、<topic> 等 XML 残片。
                 val iThink = pending.indexOf(OPEN_THINK)
-                val iTool = pending.indexOf(OPEN_TOOL)
-                val idx: Int
-                val tag: String
-                if (iThink >= 0 && (iTool < 0 || iThink < iTool)) {
-                    idx = iThink; tag = OPEN_THINK
-                } else if (iTool >= 0) {
-                    idx = iTool; tag = OPEN_TOOL
-                } else {
+                val toolOpen = earliestToken(pending, TOOL_OPEN_PREFIXES)
+                val strayClose = earliestToken(pending, TOOL_CLOSE_TAGS)
+                val orphanTool = earliestToken(pending, orphanToolMarkers)
+                val events = ArrayList<Triple<Int, Int, String>>(4)
+                if (iThink >= 0) events += Triple(iThink, EVENT_THINK, OPEN_THINK)
+                toolOpen?.let { events += Triple(it.first, EVENT_TOOL_OPEN, it.second) }
+                strayClose?.let { events += Triple(it.first, EVENT_STRAY_CLOSE, it.second) }
+                orphanTool?.let { events += Triple(it.first, EVENT_ORPHAN_TOOL, it.second) }
+
+                val event = events.minByOrNull { it.first }
+                if (event == null) {
                     // 没有完整开标签，但末尾可能是 `<thi` 这种半截
-                    val keep = maxOf(suffixLen(pending, OPEN_THINK), suffixLen(pending, OPEN_TOOL))
+                    var keep = maxOf(
+                        suffixLen(pending, OPEN_THINK),
+                        maxSuffixLen(pending.toString(), TOOL_OPEN_PREFIXES),
+                        maxSuffixLen(pending.toString(), TOOL_CLOSE_TAGS),
+                        maxSuffixLen(pending.toString(), orphanToolMarkers)
+                    )
+                    // ★ 再加上 MiniMax 标记的前缀尾巴（实测它被切成 5 帧）
+                    keep = maxOf(keep, minimaxPrefixLen(pending.toString()))
                     out.append(pending, 0, pending.length - keep)
                     pending.delete(0, pending.length - keep)
                     break
                 }
+
+                val idx = event.first
                 out.append(pending, 0, idx)
-                pending.delete(0, idx + tag.length)
-                mode = if (tag == OPEN_THINK) MODE_THINK else MODE_TOOL
+                when (event.second) {
+                    EVENT_THINK -> {
+                        pending.delete(0, idx + event.third.length)
+                        mode = MODE_THINK
+                    }
+                    EVENT_TOOL_OPEN -> {
+                        // 开标签可能带属性，例如 <invoke name="web_search">。
+                        // 等完整的 '>' 到齐后再进入工具模式。
+                        val end = pending.indexOf(">", idx + event.third.length)
+                        if (end < 0) {
+                            pending.delete(0, idx)
+                            break
+                        }
+                        pending.delete(0, end + 1)
+                        mode = MODE_TOOL
+                    }
+                    EVENT_STRAY_CLOSE -> {
+                        pending.delete(0, idx + event.third.length)
+                    }
+                    EVENT_ORPHAN_TOOL -> {
+                        pending.delete(0, idx)
+                        mode = MODE_TOOL
+                    }
+                }
             }
             return stripSpecial(out.toString())
         }
@@ -597,8 +764,14 @@ class OpenAiLlm(
         fun flush(): String {
             var rest = if (mode == MODE_TEXT) pending.toString() else ""
             if (rest.isNotEmpty()) {
-                // 末尾残留的半个标签别交出去 —— 交出去会被朗读成「小于 t h i」
-                val keep = maxOf(suffixLenText(rest, OPEN_THINK), suffixLenText(rest, OPEN_TOOL))
+                // 末尾残留的半个标签或 MiniMax 标记别交出去。
+                val keep = maxOf(
+                    maxSuffixLen(rest, TOOL_OPEN_PREFIXES),
+                    maxSuffixLen(rest, TOOL_CLOSE_TAGS),
+                    maxSuffixLen(rest, orphanToolMarkers),
+                    suffixLenText(rest, OPEN_THINK),
+                    minimaxPrefixLen(rest)
+                )
                 if (keep > 0) rest = rest.dropLast(keep)
             }
             pending.setLength(0)
@@ -607,12 +780,116 @@ class OpenAiLlm(
         }
 
         /** 去掉 chat template 的保留 token */
-        private fun stripSpecial(s: String): String =
-            if (s.indexOf('|') < 0) s else SPECIAL_TOKEN.replace(s, "")
-
+        /**
+         * 去掉不该被朗读的标记。
+         *
+         * 三类：
+         *  1. chat template 保留 token —— `<|im_end|>`、`<|minimax|>` 这类
+         *  2. MiniMax 私有分段标记 —— `]<]minimax[>[` / `]minimax[>`
+         *  3. 裸的 `minimax` 单词 —— 标记被切碎后可能只剩这个词
+         *
+         * ★ 为什么必须跨帧处理：SSE 的 delta 是任意切的，实测真机日志里
+         *   MiniMax 的标记被切成 5 帧：
+         *     帧1: ]<]minimax[>[<tool_c
+         *     帧2: all>]minimax[>]<]mi
+         *     帧3: nimax[>[<tool_call>\n
+         *     帧4: <]minimax[>[<tool_ca
+         *     帧5: ll>\n]<]minimax[>[</f
+         *   单看任何一帧都匹配不上完整标记 —— 逐帧 replace 等于没做。
+         *   所以这里用「跨帧缓冲」：只有确认不是标记前缀的尾巴才吐出去。
+         *
+         * 还有一个坑：即使一帧里恰好有完整标记，它也可能是**别的标记被切断后的残片**，
+         *   所以最后还要再扫一遍裸的 `minimax` 单词兜底。
+         */
+        private fun stripSpecial(s: String): String {
+            if (s.isEmpty()) return s
+            var out = s
+            if (out.indexOf('|') >= 0) out = SPECIAL_TOKEN.replace(out, "")
+            out = MINIMAX_MARK_RE.replace(out, "")
+            return out
+        }
         private fun suffixLen(sb: StringBuilder, tag: String): Int =
             suffixLenText(sb.toString(), tag)
 
+        private fun maxSuffixLen(s: String, tags: Collection<String>): Int =
+            tags.maxOfOrNull { suffixLenText(s, it) } ?: 0
+
+        /**
+         * 返回最先出现的 token 及其下标。只比较完整标签；
+         * 半截标签由 maxSuffixLen 留在 pending 中等待下一帧。
+         */
+        private fun earliestToken(sb: StringBuilder, tags: Collection<String>): Pair<Int, String>? {
+            var bestIndex = -1
+            var bestTag = ""
+            for (tag in tags) {
+                val index = sb.indexOf(tag)
+                if (index >= 0 && (bestIndex < 0 || index < bestIndex)) {
+                    bestIndex = index
+                    bestTag = tag
+                }
+            }
+            return if (bestIndex >= 0) bestIndex to bestTag else null
+        }
+
+        /**
+         * 末尾有多少个字符**可能**是某个 MiniMax 标记的前缀。
+         *
+         * ★ 为什么要留尾巴：SSE 的 delta 任意切，实测 MiniMax 标记被切成 5 帧：
+         *     帧1: ]<]minimax[>[<tool_c
+         *     帧2: all>]minimax[>]<]mi
+         *     帧3: nimax[>[<tool_call>\n
+         *   如果每帧都直接吐出去，第一帧的 `]<]minimax[>[` 会被切成
+         *   `]<]mi` + `nimax[>[` 两半 —— 哪一半都不匹配正则，标记就漏了。
+         *
+         *   所以吐出去之前先看看末尾：要是正好停在某个标记的前缀上，
+         *   就把它留在 pending 里等下一帧。
+         *
+         * @param s 待检查的文本
+         * @return 需要留在缓冲区里的字符数（0 = 全部可以吐）
+         */
+        /**
+         * 在 pending 上剥离 MiniMax 标记。
+         *
+         * ★ 2026-11-04 真机 raw hex 实测，MiniMax 的输出里这些标记有多种形态：
+         *
+         *   ① ]<]minimax[>[        —— 独立出现的分段标记（最常见）
+         *   ② ]minimax[>            —— 它的闭标记
+         *   ③ <tool_call>…</tool_call>
+         *   ④ <query>…</query>      —— XML 风格的参数（不是 JSON）
+         *
+         *   而且它们会被 SSE 切到任意位置，实测同一句话里
+         *   标记就横跨 3 帧：`]<]minimax[>[` / `<tool_call>...` / `]minimax[>[`
+         *
+         * 做法：用一个宽松的正则，把「标记 + 附近的分隔符」整段吃掉。
+         * 宁可多吃几个字符，也不能让标记漏进 TTS。
+         */
+        private fun stripMinimaxMarks() {
+            if (pending.length == 0) return
+            if (pending.indexOf("minimax") < 0) return
+
+            // 只删除包装标记本身。旧正则会把标记后面的 `<` 一起吃掉，
+            // 导致跨帧的 `<tool_c` + `all>` 永远拼不回 `<tool_call>`。
+            val s = MINIMAX_MARK_RE.replace(pending.toString(), "")
+            if (s == pending.toString()) return
+            pending.setLength(0)
+            pending.append(s)
+        }
+        private fun minimaxPrefixLen(s: String): Int {
+            if (s.isEmpty()) return 0
+            // 标记里可能出现的非字母字符：] < [ > 和零宽空格
+            var best = 0
+            for (marker in MINIMAX_MARK_VARIANTS) {
+                // 找出所有可能是 marker 前缀的尾巴
+                val maxLen = minOf(s.length, marker.length - 1)
+                for (n in maxLen downTo 1) {
+                    if (s.regionMatches(s.length - n, marker, 0, n)) {
+                        if (n > best) best = n
+                        break
+                    }
+                }
+            }
+            return best
+        }
         private fun suffixLenText(s: String, tag: String): Int {
             val max = minOf(s.length, tag.length - 1)
             for (n in max downTo 1) {
@@ -631,20 +908,87 @@ class OpenAiLlm(
             const val MODE_THINK = 1
             const val MODE_TOOL = 2
 
+            const val EVENT_THINK = 0
+            const val EVENT_TOOL_OPEN = 1
+            const val EVENT_STRAY_CLOSE = 2
+            const val EVENT_ORPHAN_TOOL = 3
+
             const val OPEN_THINK = "<think>"
             const val CLOSE_THINK = "</think>"
-            const val OPEN_TOOL = "<tool_call>"
             const val CLOSE_TOOL = "</tool_call>"
+            const val CLOSE_INVOKE = "</invoke>"
+            const val CLOSE_MINIMAX_TOOL = "</minimax:tool_call>"
+            val TOOL_OPEN_PREFIXES = listOf(
+                "<minimax:tool_call",
+                "<tool_call",
+                "<invoke"
+            )
+            val TOOL_CLOSE_TAGS = listOf(CLOSE_TOOL, CLOSE_INVOKE, CLOSE_MINIMAX_TOOL)
+            val ORPHAN_TOOL_HINTS = listOf(
+                "<topic>",
+                "<time_range>",
+                "<query>",
+                "topic>",
+                "time_range>",
+                "query>",
+                "\"arguments\":",
+                "\"parameters\":"
+            )
 
+            /**
+             * MiniMax 的分段标记。它们是聊天模板的控制符，不是正文。
+             *
+             * ★ 这是 2026-11-04 真机抓到的 raw hex 原文（逐码位还原，纯 ASCII，无零宽字符）：
+             *   ]<]minimax[>[<tool_call>]minimax[>]<]minimax[>[<tool_call>
+             *   <]minimax[>[<tool_call>
+             *   ]<]minimax[>[</f
+             *
+             *   拼起来就是 MiniMax 发给客户端的**文本形式工具调用**：
+             *     ]<]minimax[>[<tool_call>{json}<tool_call>
+             *   这个前缀标记是 MiniMax 私有的，不是 chat template 的保留 token，
+             *   原来的 SPECIAL_TOKEN 正则 `<\|...\|>` 完全匹配不到它 →
+             *   它就跟着工具调用正文一起漏到 TTS 里，
+             *   用户听到的就是「竖线右方括号 小猪 左方括号」这种乱码。
+             *
+             *   实测症状：模型最终播报只剩 13 个字符 —— 正好是 `]<]minimax[>[` 的长度。
+             */
             /** `<|im_end|>`、`<|minimax|>` 这类保留 token，最长也就二十来个字符 */
             val SPECIAL_TOKEN = Regex("<\\|[^<>|]{0,24}\\|>")
+
+            /**
+             * 精确匹配 MiniMax 包装标记，避免吞掉紧随其后的 `<tool_call>`。
+             * 前缀可能是 `]<]`、`<]`、`]` 或没有；后缀可能多一个 `[`/`]`。
+             */
+            val MINIMAX_MARK_RE = Regex("(?:]<]|<]|])?minimax\\[>(?:\\[|])?")
+            val MINIMAX_MARK_VARIANTS = listOf(
+                "]<]minimax[>[",
+                "<]minimax[>[",
+                "]minimax[>[",
+                "minimax[>[",
+                "]<]minimax[>",
+                "<]minimax[>",
+                "]minimax[>",
+                "minimax[>"
+            )
         }
     }
 
-    private companion object {
-        /** 最多查两轮工具。再多基本是模型在绕圈，白烧钱 */
-        const val MAX_TOOL_ROUNDS = 2
+    /**
+     * MiniMax 私有标记的总正则。
+     *
+     * ★ 2026-11-04 真机 raw hex 实测抓到的原文：
+     *   ]<]minimax[>[<tool_call>]minimax[>]<]minimax[>[<tool_call><LF>
+     *   <]minimax[>[<tool_call><LF>]<]minimax[>[</f
+     *
+     *   形态不统一：开标记有 `]<>]minimax[>[` 和 `<]minimax[>[` 两种（括号数不同），
+     *   所以用宽松字符类而不是字面量。
+     */
 
+    /** 外层用的 MiniMax 标记正则（与 StreamFilter 内部同款） */
+    private val MINIMAX_MARK_RE_OUTER =
+        Regex("(?:]<]|<]|])?minimax\\[>(?:\\[|])?")
+
+    private companion object {
         /** 重试摘要里单个工具结果的上限 */
         const val DIGEST_PER_TOOL = 1_200
 

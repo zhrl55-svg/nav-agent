@@ -7,6 +7,7 @@ import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.graphics.Color
 import android.os.Bundle
+import org.json.JSONObject
 import android.view.View
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
@@ -280,6 +281,7 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
         consumeVpTestExtra(intent)
         consumeVpEnrollExtra(intent)
         consumeTtsExtra(intent)
+        consumeWsTestExtra(intent)
         if (intent?.getStringExtra(EXTRA_DEST).isNullOrBlank()) {
             toast("地图已打开 · 说个目的地就开始导航")
         } else {
@@ -1771,6 +1773,31 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
         (application as? NavApp)?.voice?.speak(text)
     }
 
+    /**
+     * 调试入口：直接跑一次联网搜索，把结果打进日志。
+     *
+     * `adb shell am start -n com.navagent/com.navagent.app.NavActivity --es ws_test "张掖 供暖" --es ws_topic news`
+     *
+     * 用来验证参数改动（country / days / raw_content）和降级链是否真的生效，
+     * 不用每次都通过对话模型绕一圈。
+     */
+    private fun consumeWsTestExtra(intent: Intent?) {
+        val query = intent?.getStringExtra(EXTRA_WS_TEST)?.takeIf { it.isNotBlank() } ?: return
+        val topic = intent.getStringExtra(EXTRA_WS_TOPIC)?.takeIf { it.isNotBlank() } ?: "general"
+        val timeRange = intent.getStringExtra(EXTRA_WS_RANGE)?.takeIf { it.isNotBlank() }
+        Dbg.log("NavActivity 搜索自测：$query topic=$topic range=$timeRange")
+        Thread {
+            val tool = WebSearchTool { Prefs.tavilyKey }
+            val args = JSONObject()
+                .put("query", query)
+                .put("topic", topic)
+                .apply { timeRange?.let { put("time_range", it) } }
+                .toString()
+            val out = tool.execute(args)
+            Dbg.log("NavActivity 搜索自测结果：\n" + out)
+        }.apply { isDaemon = true; name = "ws-test" }.start()
+    }
+
     private fun consumeVpTestExtra(intent: Intent?) {
         if (intent?.getStringExtra(EXTRA_VP_TEST)?.takeIf { it.isNotBlank() } == null) return
         Dbg.log("NavActivity 声纹自测")
@@ -1789,6 +1816,7 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
         consumeVpTestExtra(intent)
         consumeVpEnrollExtra(intent)
         consumeTtsExtra(intent)
+        consumeWsTestExtra(intent)
         readDebugStart(intent)
         val dest = intent.getStringExtra(EXTRA_DEST)?.takeIf { it.isNotBlank() } ?: return
         app.destination = dest
@@ -2078,6 +2106,9 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
         const val EXTRA_VP_TEST = "vp_test"
         const val EXTRA_VP_ENROLL = "vp_enroll"
         const val EXTRA_TTS = "tts"
+        const val EXTRA_WS_TEST = "ws_test"
+        const val EXTRA_WS_TOPIC = "ws_topic"
+        const val EXTRA_WS_RANGE = "ws_range"
         private const val REQ_PERMS = 1002
         private const val REQ_LOCATION = 1003
         private const val REQ_MICROPHONE = 1004

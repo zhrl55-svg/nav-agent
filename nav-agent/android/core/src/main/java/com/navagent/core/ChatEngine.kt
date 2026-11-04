@@ -60,7 +60,11 @@ class ChatEngine(
     private val lock = Any()
 
     private val history = ArrayList<ChatMessage>().apply {
-        addAll(runCatching { memory.loadRecent(MAX_RESTORED_MESSAGES) }.getOrDefault(emptyList()))
+        addAll(
+            runCatching {
+                memory.loadRecent(MAX_RESTORED_MESSAGES).mapNotNull(::sanitizeRestoredMessage)
+            }.getOrDefault(emptyList())
+        )
     }
 
     /**
@@ -275,6 +279,29 @@ class ChatEngine(
 
     fun snapshot(): List<ChatMessage> = synchronized(lock) { history.toList() }
 
+    /**
+     * 旧版本曾把工具协议碎片存进本地历史。协议残留既会显示成乱文，
+     * 也会被下一轮模型当成“可模仿的回复”，所以恢复历史时先清掉。
+     *
+     * 正常的用户消息不动；助手消息中如果协议片段前后还有自然语言，
+     * 只保留自然语言部分。
+     */
+    private fun sanitizeRestoredMessage(message: ChatMessage): ChatMessage? {
+        if (message.role == ChatMessage.Role.USER) return message
+
+        var text = message.text
+        RESTORED_PROTOCOL_START.find(text)?.let {
+            text = text.substring(0, it.range.first)
+        }
+        text = TOOL_BLOCK_RE.replace(text, "")
+        text = INVOKE_BLOCK_RE.replace(text, "")
+        text = CONTROL_TAG_RE.replace(text, "")
+        text = MINIMAX_MARK_RE.replace(text, "")
+
+        val clean = text.trim()
+        return clean.takeIf { it.isNotEmpty() }?.let { message.copy(text = it) }
+    }
+
     private fun systemPrompt(query: String): String = buildString {
         append("你是「${assistantName()}」，一个在车里陪用户说话的语音助手。")
         // ★ 必须注入当前时间。模型只知道自己训练到哪天，不知道"今天"是几号，
@@ -331,6 +358,19 @@ class ChatEngine(
             append("   搜索词要具体：写「地名 + 主题」，比如「张掖 新闻」「张掖 供暖」；")
             append("   不要用「近期事件」「最近发生了什么」这种泛词，会搜到无关内容。")
             append("   一次只发一个搜索，结果不够再补第二个，不要同时发多个。")
+            // ★ 2026-11-04：新增降级链后，模型必须看懂两种结果的区别。
+            //   主搜索（Tavily）失败时会自动退到国内搜索引擎，结果长这样：
+            //     「（主搜索服务不可用：…；已改用备用搜索。）」
+            //     「备用搜索结果（来源：搜狗）」
+            //   这种结果**没有发布时间**，只有标题和摘要。
+            append("   如果结果开头写着「主搜索服务不可用…已改用备用搜索」，说明这是备用引擎的结果，")
+            append("   **没有精确的发布时间**，只有标题和摘要。这时不要说「今天」「最新」这类时间词，")
+            append("   也不要把来源说得很确定 —— 要说「搜到了一些相关网页，但没法确认具体时间」。")
+            append("   备用结果照样可以用来回答，只是要如实说明来源有限。")
+            // ★ 允许多搜一次：原来「一次只发一个搜索」把模型限制得太死，
+            //   结果不够时它不敢再搜，直接拿半截结果编。
+            append("   一次搜索结果明显不够（内容对不上题、或只有很旧的结果）时，可以再搜一次，")
+            append("   换个关键词或放宽时间范围，最多搜两次。")
             append("   若搜索摘要不足以核实关键细节，再对搜索结果中相关链接调用 web_extract；不要读取未由搜索结果提供的猜测链接。")
             append("   搜索或网页读取失败时，明确告知没有核实到实时来源，再说明能提供的背景知识及其可能过时。")
         } else {
@@ -405,6 +445,20 @@ class ChatEngine(
     }.getOrNull()
 
     private companion object {
+        val RESTORED_PROTOCOL_START = Regex(
+            """(?i)(?:name\s*=\s*["'](?:web_search|web_extract|navigate|get_weather|search_nearby)["']|["']name["']\s*:|<(?:topic|time_range|query)\b)"""
+        )
+        val TOOL_BLOCK_RE = Regex(
+            """(?is)<(?:tool_call|minimax:tool_call)\b[^>]*>.*?</(?:tool_call|minimax:tool_call)\s*>"""
+        )
+        val INVOKE_BLOCK_RE = Regex(
+            """(?is)<invoke\b[^>]*>.*?</invoke\s*>"""
+        )
+        val CONTROL_TAG_RE = Regex(
+            """(?i)</?(?:tool_call|invoke|minimax:tool_call|topic|time_range|query|parameter)(?:\s[^>]*)?>|tool_call>"""
+        )
+        val MINIMAX_MARK_RE = Regex("""(?:]<]|<]|])?minimax\[>(?:\[|])?""")
+
         /** 最多压两句，再多就把最老的挤掉 */
         const val MAX_PENDING = 2
 

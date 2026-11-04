@@ -43,6 +43,8 @@ class WebSearchTool(private val apiKey: () -> String) : LlmTool {
             "**问新闻、最近发生的事，topic 必须传 news**；查资料、常识、价格这类用 general。" +
             "新闻按时间范围传 time_range：今天或最近两三天用 day，这周用 week，这个月用 month，" +
             "说不清就不传（默认一周内）。只传 general 会搜到旧文章。\n" +
+            "搜索词要具体，写「地名 + 主题」（如「张掖 供暖」），别用「近期事件」这种泛词。\n" +
+            "**一次搜索结果不够时可以再搜一次**（换关键词或放宽时间范围），最多搜两次。\n" +
             "不要用它查本地店铺（加油站/餐厅/停车场用 search_nearby），也不要查天气（用 get_weather）。"
 
     override fun parametersJson(): String = """
@@ -66,27 +68,69 @@ class WebSearchTool(private val apiKey: () -> String) : LlmTool {
 
         val key = apiKey().trim()
         if (key.isBlank()) {
-            Dbg.log("web_search 未执行：Tavily Key 未配置")
-            return "联网搜索不可用：没有配置 Tavily 搜索 Key。请在设置→联网搜索配置 Key；本次没有联网，不能把模型记忆当作实时搜索结果。"
+            // ★ 没有 Key 也要能搜。降级链不依赖任何 Key，
+            //   实测这台手机直连搜狗/百度/Bing 只要 32~41ms。
+            //   原来这里直接返回失败，等于「没配 Tavily = 完全不能联网」，
+            //   而实际上国产引擎一直都在。
+            Dbg.log("web_search：Tavily Key 未配置，直接走备用搜索")
+            return fallback(query, "没有配置 Tavily Key")
         }
 
+        // ★★ 2026-11-04 实测重做的参数策略。原来 news 用 advanced、general 用 basic，
+        //   结果「张掖 供暖」搜回来的是 Trip.com 旅行地、日照金山、辽宁高铁 —— 全不相关，
+        //   而且 HTTP 200 一切正常。**最坏的失败是看起来成功了，其实没搜到。**
+        //
+        // 四个改动，每一个都是实测出来的：
+        //
+        // ① country=china（中文查询自动加）
+        //    加之前：Trip.com 旅行地 / 日照金山 / 辽宁高铁
+        //    加之后：张掖市权威新闻门户 / 甘州区供暖通知 / 甘肃供热新闻   ← 完全对题
+        //    Tavily 的默认检索偏向英文大站，中文本地内容全靠 country 偏置才捞得回来。
+        //    ★ 只对**含中日韩字符**的查询加；实测英文查询「Tesla latest news」
+        //      加 country=china 后结果变窄（少了 BASENOR 那种聚合站），不加更全。
+        //
+        // ② search_depth=advanced 全用（general 也不例外）
+        //    实测 general 用 basic 时 content 只有 80~100 字，
+        //    换成 advanced 后同样的查询拿到 300~2000 字的正文。
+        //    原来「general 用 basic 省时间」是误判 —— basic 省的那点时间，
+        //    换来的是模型只能看到标题然后去编。
+        //
+        // ③ include_raw_content=markdown
+        //    实测 basic/advanced 的 content 有时只是几十字的摘要，
+        //    raw_content 才是真的网页正文（张掖供热通知拿回 473 字正文）。
+        //    模型有正文才不会去猜。
+        //
+        // ④ days 替代 time_range（仅 news）
+        //    days 是天数（1~30），比 time_range 的 day/week/month 粒度细。
+        //    实测 days=3 和 days=7 结果明显不同 —— 「今天的事」用 week 会混进一周前的。
+        val isChinese = query.any { it.code in 0x4E00..0x9FFF || it.code in 0x3400..0x4DBF }
         val payload = JSONObject()
             .put("query", query)
             .put("topic", topic)
-            // 新闻要正文：basic 的 content 只有 60~90 字，全是「图片新闻」那种标题党
-            .put("search_depth", if (isNews) "advanced" else "basic")
-            // 新闻拿 5 条够筛（advanced 每条约 2KB 正文，再多只是拖时间：实测 8 条要 8.6s，6 条约 5s）
-            .put("max_results", if (isNews) 5 else 5)
+            .put("search_depth", "advanced")
+            .put("max_results", if (isNews) 6 else 5)
             // 新闻不要 Tavily 的自动摘要：中文查询它常回英文，模型还会照着念
             .put("include_answer", !isNews)
             .put("include_published_date", true)
+            // ★ 拿真正文：content 有时只是几十字摘要，raw_content 才是网页正文
+            .put("include_raw_content", "markdown")
             // ★ 排除境外敏感媒体。实测搜「国内新闻 今天」返回新唐人电视台的
-            //   「古宁头大捷 77 年」「反共战场」—— 模型按 prompt 不该展开这类内容，
+            //   「古宁大头捷 77 年」「反共战场」—— 模型按 prompt 不该展开这类内容，
             //   结果直接卡死输出 0 字。在工具层就把这些源挡掉，别让模型看见。
             .put("exclude_domains", org.json.JSONArray(SENSITIVE_DOMAINS))
             .apply {
-                val range = timeRange ?: if (isNews) "week" else null
-                if (range != null) put("time_range", range)
+                if (isChinese) put("country", "china")
+                if (isNews) {
+                    // 天数优先用模型给的 time_range 换算，其次沿用一周
+                    val days = when (timeRange) {
+                        "day" -> 1
+                        "week" -> 7
+                        "month" -> 30
+                        "year" -> null
+                        else -> 7
+                    }
+                    if (days != null) put("days", days) else put("time_range", "year")
+                }
             }
             .toString()
 
@@ -114,21 +158,54 @@ class WebSearchTool(private val apiKey: () -> String) : LlmTool {
 
             if (code !in 200..299) {
                 Dbg.log("web_search 失败 ${body.take(200)}")
-                return when (code) {
-                    401, 403 -> "联网搜索失败：Tavily Key 无效或没有权限；本次没有取得搜索结果。请明确告知用户未能核实实时信息。"
-                    429 -> "联网搜索失败：Tavily 额度不足；本次没有取得搜索结果。请明确告知用户未能核实实时信息。"
-                    else -> "联网搜索失败（HTTP $code）；本次没有取得搜索结果。请明确告知用户未能核实实时信息，再谨慎提供可能过时的背景知识。"
+                // ★★ Tavily 任何一种失败都不该直接终结 —— 退到国内引擎再试一次。
+                //   实测这台手机上搜狗/百度/Bing 全部直连可达（32~41ms），
+                //   Tavily 挂了不该等于「搜不到」。
+                val reason = when (code) {
+                    401, 403 -> "Tavily Key 无效或没有权限"
+                    429 -> "Tavily 额度不足"
+                    else -> "Tavily 返回 HTTP $code"
                 }
+                return fallback(query, reason)
             }
 
             val json = JSONObject(body)
             val out = if (isNews) renderNews(json, query) else renderGeneral(json)
-            return out.ifBlank { "没搜到「$query」的相关内容" }
+            if (out.isNotBlank()) return out
+
+            // ★ Tavily 返回了 200 但结果为空 / 全被过滤掉 —— 这也是失败。
+            //   实测「张掖 供暖」就会这样：返回一堆不相关的旅行地，
+            //   过滤后一条不剩。静默返回「没搜到」不如换个引擎再试。
+            Dbg.log("web_search 结果为空或不相关，降级")
+            return fallback(query, "Tavily 没返回可用结果")
         } catch (t: Throwable) {
             Dbg.log("web_search 异常 ${t.javaClass.simpleName}: ${t.message}")
-            "搜索出错了：${t.message ?: t.javaClass.simpleName}"
+            // 网络异常同样降级 —— Tavily 超时不代表国内引擎也超时
+            fallback(query, "Tavily 连接失败（${t.javaClass.simpleName}）")
         } finally {
             conn?.disconnect()
+        }
+    }
+
+    /**
+     * 降级到国内搜索引擎。
+     *
+     * @param reason Tavily 失败的原因，会写进给模型看的说明里
+     * @return 给模型的结果文本
+     */
+    private fun fallback(query: String, reason: String): String {
+        val t0 = System.currentTimeMillis()
+        val result = FallbackWebSearch.search(query)
+        if (result == null) {
+            Dbg.log("降级搜索也失败：全部引擎无结果 ${System.currentTimeMillis() - t0}ms")
+            return "联网搜索失败：$reason，并且备用搜索也没有取得结果。" +
+                "本次没有取得任何实时来源，请明确告知用户未能核实实时信息，" +
+                "再谨慎提供可能过时的背景知识。"
+        }
+        Dbg.log("降级搜索成功 ${result.engine} ${System.currentTimeMillis() - t0}ms")
+        return buildString {
+            append("（主搜索服务不可用：").append(reason).append("；已改用备用搜索。）\n")
+            append(FallbackWebSearch.render(result, query))
         }
     }
 
@@ -150,7 +227,11 @@ class WebSearchTool(private val apiKey: () -> String) : LlmTool {
             // 境外敏感源整条丢弃 —— 详见 isBlockedSource 的注释，
             // 不过滤的话整轮请求会被模型服务端 422 拒掉
             if (isBlockedSource(r.optString("url"))) return@mapNotNull null
-            val content = r.optString("content").trim()
+            // ★ raw_content 才是真网页正文，content 有时只是几十字摘要。
+            //   实测「张掖 供暖」带 raw_content 时拿回 473~2000 字正文，
+            //   不带只有 78~100 字。模型有正文才不会去编。
+            val content = cleanBody(r.optString("raw_content").trim()
+                .ifBlank { r.optString("content").trim() })
             val rawTitle = r.optString("title").trim()
             // 乱码标题（GBK 站点被按 UTF-8 解）直接丢掉标题，用域名顶上
             val title = if (rawTitle.contains('\uFFFD') || rawTitle.count { it.code in 0xE000..0xF8FF } > 2) {
@@ -167,9 +248,14 @@ class WebSearchTool(private val apiKey: () -> String) : LlmTool {
 
         // 有正文的优先，短条目补位 —— 不能只留「有正文」的，
         // 实测中文新闻大半是转载短讯，过滤太狠会只剩 1 条，模型没得选
-        val solid = all.filter { it.content.length >= MIN_NEWS_CONTENT }
+        //
+        // ★ 导航页过滤：正文大半是站点导航（首页/登录/招标/图片）时，
+        //   这条对模型没有任何信息量，只会把它带偏。
+        //   实测「石家庄…管廊监理终止公告」整条正文全是「[首页] [招标] 会员登录」。
+        //   判定：导航特征词占的比例过高就降级成 thin（排到最后）。
+        val solid = all.filter { it.content.length >= MIN_NEWS_CONTENT && !isNavNoise(it.content) }
             .sortedByDescending { it.published }
-        val thin = all.filter { it.content.length < MIN_NEWS_CONTENT }
+        val thin = all.filter { it.content.length < MIN_NEWS_CONTENT || isNavNoise(it.content) }
             .sortedByDescending { it.published }
         val picked = (solid + thin).take(NEWS_MAX_ITEMS)
         if (picked.isEmpty()) return ""
@@ -214,7 +300,10 @@ class WebSearchTool(private val apiKey: () -> String) : LlmTool {
             val published = r.optString("published_date").takeIf { it.isNotBlank() && it != "null" }
             if (published != null) append(" · 发布/更新：").append(published)
             append("\n")
-            val content = r.optString("content").trim()
+            // 同上：raw_content 优先，它是真正文
+            val content = cleanBody(r.optString("raw_content").trim()
+                .ifBlank { r.optString("content").trim() })
+                .ifBlank { r.optString("content").trim() }
             if (content.isNotEmpty()) {
                 append("  ").append(content.take(420)).append("\n")
             }
@@ -249,6 +338,108 @@ class WebSearchTool(private val apiKey: () -> String) : LlmTool {
         }
     }
 
+    /**
+     * 清洗正文。
+     *
+     * ★ 为什么必须洗：raw_content 是 markdown 格式的网页正文，
+     *   实测拿到的是这样的东西：
+     *     ![](https://x0.ifengimg.com/ucms/2025_29/DB9A...png)
+     *     * [首页](/ "建设工程招标网")
+     *     * [招标](/invite.html "建设工程招标网")
+     *     会员登录 ![](/images/arrowBottom.png)
+     *
+     *   这些图片和站点导航占了正文一大半，真正有用的那句话反而被挤到中间。
+     *   不洗的话模型读到的全是导航菜单，答出来就是「该网站提供招标信息服务」。
+     *
+     * 洗掉的：markdown 图片、链接的 URL 部分、残留的 HTML 标签、空行。
+     * 保留的：正文文字、链接的可读文字（标题常常就在里面）。
+     */
+    /**
+     * 判断正文是不是站点导航/页面框架而不是真内容。
+     *
+     * 判据：导航特征词出现的次数，占正文行数的比例过高就判定为导航。
+     * 真实新闻正文里几乎不会出现「会员登录」「版权所有」「友情链接」这类词，
+     * 而一个导航页几乎全是这些词。
+     */
+    /**
+     * 判断正文是不是站点导航/页面框架而不是真内容。
+     *
+     * 两个判据（任一命中就判定为导航页）：
+     *
+     * ① 导航特征词密度过高 —— 命中数达到非空行数的一半。
+     *    真实新闻正文里几乎不会出现「会员登录」「版权所有」「友情链接」，
+     *    而一个导航页几乎全是这些词。
+     *
+     * ② 没有任何一段像正文的长句 —— 所有非空行都很短（< 12 字）。
+     *    「首页 / 招标 / 项目 / 会员登录」这种导航菜单每行就两三个字，
+     *    而真正文一定有像「每年交采暖费，最闹心的一件事…」这样的长句。
+     *    ★ 这个判据比特征词密度更准：实测那条石家庄招标公告
+     *    导航词只占小半（后面还有「发布日期」「所属地区」这些表单字段），
+     *    但正文段落全是短行，靠特征词密度抓不住。
+     */
+    /**
+     * 判断正文是不是站点导航/页面框架而不是真内容。
+     *
+     * 三个判据（任一命中就判定为导航页）：
+     *
+     * ① 导航特征词密度过高 —— 命中数达到非空行数的一半。
+     *    真实新闻正文里几乎不会出现「会员登录」「版权所有」「友情链接」，
+     *    而一个导航页几乎全是这些词。
+     *
+     * ② 短行占比过高 —— 超过一半的非空行都不到 12 个字。
+     *    导航菜单每行两三个字（首页 / 招标 / 会员中心），
+     *    真正文一定有连续十几个字以上的句子。
+     *
+     * ③ 「有导航词」且「短行多」同时成立。
+     *    ★ 只看长行会被表单字段骗过：那条石家庄招标公告里有
+     *    「发布日期：2026-10-30」「所属地区：河北省 石家庄市」这样的长行，
+     *    但整篇仍然是页面框架。两个条件同时看才抓得住。
+     */
+    private fun isNavNoise(content: String): Boolean {
+        if (content.length < MIN_NEWS_CONTENT) return false
+        val nonEmpty = content.lines().filter { it.isNotBlank() }
+        if (nonEmpty.isEmpty()) return true
+        val hits = NAV_MARKERS.count { content.contains(it) }
+        if (hits * 2 >= nonEmpty.size) return true
+        val shortLines = nonEmpty.count { it.length < LONG_LINE_CHARS }
+        val shortRatio = shortLines * 2 >= nonEmpty.size
+        // 导航词 + 短行占多数 → 页面框架
+        if (hits > 0 && shortRatio) return true
+        // 一行长句都没有 → 纯菜单
+        return nonEmpty.none { it.length >= LONG_LINE_CHARS }
+    }
+    /**
+     * 清洗正文。
+     *
+     * ★ 为什么必须洗：raw_content 是 markdown 格式的网页正文，
+     *   实测拿到的是这样的东西：
+     *     ![](https://x0.ifengimg.com/ucms/2025_29/DB9A...png)
+     *     * [首页](/ "建设工程招标网")
+     *     * [招标](/invite.html "建设工程招标网")
+     *     会员登录 ![](/images/arrowBottom.png)
+     *
+     *   这些图片和站点导航占了正文一大半，真正有用的那句话反而被挤到中间。
+     *   不洗的话模型读到的全是导航菜单，答出来就是「该网站提供招标信息服务」。
+     *
+     * 洗掉的：markdown 图片、链接的 URL 部分、残留的 HTML 标签、空行。
+     * 保留的：正文文字、链接的可读文字（标题常常就在里面）。
+     */
+    private fun cleanBody(raw: String): String {
+        if (raw.isBlank()) return ""
+        var s = raw
+        // markdown 图片：![alt](url) → 删掉（alt 常常是空）
+        s = s.replace(Regex("!\\[[^\\]]*\\]\\([^)]*\\)"), " ")
+        // markdown 链接：[text](url) → text
+        s = s.replace(Regex("\\[([^\\]]*)\\]\\([^)]*\\)"), "$1")
+        // 残留 HTML 标签
+        s = s.replace(Regex("<[^>]{1,80}>"), " ")
+        // 行内 markdown 强调符号
+        s = s.replace(Regex("[*_`]{1,3}"), "")
+        // 压缩空白，但保留段落换行（模型按段落读更自然）
+        s = s.replace(Regex("[ \\t\\u00A0]+"), " ")
+        s = s.replace(Regex("(\\s*\\n\\s*){3,}"), "\n\n")
+        return s.trim()
+    }
     private fun hostOf(url: String): String =
         runCatching { URL(url).host.removePrefix("www.") }.getOrDefault("（标题乱码）")
 
@@ -277,6 +468,14 @@ class WebSearchTool(private val apiKey: () -> String) : LlmTool {
         const val ENDPOINT = "https://api.tavily.com/search"
 
         /** 短于这个长度的新闻正文基本是图注/版面导航，不算内容 */
+        /**
+         * 正文里「像正文」的最小行长（字）。
+         *
+         * 导航菜单每行两三个字（首页 / 招标 / 会员中心），
+         * 真正文一定有连续十几个字以上的句子。
+         */
+        const val LONG_LINE_CHARS = 20
+
         const val MIN_NEWS_CONTENT = 120
 
         /**
@@ -306,7 +505,18 @@ class WebSearchTool(private val apiKey: () -> String) : LlmTool {
         )
 
         /** 新闻最多给模型几条。多了占上下文，也拖慢首字 */
-        const val NEWS_MAX_ITEMS = 5
+        /**
+         * 站点导航特征词。用来识别「抓到的其实是页面框架，不是文章正文」。
+         *
+         * 命中数达到正文行数的一半 → 判定为导航页。
+         */
+        val NAV_MARKERS = listOf(
+            "会员登录", "登录", "注册", "首页", "版权所有", "友情链接", "网站地图",
+            "联系我们", "关于我们", "广告", "订阅", "上一篇", "下一篇", "免责声明",
+            "更多精彩", "热门推荐", "相关推荐", "点击查看"
+        )
+
+        const val NEWS_MAX_ITEMS = 6
 
         /**
          * 境外敏感媒体黑名单。
