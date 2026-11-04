@@ -175,6 +175,53 @@ class LocalMemoryStore(context: Context) :
         writableDatabase.delete("memory_facts", "id = ?", arrayOf(id.toString()))
     }
 
+    /**
+     * 从设置页新增或编辑一条长期记忆。
+     *
+     * @param id 为 null 时新增；有值时原地更新，保留原有分类和稳定 key。
+     * @return 内容为空、超过长度限制或写库失败时返回 false。
+     */
+    @Synchronized
+    fun saveFact(id: Long?, value: String): Boolean {
+        val fact = value.trim()
+            .replace(Regex("[\\t\\u00A0]+"), " ")
+            .replace(Regex("\\n{3,}"), "\n\n")
+        if (fact.length !in 2..MAX_FACT_CHARS) return false
+
+        val db = writableDatabase
+        val now = System.currentTimeMillis()
+        if (id != null) {
+            val updated = db.update(
+                "memory_facts",
+                ContentValues().apply {
+                    put("fact_value", fact)
+                    put("updated_at", now)
+                },
+                "id = ?",
+                arrayOf(id.toString())
+            )
+            if (updated > 0) {
+                pruneFacts()
+                return true
+            }
+        }
+
+        val key = "manual_${fact.hashCode().toUInt().toString(16)}"
+        val inserted = db.insertWithOnConflict(
+            "memory_facts",
+            null,
+            ContentValues().apply {
+                put("category", "manual")
+                put("fact_key", key)
+                put("fact_value", fact)
+                put("updated_at", now)
+            },
+            SQLiteDatabase.CONFLICT_REPLACE
+        )
+        if (inserted != -1L) pruneFacts()
+        return inserted != -1L
+    }
+
     @Synchronized
     override fun contextFor(query: String): String {
         val all = facts()
@@ -273,17 +320,17 @@ class LocalMemoryStore(context: Context) :
         return normalized.windowed(2).toSet()
     }
 
-    private companion object {
-        const val DB_NAME = "local_memory.db"
-        const val DB_VERSION = 1
-        const val ROLE_USER = "user"
-        const val ROLE_ASSISTANT = "assistant"
-        const val MAX_MESSAGES = 500
-        const val MAX_FACTS = 30
+    companion object {
         const val MAX_FACT_CHARS = 200
-        const val MAX_CONTEXT_CHARS = 1_200
+        private const val DB_NAME = "local_memory.db"
+        private const val DB_VERSION = 1
+        private const val ROLE_USER = "user"
+        private const val ROLE_ASSISTANT = "assistant"
+        private const val MAX_MESSAGES = 500
+        private const val MAX_FACTS = 30
+        private const val MAX_CONTEXT_CHARS = 1_200
 
-        val REMEMBER_PATTERN = Regex(
+        private val REMEMBER_PATTERN = Regex(
             "(?:请|帮我|麻烦)?(?:你)?记住(?:一下|住)?[：:，,\\s]*(.+)$",
             setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
         )

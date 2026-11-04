@@ -905,7 +905,7 @@ class SettingsActivity : AppCompatActivity() {
             .show()
     }
 
-    /** 查看本地记忆。最近对话只展示摘要，长期偏好可逐条删除。 */
+    /** 查看本地记忆。最近对话只展示摘要，长期偏好可新增、编辑和删除。 */
     private fun showLocalMemory() {
         val stats = app.memory.stats()
         val facts = app.memory.facts()
@@ -932,33 +932,93 @@ class SettingsActivity : AppCompatActivity() {
         AlertDialog.Builder(this)
             .setTitle("本地记忆")
             .setMessage(body)
-            .setPositiveButton("管理偏好") { _, _ -> showFactManager(facts) }
+            .setPositiveButton("管理长期记忆") { _, _ -> showFactManager() }
             .setNegativeButton("关闭", null)
             .show()
     }
 
-    private fun showFactManager(facts: List<MemoryFact>) {
+    private fun showFactManager() {
+        val facts = app.memory.facts()
+        val builder = AlertDialog.Builder(this)
+            .setTitle("长期记忆")
+            .setPositiveButton("添加") { _, _ -> showFactEditor(null) }
+            .setNegativeButton("关闭", null)
         if (facts.isEmpty()) {
-            toast("还没有长期偏好。说“记住我不走高速”即可添加")
-            return
+            builder.setMessage(
+                "还没有长期记忆。\n\n" +
+                    "可以在这里手动添加，也可以在对话中说“记住我不走高速”。"
+            )
+        } else {
+            builder.setItems(facts.map { it.value }.toTypedArray()) { _, which ->
+                showFactActions(facts[which])
+            }
         }
+        builder.show()
+    }
+
+    private fun showFactActions(fact: MemoryFact) {
         AlertDialog.Builder(this)
-            .setTitle("点一条删除长期偏好")
-            .setItems(facts.map { it.value }.toTypedArray()) { _, which ->
-                val fact = facts[which]
-                AlertDialog.Builder(this)
-                    .setTitle("删除这条记忆？")
-                    .setMessage(fact.value)
-                    .setPositiveButton("删除") { _, _ ->
-                        app.memory.deleteFact(fact.id)
-                        toast("已删除")
-                        render()
-                    }
-                    .setNegativeButton("取消", null)
-                    .show()
+            .setTitle(fact.value)
+            .setItems(arrayOf("编辑", "删除")) { _, which ->
+                when (which) {
+                    0 -> showFactEditor(fact)
+                    1 -> confirmDeleteFact(fact)
+                }
             }
             .setNegativeButton("取消", null)
             .show()
+    }
+
+    private fun confirmDeleteFact(fact: MemoryFact) {
+        AlertDialog.Builder(this)
+            .setTitle("删除这条长期记忆？")
+            .setMessage(fact.value)
+            .setPositiveButton("删除") { _, _ ->
+                app.memory.deleteFact(fact.id)
+                toast("已删除")
+                render()
+                showFactManager()
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun showFactEditor(fact: MemoryFact?) {
+        val input = EditText(this).apply {
+            setText(fact?.value.orEmpty())
+            hint = "例如：我走高速时不走夜间路线"
+            setTextColor(Color.parseColor("#1B1B1B"))
+            setHintTextColor(Color.parseColor("#8A8A8A"))
+            background = roundBg(Color.parseColor("#F1F3F2"), 8f)
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+            minLines = 3
+            maxLines = 6
+        }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle(if (fact == null) "添加长期记忆" else "编辑长期记忆")
+            .setView(input)
+            .setPositiveButton("保存", null)
+            .setNegativeButton("取消", null)
+            .create()
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val value = input.text.toString().trim()
+                when {
+                    value.length < 2 -> input.error = "至少输入 2 个字"
+                    value.length > LocalMemoryStore.MAX_FACT_CHARS ->
+                        input.error = "最多 ${LocalMemoryStore.MAX_FACT_CHARS} 个字"
+                    app.memory.saveFact(fact?.id, value) -> {
+                        toast(if (fact == null) "长期记忆已添加" else "长期记忆已更新")
+                        dialog.dismiss()
+                        render()
+                        showFactManager()
+                    }
+                    else -> input.error = "保存失败，请重试"
+                }
+            }
+        }
+        dialog.show()
     }
 
     // ---------------------------------------------------------------- 模型
