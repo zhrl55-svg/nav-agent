@@ -243,7 +243,12 @@ class AmapNavController(
         pendingPlace = null
         // 新的一次导航 → 解除「停止中」标志
         stopRequested = false
-        onState("正在解析「$destination」…")
+        // ★ 中间态不弹提示（2026-11-04）：
+        //   原来「正在解析」+「正在规划到X的路线」+「导航中→X」三条连着弹，
+        //   1.2 秒内刷四五个 toast，看着像出故障（用户反馈：「是不是打架的进程」）。
+        //   中间态 1~2 秒就过去了，弹出来只是闪一下；
+        //   真正的反馈是语音播报 + 最后的「导航中 → X」。
+        Dbg.log("解析目的地「$destination」…")
         // ★ 城市偏置要等城市名解析出来。
         //   定位回调里坐标是先到的，`loc.city` 要靠 setNeedAddress(true) 反查地址，
         //   慢一拍（实测差几百毫秒）。hasFix 一变 true 就去搜索的话，
@@ -450,10 +455,13 @@ class AmapNavController(
         )
         Dbg.log("calculateDriveRoute 返回=$ok")
         post {
-            onState(
-                if (ok) "正在规划到 ${point.formatted} 的路线…" else "算路请求发送失败"
-            )
-            if (!ok) voice.speak("路线规划失败，换个说法试试", VoiceGuide.Priority.USER)
+            // 中间态不弹 toast（见 resolvePlace 里的说明）—— 只在失败时提示
+            if (ok) {
+                Dbg.log("正在规划到 ${point.formatted} 的路线…")
+            } else {
+                onState("算路请求发送失败")
+                voice.speak("路线规划失败，换个说法试试", VoiceGuide.Priority.USER)
+            }
         }
     }
 
@@ -760,15 +768,20 @@ class AmapNavController(
                 place.city != currentCity
             onState(if (navigating) "导航中 → $where" else "启动导航失败")
             if (navigating) {
-                val stat = spokenDistance(pathRemainMeters) + "，" + spokenDuration(pathRemainSeconds)
-                val text = when {
-                    wasNavigating && farAway -> "已改道，目的地在外地：$where，全程$stat"
-                    wasNavigating -> "已改道去$where，全程$stat"
-                    farAway -> "注意，目的地不在${currentCity}：$where，全程$stat"
-                    else -> "开始导航去$where，全程$stat"
-                }
-                Dbg.log("播报目的地=$where 跨市=$farAway")
-                voice.speak(text, VoiceGuide.Priority.NAV)
+                // ★ ★ 导航开始的播报**完全交给高德**（2026-11-04）
+                //   高德自己会播：「准备出发，全程2.6公里，大约9分钟，左转，随后…」
+                //   —— 完整、准确、带转向。
+                //
+                //   以前我们自己**也**播一句「开始导航去X，全程2.6公里」，
+                //   两条都是 NAV 优先级 → 互相 tts.stop() 打断
+                //   → 用户听到的是断断续续的（用户反馈：「播报会被中断」）。
+                //
+                //   ★ 跨市提醒也不额外播：
+                //     高德的播报是 SDK 内部直接调 TTS，不经过我们的 VoiceGuide，
+                //     我们 tts.stop() 拦不住它 —— 实测我们的提醒 0.65 秒就被打断。
+                //     而且高德那句「全程1516公里，17小时」本身就会让用户意识到是长途，
+                //     界面提示「导航中 → 石家庄市桥西区石家庄站」也带了城市全称。
+                Dbg.log("导航播报交给高德（我们不重复）=$where 跨市=$farAway 改道=$wasNavigating")
                 onHud(
                     NavHud(
                         navigating = true,

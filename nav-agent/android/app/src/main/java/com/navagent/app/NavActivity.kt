@@ -646,7 +646,8 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
                 Prefs.rememberDestination(poi.name)
                 app.destination = poi.name
                 nav.navigateTo(poi.name)
-                toast("正在规划到 ${poi.name} …")
+                // 不弹「正在规划…」—— 中间态 1 秒就过去了，
+                // 弹出来只是闪一下，还会跟高德的「准备出发」播报抢注意力
                 Dbg.log("搜索栏选择 → ${poi.name} (${poi.latitude},${poi.longitude})")
             }
             list.addView(
@@ -1216,7 +1217,6 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
                 Prefs.rememberDestination(dest)
                 app.destination = dest
                 nav.navigateTo(dest)
-                toast("正在规划到 $dest …")
                 Dbg.log("历史目的地选择 → $dest")
             }
             .setNegativeButton("取消", null)
