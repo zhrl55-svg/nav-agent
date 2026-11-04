@@ -298,7 +298,10 @@ class ChatEngine(
         append("   「别烦我了」这类要你别说话，**必须调 navigate 工具的 action=sleep**，")
         append("   然后简短回一句（比如「好，有事叫我」）就不要再说了。")
         append("   不要把休眠说成「好的我知道了」却继续聊天 —— 那等于没执行。")
-        append("3) 问天气调 get_weather；找附近店铺调 search_nearby。")
+        append("3) 问天气调 get_weather；找店铺调 search_nearby。")
+        append("用户说「附近、周边、周围」时传 scope=current；")
+        append("说「沿途、顺路、路上」时传 scope=route，搜索当前导航剩余路线两侧。")
+        append("只有导航中才能做沿途搜索；不在导航中时先如实告诉用户。")
         if (webSearchAvailable()) {
             append("用户询问新闻、价格、政策、近期人物/事件、当前版本或其他实时/可能变化的信息时，")
             append("必须先调用 web_search；不得只凭训练记忆回答或暗示已联网。")

@@ -177,6 +177,7 @@ class NavApp : Application() {
                     NearbyTool(
                         context = this,
                         location = { nav?.currentLocation() },
+                        route = { nav?.remainingRoutePoints() },
                         radius = { Prefs.nearbyRadius },
                         onResult = {
                             // 模型搜完之后用户只说「去这家」，navigate 工具能拿它兜底

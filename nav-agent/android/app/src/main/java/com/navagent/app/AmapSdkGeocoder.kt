@@ -13,6 +13,9 @@ import com.amap.api.services.geocoder.GeocodeQuery
 import com.amap.api.services.geocoder.GeocodeSearch
 import com.amap.api.services.poisearch.PoiResult
 import com.amap.api.services.poisearch.PoiSearch
+import com.amap.api.services.routepoisearch.RoutePOISearch
+import com.amap.api.services.routepoisearch.RoutePOISearchQuery
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -98,6 +101,12 @@ object AmapSdkGeocoder {
         val district: String = ""
     )
 
+    /** 导航路线上的一个坐标点，按行驶方向排列。 */
+    data class RoutePoint(
+        val latitude: Double,
+        val longitude: Double
+    )
+
     /** 定位结果 */
     data class Fix(val latitude: Double, val longitude: Double, val city: String)
 
@@ -115,6 +124,15 @@ object AmapSdkGeocoder {
      *   搜索栏里同样的调用几百毫秒就来，是因为那时还没被 GC 回收。
      */
     private var lastSearch: PoiSearch? = null
+
+    /** RoutePOISearch 同样要持有强引用，避免异步任务执行前被 GC 回收。 */
+    private var lastRouteSearch: RoutePOISearch? = null
+
+    /**
+     * 沿途通用搜索会同时发多个周边请求。只用一个 lastSearch 字段会被后一个
+     * 请求覆盖，这里集中持有并在回调后释放。
+     */
+    private val activeAroundSearches = CopyOnWriteArrayList<PoiSearch>()
 
     /**
      * 高德 SDK 的隐私合规。**必须在任何 SDK 调用之前**做，否则定位和搜索都会失败。
@@ -312,6 +330,7 @@ object AmapSdkGeocoder {
 
         runCatching {
             val search = PoiSearch(context.applicationContext, query)
+            activeAroundSearches.add(search)
             // radius=0 表示不限距离，但配合 setDistanceSort 就按距离排
             search.setBound(
                 PoiSearch.SearchBound(
@@ -322,6 +341,7 @@ object AmapSdkGeocoder {
             )
             search.setOnPoiSearchListener(object : PoiSearch.OnPoiSearchListener {
                 override fun onPoiSearched(result: PoiResult?, code: Int) {
+                    activeAroundSearches.remove(search)
                     if (code != 1000) {
                         Dbg.log("高德周边搜索失败 code=$code keyword=$keyword")
                         onResult(emptyList())
@@ -340,12 +360,130 @@ object AmapSdkGeocoder {
                 }
 
                 override fun onPoiItemSearched(item: PoiItem?, code: Int) {
+                    activeAroundSearches.remove(search)
                 }
             })
             search.searchPOIAsyn()
         }.onFailure {
             Dbg.log("高德周边搜索异常：${it.message}")
             onResult(emptyList())
+        }
+    }
+
+    /**
+     * 沿当前导航路线搜索官方支持的常见 POI 类型。
+     *
+     * 高德 `RoutePOISearch` 一次请求就能沿整条路线搜索，比在路线上取多个圆心
+     * 反复做周边搜索更省流量，也不会漏掉两个采样圆之间的地点。
+     * 它只支持固定类别；其他关键词由 [NearbyTool] 做采样兜底。
+     *
+     * @param route 当前导航剩余路线，必须按行驶方向排列
+     * @param radius 路线两侧的搜索宽度，高德该接口最大支持 3000 米
+     */
+    fun searchAlongRoute(
+        context: Context,
+        route: List<RoutePoint>,
+        keyword: String,
+        radius: Int,
+        limit: Int,
+        onResult: (List<Poi>) -> Unit
+    ) {
+        init(context)
+        val type = routePoiSearchType(keyword)
+        if (type == null || route.size < 2) {
+            onResult(emptyList())
+            return
+        }
+        val safeRadius = radius.coerceIn(200, 3_000)
+        val polyline = sampleRouteForQuery(route).map {
+            LatLonPoint(it.latitude, it.longitude)
+        }
+        runCatching {
+            val query = RoutePOISearchQuery(
+                polyline,
+                type,
+                safeRadius
+            )
+            val search = RoutePOISearch(context.applicationContext, query)
+            lastRouteSearch = search
+            search.setPoiSearchListener(object : RoutePOISearch.OnRoutePOISearchListener {
+                override fun onRoutePoiSearched(
+                    result: com.amap.api.services.routepoisearch.RoutePOISearchResult?,
+                    code: Int
+                ) {
+                    if (code != 1000) {
+                        Dbg.log("高德沿途搜索失败 code=$code keyword=$keyword type=$type")
+                        onResult(emptyList())
+                        return
+                    }
+                    val pois = result?.routePois.orEmpty()
+                        .mapNotNull { item ->
+                            val point = item.point ?: return@mapNotNull null
+                            Poi(
+                                name = item.title ?: keyword,
+                                distance = item.distance.toInt(),
+                                latitude = point.latitude,
+                                longitude = point.longitude
+                            )
+                        }
+                        .sortedBy { it.distance }
+                        .take(limit)
+                    Dbg.log(
+                        "高德沿途命中 ${pois.size} 个 keyword=$keyword type=$type radius=$safeRadius：" +
+                            pois.joinToString { "${it.name}(${it.distance}m)" }
+                    )
+                    onResult(pois)
+                }
+            })
+            search.searchRoutePOIAsyn()
+        }.onFailure {
+            Dbg.log("高德沿途搜索异常：${it.message}")
+            onResult(emptyList())
+        }
+    }
+
+    /** 当前关键词是否可由高德官方 RoutePOISearch 直接查询。 */
+    fun supportsAlongRouteSearch(keyword: String): Boolean =
+        routePoiSearchType(keyword) != null
+
+    private fun routePoiSearchType(
+        keyword: String
+    ): RoutePOISearch.RoutePOISearchType? {
+        val k = keyword.trim()
+        if (k.isBlank()) return null
+        fun has(vararg words: String) = words.any { k.contains(it) }
+        return when {
+            has("充电站", "充电桩", "充电") ->
+                RoutePOISearch.RoutePOISearchType.TypeChargeStation
+            has("加气站", "加气") ->
+                RoutePOISearch.RoutePOISearchType.TypeFillingStation
+            has("加油站", "加油", "油站") ->
+                RoutePOISearch.RoutePOISearchType.TypeGasStation
+            has("维修", "修车", "汽修", "保养") ->
+                RoutePOISearch.RoutePOISearchType.TypeMaintenanceStation
+            has("ATM", "atm", "取款", "取钱") ->
+                RoutePOISearch.RoutePOISearchType.TypeATM
+            has("厕所", "卫生间", "洗手间") ->
+                RoutePOISearch.RoutePOISearchType.TypeToilet
+            has("服务区") ->
+                RoutePOISearch.RoutePOISearchType.TypeServiceArea
+            has("餐厅", "饭店", "饭馆", "吃饭", "美食", "小吃", "咖啡") ->
+                RoutePOISearch.RoutePOISearchType.TypeFood
+            has("酒店", "宾馆", "旅馆", "住宿") ->
+                RoutePOISearch.RoutePOISearchType.TypeHotel
+            else -> null
+        }
+    }
+
+    /** 路线很长时降采样，避免一次请求塞入过多坐标点。 */
+    private fun sampleRouteForQuery(
+        route: List<RoutePoint>,
+        maxPoints: Int = 500
+    ): List<RoutePoint> {
+        if (route.size <= maxPoints) return route
+        val last = route.lastIndex
+        return List(maxPoints) { i ->
+            route[(i.toLong() * last / (maxPoints - 1)).toInt()]
         }
     }
 

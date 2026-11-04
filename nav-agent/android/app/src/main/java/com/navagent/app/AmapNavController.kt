@@ -11,6 +11,7 @@ import com.amap.api.navi.AMapNavi
 import com.amap.api.navi.enums.NaviType
 import com.amap.api.navi.enums.PathPlanningStrategy
 import com.amap.api.navi.model.AMapCalcRouteResult
+import com.amap.api.navi.model.AMapNaviLocation
 import com.amap.api.navi.model.NaviInfo
 import com.amap.api.navi.model.NaviLatLng
 import com.navagent.core.NavController
@@ -83,6 +84,17 @@ class AmapNavController(
     @Volatile private var lastLat = 0.0
     @Volatile private var lastLon = 0.0
     @Volatile private var hasFix = false
+
+    /**
+     * 高德导航车标的实时位置。
+     *
+     * 定位客户端的坐标不一定跟导航车标同步：模拟导航时它停在出发点，部分车机
+     * 也会让两者有几秒延迟。沿途搜索必须用这个坐标，否则会把已经走过的路段
+     * 重新算进「前方」。
+     */
+    @Volatile private var navLat = 0.0
+    @Volatile private var navLon = 0.0
+    @Volatile private var hasNavCoord = false
 
     /**
      * 当前城市（如"张掖市"）。用来给地理编码/POI 搜索做偏置。
@@ -275,6 +287,7 @@ class AmapNavController(
         // 新的一次导航 → 解除「停止中」标志
         stopRequested = false
         cancelPendingRoute = false
+        hasNavCoord = false
         // ★ 中间态不弹提示（2026-11-04）：
         //   原来「正在解析」+「正在规划到X的路线」+「导航中→X」三条连着弹，
         //   1.2 秒内刷四五个 toast，看着像出故障（用户反馈：「是不是打架的进程」）。
@@ -324,6 +337,7 @@ class AmapNavController(
         // 新的一次导航 → 解除「停止中」标志
         stopRequested = false
         cancelPendingRoute = false
+        hasNavCoord = false
         onPlaceResolved(
             AmapSdkGeocoder.GeoPoint(
                 latitude = latitude,
@@ -709,6 +723,7 @@ class AmapNavController(
         stepRemainMeters = 0
         pathRemainSeconds = 0
         pathRemainMeters = 0
+        hasNavCoord = false
         onHud(NavHud(navigating = false))
     }
 
@@ -777,6 +792,48 @@ class AmapNavController(
         if (hasFix) lastLat to lastLon else null
 
     /**
+     * 当前导航剩余路线，按行驶方向排列，给「沿途搜索」使用。
+     *
+     * `AMapNaviPath.getCoordList()` 保存的是当前活动路线的完整折线。导航过程中
+     * 可能已经驶过前一段，所以先找离当前定位最近的路线点，再只返回它后面的部分，
+     * 避免把已经经过的地点当成「沿途」结果。
+     */
+    fun remainingRoutePoints(): List<AmapSdkGeocoder.RoutePoint> {
+        if (!navigating) return emptyList()
+        val coords = runCatching { navi?.naviPath?.coordList }.getOrNull().orEmpty()
+        if (coords.size < 2) return emptyList()
+
+        val currentLat = if (hasNavCoord) navLat else lastLat
+        val currentLon = if (hasNavCoord) navLon else lastLon
+        val startIndex = if (hasFix || hasNavCoord) {
+            var nearest = 0
+            var nearestDistance = Double.MAX_VALUE
+            coords.forEachIndexed { index, point ->
+                val latDelta = point.latitude - currentLat
+                val lonDelta = point.longitude - currentLon
+                val distance = latDelta * latDelta + lonDelta * lonDelta
+                if (distance < nearestDistance) {
+                    nearestDistance = distance
+                    nearest = index
+                }
+            }
+            nearest
+        } else {
+            0
+        }
+
+        val remaining = coords.drop(startIndex + 1).map {
+            AmapSdkGeocoder.RoutePoint(it.latitude, it.longitude)
+        }
+        if (remaining.size < 2) return emptyList()
+        Dbg.log(
+            "沿途搜索路线截取 index=$startIndex/${coords.lastIndex} " +
+                "points=${remaining.size + 1} source=${if (hasNavCoord) "navi" else "location"}"
+        )
+        return listOf(AmapSdkGeocoder.RoutePoint(currentLat, currentLon)) + remaining
+    }
+
+    /**
      * 当前导航实际指向的地点全称（带城市/区县），如「白银市景泰县金星家园」。
      * 用户说「导航错了」时用它重报，好让用户判断是哪里解析歪了。
      */
@@ -799,6 +856,7 @@ class AmapNavController(
             .onFailure { Dbg.log("销毁高德导航单例失败：${it.message}") }
         navi = null
         navigating = false
+        hasNavCoord = false
     }
 
     private fun detachLocation() {
@@ -839,6 +897,16 @@ class AmapNavController(
             failCurrentAttempt("导航引擎初始化失败")
             onState("导航引擎初始化失败")
             voice.speak("导航引擎初始化失败", VoiceGuide.Priority.USER)
+        }
+
+        override fun onLocationChange(p0: AMapNaviLocation?) {
+            if (stopRequested) return
+            val coord = p0?.coord ?: return
+            if (!coord.latitude.isFinite() || !coord.longitude.isFinite()) return
+            if (coord.latitude == 0.0 && coord.longitude == 0.0) return
+            navLat = coord.latitude
+            navLon = coord.longitude
+            hasNavCoord = true
         }
 
         override fun onCalculateRouteSuccess(p0: AMapCalcRouteResult?) {
