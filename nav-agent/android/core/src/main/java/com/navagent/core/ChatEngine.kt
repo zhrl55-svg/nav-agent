@@ -47,12 +47,21 @@ class ChatEngine(
      */
     private val webSearchAvailable: () -> Boolean = { true },
     /** 明确的本地动作意图可由宿主直接执行，避免不支持工具调用的模型只给文字承诺。 */
-    private val interceptAction: (String, List<ChatMessage>) -> String? = { _, _ -> null }
+    private val interceptAction: (String, List<ChatMessage>) -> String? = { _, _ -> null },
+    /**
+     * App 本地记忆。启动时恢复最近对话，每轮把相关长期事实注入 system prompt。
+     *
+     * 记忆与模型提供商解耦：无论请求发往 Minis、MiniMax、OpenAI 还是本地模型，
+     * 都使用同一份本地数据。
+     */
+    private val memory: ChatMemory = ChatMemory.None
 ) {
 
     private val lock = Any()
 
-    private val history = ArrayList<ChatMessage>()
+    private val history = ArrayList<ChatMessage>().apply {
+        addAll(runCatching { memory.loadRecent(MAX_RESTORED_MESSAGES) }.getOrDefault(emptyList()))
+    }
 
     /**
      * 待处理的句子。
@@ -94,8 +103,10 @@ class ChatEngine(
     }
 
     private fun process(utterance: String) {
+        val userMessage = ChatMessage(ChatMessage.Role.USER, utterance)
         val runGeneration = synchronized(lock) {
-            history += ChatMessage(ChatMessage.Role.USER, utterance)
+            history += userMessage
+            runCatching { memory.append(userMessage) }
             generation
         }
         try {
@@ -140,7 +151,7 @@ class ChatEngine(
                 null
             }
 
-            var full = attempt(systemPrompt(), snapshot())
+            var full = attempt(systemPrompt(utterance), snapshot())
 
             // ★ 2026-11-02：失败后**不再由 App 编一句兜底**，而是让模型自己说。
             //
@@ -161,7 +172,7 @@ class ChatEngine(
             // 那半句通常只是「我帮你查一下」，用户等的是后面的答案。
             if (full.isNullOrBlank()) {
                 full = attemptText(
-                    retryPrompt(sb.toString().trim()),
+                    retryPrompt(sb.toString().trim(), utterance),
                     snapshot().takeLast(RETRY_HISTORY)
                 )
             }
@@ -207,9 +218,11 @@ class ChatEngine(
     }
 
     private fun appendAssistant(runGeneration: Long, text: String) {
+        val message = ChatMessage(ChatMessage.Role.ASSISTANT, text)
         synchronized(lock) {
             if (generation == runGeneration) {
-                history += ChatMessage(ChatMessage.Role.ASSISTANT, text)
+                history += message
+                runCatching { memory.append(message) }
             }
         }
     }
@@ -220,6 +233,7 @@ class ChatEngine(
             val last = history.last()
             if (last.role == ChatMessage.Role.USER && last.text == utterance) {
                 history.removeAt(history.lastIndex)
+                runCatching { memory.removeLastIfMatching(last) }
             }
         }
     }
@@ -255,12 +269,13 @@ class ChatEngine(
             generation++
             history.clear()
             pending.clear()
+            runCatching { memory.clear() }
         }
     }
 
     fun snapshot(): List<ChatMessage> = synchronized(lock) { history.toList() }
 
-    private fun systemPrompt(): String = buildString {
+    private fun systemPrompt(query: String): String = buildString {
         append("你是「${assistantName()}」，一个在车里陪用户说话的语音助手。")
         // ★ 必须注入当前时间。模型只知道自己训练到哪天，不知道"今天"是几号，
         //   问日期、问"明天天气"、说"周六去哪"全都会瞎编。这条不加必然出错。
@@ -350,6 +365,8 @@ class ChatEngine(
         append("   新闻类问题一次搜完（比如「今天国内国际要闻」），不要拆成国内、国际分几次搜。")
         val ctx = context()
         if (ctx.isNotBlank()) append("\n当前状态：").append(ctx)
+        val remembered = runCatching { memory.contextFor(query) }.getOrDefault("")
+        if (remembered.isNotBlank()) append("\n\n").append(remembered)
     }
 
     /**
@@ -365,7 +382,8 @@ class ChatEngine(
      * @param alreadySaid 已经播出去/上屏的半句话。有值就让模型接着说完，
      *                    否则它会把同一句话再说一遍 —— 用户听到的是重复。
      */
-    private fun retryPrompt(alreadySaid: String): String = systemPrompt() + buildString {
+    private fun retryPrompt(alreadySaid: String, query: String): String =
+        systemPrompt(query) + buildString {
         append("\n\n【补充】你上一条回复没有成功发出来（网络或超时）。")
         if (alreadySaid.isNotBlank()) {
             append("你已经说出口的是：「").append(alreadySaid.take(120)).append("」。")
@@ -397,5 +415,8 @@ class ChatEngine(
          * 刚才失败的那个大请求。两轮够模型知道"在聊什么"了。
          */
         const val RETRY_HISTORY = 4
+
+        /** 进程重启后恢复的本地消息上限；界面能看到近期对话，又不至于拖慢启动。 */
+        const val MAX_RESTORED_MESSAGES = 100
     }
 }

@@ -340,23 +340,24 @@ class SettingsActivity : AppCompatActivity() {
         row("服务商", providerLabel(), "换一家会同时改接口地址和模型名，之后可以再手动改") {
             choose(
                 "对话大脑服务商", listOf(
-                    "MiniMax（默认，云端）" to Prefs.PROVIDER_MINIMAX,
+                    "Minis 本地网关（默认）" to Prefs.PROVIDER_MINIS,
+                    "MiniMax 云端" to Prefs.PROVIDER_MINIMAX,
                     "OpenAI 兼容（自填地址）" to Prefs.PROVIDER_OPENAI,
-                    "本地 / 局域网（Ollama、LM Studio、vLLM）" to Prefs.PROVIDER_LOCAL
+                    "其他本地 / 局域网服务" to Prefs.PROVIDER_LOCAL
                 ), Prefs.chatProvider
             ) { applyProvider(it) }
         }
 
         row(
             "接口地址", chatBaseLabel(),
-            "OpenAI 兼容格式。默认预设 http://127.0.0.1:8802/v1"
+            "OpenAI 兼容格式。Minis 默认使用 http://127.0.0.1:8802/v1"
         ) {
             editText("接口地址", Prefs.chatBaseRaw, "http://127.0.0.1:8802/v1") {
                 Prefs.chatBaseRaw = it
                 applied()
                 toast(
                     when {
-                        it.isBlank() -> "已恢复默认：跟随语音服务的 MiniMax 地址"
+                        it.isBlank() -> "已恢复当前服务商的默认地址"
                         !it.startsWith("http") -> "地址要以 http:// 或 https:// 开头"
                         else -> "接口地址已保存"
                     }
@@ -384,7 +385,11 @@ class SettingsActivity : AppCompatActivity() {
                 Prefs.PROVIDER_LOCAL -> custom()
                 else -> choose(
                     "对话模型",
-                    if (Prefs.chatProvider == Prefs.PROVIDER_OPENAI) OPENAI_MODELS else MINIMAX_MODELS,
+                    when (Prefs.chatProvider) {
+                        Prefs.PROVIDER_MINIS -> MINIS_MODELS
+                        Prefs.PROVIDER_OPENAI -> OPENAI_MODELS
+                        else -> MINIMAX_MODELS
+                    },
                     Prefs.chatModel
                 ) { pick -> if (pick.isEmpty()) custom() else { Prefs.chatModel = pick; applied() } }
             }
@@ -427,9 +432,9 @@ class SettingsActivity : AppCompatActivity() {
             ) { Prefs.maxTokens = it; applied() }
         }
 
-        row("记忆轮数", "${Prefs.historyTurns} 轮", "带多少轮历史给模型，越多越贵越慢") {
+        row("上下文轮数", "${Prefs.historyTurns} 轮", "每次携带多少轮最近对话；本地长期偏好不受这个数字影响") {
             choose(
-                "记忆轮数", listOf(
+                "上下文轮数", listOf(
                     "4 轮" to 4,
                     "8 轮（推荐）" to 8,
                     "16 轮" to 16
@@ -546,13 +551,24 @@ class SettingsActivity : AppCompatActivity() {
         row("查看日志", logSize(), "点开看最近 40 行") { showLog() }
 
         section("维护")
-        row("清空对话历史", "", "下次打开是干净的，我什么都不记得了") {
+        row(
+            "本地记忆",
+            memorySummary(),
+            "跨重启保存最近对话和你说过「记住……」的内容，换聊天接口也不会丢"
+        ) {
+            showLocalMemory()
+        }
+        row("清空对话与长期记忆", "", "删除全部本地消息和偏好。此操作不可撤销") {
             AlertDialog.Builder(this)
-                .setTitle("清空对话历史")
-                .setMessage("当前 ${app.chat.snapshot().size} 条消息会全部删除。继续？")
+                .setTitle("清空本地记忆")
+                .setMessage(
+                    "当前 ${app.memory.stats().messages} 条消息、" +
+                        "${app.memory.stats().facts} 条长期偏好会全部删除。继续？"
+                )
                 .setPositiveButton("清空") { _, _ ->
                     app.chat.reset()
-                    toast("已清空")
+                    toast("对话和长期记忆已清空")
+                    render()
                 }
                 .setNegativeButton("取消", null)
                 .show()
@@ -862,6 +878,62 @@ class SettingsActivity : AppCompatActivity() {
             .show()
     }
 
+    /** 查看本地记忆。最近对话只展示摘要，长期偏好可逐条删除。 */
+    private fun showLocalMemory() {
+        val stats = app.memory.stats()
+        val facts = app.memory.facts()
+        val recent = app.memory.loadRecent(12)
+        val preview = if (recent.isEmpty()) {
+            "最近对话：无"
+        } else {
+            recent.joinToString("\n") {
+                val who = if (it.role == com.navagent.core.ChatMessage.Role.USER) "你" else Prefs.aiName
+                "$who：${it.text.replace('\n', ' ').take(80)}"
+            }
+        }
+        val body = buildString {
+            append("消息 ").append(stats.messages).append(" 条，长期偏好 ")
+                .append(stats.facts).append(" 条。\n\n")
+            if (facts.isNotEmpty()) {
+                append("长期偏好：\n")
+                facts.take(8).forEach { append("• ").append(it.value).append('\n') }
+                if (facts.size > 8) append("…另有 ").append(facts.size - 8).append(" 条\n")
+                append('\n')
+            }
+            append(preview)
+        }
+        AlertDialog.Builder(this)
+            .setTitle("本地记忆")
+            .setMessage(body)
+            .setPositiveButton("管理偏好") { _, _ -> showFactManager(facts) }
+            .setNegativeButton("关闭", null)
+            .show()
+    }
+
+    private fun showFactManager(facts: List<MemoryFact>) {
+        if (facts.isEmpty()) {
+            toast("还没有长期偏好。说“记住我不走高速”即可添加")
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("点一条删除长期偏好")
+            .setItems(facts.map { it.value }.toTypedArray()) { _, which ->
+                val fact = facts[which]
+                AlertDialog.Builder(this)
+                    .setTitle("删除这条记忆？")
+                    .setMessage(fact.value)
+                    .setPositiveButton("删除") { _, _ ->
+                        app.memory.deleteFact(fact.id)
+                        toast("已删除")
+                        render()
+                    }
+                    .setNegativeButton("取消", null)
+                    .show()
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
     // ---------------------------------------------------------------- 模型
 
     private fun modelStatus(): String {
@@ -949,14 +1021,22 @@ class SettingsActivity : AppCompatActivity() {
     // ---------------------------------------------------------------- 对话大脑
 
     private fun providerLabel(): String = when (Prefs.chatProvider) {
+        Prefs.PROVIDER_MINIS -> "Minis 本地网关（默认）"
         Prefs.PROVIDER_LOCAL -> if (Prefs.chatEndpointIsLocal()) "本地 / 局域网" else "自定义地址"
         Prefs.PROVIDER_OPENAI -> "OpenAI 兼容"
-        else -> "MiniMax（默认）"
+        else -> "MiniMax 云端"
     }
 
     private fun chatBaseLabel(): String = when {
+        Prefs.chatBaseRaw.isEmpty() && Prefs.chatProvider == Prefs.PROVIDER_MINIS ->
+            "Minis · ${Prefs.MINIS_BASE_URL}"
         Prefs.chatBaseRaw.isEmpty() -> "MiniMax 官方（跟随语音服务）"
         else -> Prefs.chatBaseRaw
+    }
+
+    private fun memorySummary(): String {
+        val stats = app.memory.stats()
+        return "${stats.messages} 条消息 · ${stats.facts} 条偏好"
     }
 
     private fun chatKeyLabel(): String {
@@ -994,6 +1074,12 @@ class SettingsActivity : AppCompatActivity() {
     private fun applyProvider(provider: String) {
         Prefs.chatProvider = provider
         when (provider) {
+            Prefs.PROVIDER_MINIS -> {
+                Prefs.chatBaseRaw = Prefs.MINIS_BASE_URL
+                Prefs.chatKeyRaw = ""
+                Prefs.chatModel = Prefs.MINIS_CHAT_MODEL
+                toast("已切到 Minis 本地网关，本地记忆不受影响")
+            }
             Prefs.PROVIDER_MINIMAX -> {
                 // 空 = 跟随语音服务；未填 Key 时由设置页明确提示未配置
                 Prefs.chatBaseRaw = ""
@@ -1007,11 +1093,10 @@ class SettingsActivity : AppCompatActivity() {
                 toast("把地址换成你自己的中转，再填 Key")
             }
             else -> {
-                // 用户指定：本地模型默认预设 127.0.0.1:8802（手机上的转发/本机服务）。
-                // 接电脑上的 LM Studio（1234）或 Ollama（11434）时把地址改掉即可。
-                Prefs.chatBaseRaw = "http://127.0.0.1:8802/v1"
+                // 其他本地服务常用 Ollama 的 11434；LM Studio 可再手动改 1234。
+                Prefs.chatBaseRaw = "http://127.0.0.1:11434/v1"
                 Prefs.chatModel = "qwen2.5:7b"
-                toast("已填本地预设 127.0.0.1:8802；接电脑上的服务就把地址改成电脑 IP")
+                toast("已填 Ollama 预设；LM Studio 等其他服务请改地址和模型")
             }
         }
         app.applySettings()
@@ -1019,6 +1104,12 @@ class SettingsActivity : AppCompatActivity() {
     }
 
     /** MiniMax 云端可选模型 */
+    private val MINIS_MODELS = listOf(
+        "minis（默认网关）" to "minis",
+        "workbuddy/deepseek-v4.1-flash" to "workbuddy/deepseek-v4.1-flash",
+        "自定义…" to ""
+    )
+
     private val MINIMAX_MODELS = listOf(
         "minimax-m3.1-flash（快，推荐）" to "minimax-m3.1-flash",
         "MiniMax-M2.7（更快）" to "MiniMax-M2.7",

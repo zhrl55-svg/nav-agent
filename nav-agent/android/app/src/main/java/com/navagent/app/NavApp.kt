@@ -21,6 +21,10 @@ class NavApp : Application() {
     lateinit var chat: ChatEngine
         private set
 
+    /** App 本地长期记忆，独立于当前对话模型和网关。 */
+    lateinit var memory: LocalMemoryStore
+        private set
+
     /**
      * 车载蓝牙播报路由。
      *
@@ -124,6 +128,7 @@ class NavApp : Application() {
         super.onCreate()
         // 顺序不能反：Dbg.init 要读 Prefs.fileLog 决定开不开
         Prefs.init(this)
+        memory = LocalMemoryStore(this)
         Dbg.init(this)
         // 高德 SDK 的隐私合规。必须在任何 SDK 调用（定位/地图/搜索）之前做，
         // 否则高德会静默失败——查不到城市、周边搜索返回空，都查不出原因。
@@ -200,7 +205,8 @@ class NavApp : Application() {
             onFailure = { msg -> dispatchNotice(msg) },
             // 接本地接口时不给 Tavily（本地服务自带检索），prompt 也要跟着改口
             webSearchAvailable = { Prefs.webSearchEnabled() },
-            interceptAction = ::interceptNavigation
+            interceptAction = ::interceptNavigation,
+            memory = memory
         )
 
         prewarm()

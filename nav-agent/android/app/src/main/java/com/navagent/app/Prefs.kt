@@ -69,14 +69,21 @@ object Prefs {
     private const val K_NAV_ZOOM = "nav_zoom"
     private const val K_CAR_BT_AUDIO = "car_bt_audio"
     private const val K_CAR_NUMBER = "car_number"
+    private const val K_MEMORY_USER_ID = "memory_user_id"
+    private const val K_MINIS_PROVIDER_MIGRATED = "minis_provider_migrated"
 
     /** MiniMax 默认音色：青涩青年 */
     const val DEFAULT_VOICE = "male-qn-qingse"
 
     /** 对话大脑服务商标识 */
+    const val PROVIDER_MINIS = "minis"
     const val PROVIDER_MINIMAX = "minimax"
     const val PROVIDER_OPENAI = "openai"
     const val PROVIDER_LOCAL = "local"
+
+    /** P40 上运行的 Minis 本地网关。 */
+    const val MINIS_BASE_URL = "http://127.0.0.1:8802/v1"
+    const val MINIS_CHAT_MODEL = "minis"
 
     /** Tavily 搜索工具的三态 */
     const val WEB_SEARCH_AUTO = "auto"
@@ -94,6 +101,24 @@ object Prefs {
     fun init(ctx: Context) {
         if (::sp.isInitialized) return
         sp = ctx.applicationContext.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+        migrateLegacyMinisProvider()
+    }
+
+    /**
+     * 旧版本把 P40 的 8802 网关归在“本地服务”里，模型名已改成 minis。
+     * 精确匹配这组旧预设时升级为独立 Minis 服务商；迁移只执行一次，之后用户
+     * 主动选择“其他本地服务”不会被改回。
+     */
+    private fun migrateLegacyMinisProvider() {
+        if (sp.getBoolean(K_MINIS_PROVIDER_MIGRATED, false)) return
+        val provider = sp.getString(K_CHAT_PROVIDER, "").orEmpty()
+        val base = sp.getString(K_CHAT_BASE, "").orEmpty().trimEnd('/')
+        val model = sp.getString(K_CHAT_MODEL, "").orEmpty()
+        val editor = sp.edit().putBoolean(K_MINIS_PROVIDER_MIGRATED, true)
+        if (provider == PROVIDER_LOCAL && base == MINIS_BASE_URL && model == MINIS_CHAT_MODEL) {
+            editor.putString(K_CHAT_PROVIDER, PROVIDER_MINIS)
+        }
+        editor.apply()
     }
 
     /** 设置页「恢复默认」用 */
@@ -215,7 +240,7 @@ object Prefs {
 
     /** 对话大脑服务商。只用于设置页的预设和文案，运行时真正生效的是地址 + 模型名 */
     var chatProvider: String
-        get() = sp.getString(K_CHAT_PROVIDER, PROVIDER_MINIMAX).orEmpty().ifBlank { PROVIDER_MINIMAX }
+        get() = sp.getString(K_CHAT_PROVIDER, PROVIDER_MINIS).orEmpty().ifBlank { PROVIDER_MINIS }
         set(v) = sp.edit().putString(K_CHAT_PROVIDER, v.trim()).apply()
 
     /**
@@ -233,7 +258,9 @@ object Prefs {
         get() = sp.getString(K_CHAT_KEY, "").orEmpty().trim()
         set(v) = sp.edit().putString(K_CHAT_KEY, v.trim()).apply()
 
-    fun chatBaseUrl(): String = chatBaseRaw.ifEmpty { MINIMAX_BASE_URL }
+    fun chatBaseUrl(): String = chatBaseRaw.ifEmpty {
+        if (chatProvider == PROVIDER_MINIS) MINIS_BASE_URL else MINIMAX_BASE_URL
+    }
 
     /**
      * 对话大脑实际使用的 Key。
@@ -242,10 +269,12 @@ object Prefs {
      * - 填了自定义地址 → **只**用自己填的；留空就不发 Authorization 头
      *   （本地 llama.cpp / Ollama 大多不校验，发个假 Key 反而被某些网关拒）
      */
-    fun chatApiKey(): String = if (chatBaseRaw.isEmpty()) voiceApiKey() else chatKeyRaw
+    fun chatApiKey(): String =
+        if (chatBaseRaw.isEmpty() && chatProvider == PROVIDER_MINIMAX) voiceApiKey() else chatKeyRaw
 
     /** 是否接了自定义 / 本地接口 */
-    fun chatEndpointIsCustom(): Boolean = chatBaseRaw.isNotEmpty()
+    fun chatEndpointIsCustom(): Boolean =
+        chatBaseRaw.isNotEmpty() || chatProvider != PROVIDER_MINIMAX
 
     /** 地址是不是本机或局域网。设置页文案和「免 Key」提示用 */
     fun chatEndpointIsLocal(): Boolean {
@@ -290,10 +319,29 @@ object Prefs {
         set(v) = sp.edit().putString(K_CHAT_MODEL, v.trim()).apply()
 
     private fun defaultChatModel(): String = when (chatProvider) {
+        PROVIDER_MINIS -> MINIS_CHAT_MODEL
         PROVIDER_LOCAL -> "qwen2.5:7b"
         PROVIDER_OPENAI -> "gpt-4o-mini"
         else -> MINIMAX_CHAT_MODEL
     }
+
+    /**
+     * 设备本地身份。Minis 等支持记忆的网关可以据此区分用户，其他接口会忽略。
+     * 该值不是密钥，也不会上传到本项目自己的服务器。
+     */
+    fun memoryUserId(): String {
+        val existing = sp.getString(K_MEMORY_USER_ID, "").orEmpty()
+        if (existing.isNotBlank()) return existing
+        return synchronized(this) {
+            sp.getString(K_MEMORY_USER_ID, "").orEmpty().ifBlank {
+                java.util.UUID.randomUUID().toString().also {
+                    sp.edit().putString(K_MEMORY_USER_ID, it).apply()
+                }
+            }
+        }
+    }
+
+    fun conversationId(): String = "${memoryUserId()}-default"
 
     /** 单条回复的 token 上限 */
     var maxTokens: Int

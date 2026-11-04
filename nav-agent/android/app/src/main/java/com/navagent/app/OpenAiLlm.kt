@@ -303,6 +303,10 @@ class OpenAiLlm(
                 if (apiKey.isNotBlank()) setRequestProperty("Authorization", "Bearer $apiKey")
                 setRequestProperty("Content-Type", "application/json")
                 setRequestProperty("Accept", "text/event-stream")
+                // Minis 等网关可据此启用服务端记忆；普通 OpenAI 兼容接口会忽略未知头。
+                // 真正跨服务商不丢上下文依赖 App 本地 SQLite，而不是这两个头。
+                setRequestProperty("X-User-Id", Prefs.memoryUserId())
+                setRequestProperty("X-Conversation-Id", Prefs.conversationId())
             }
             conn.outputStream.use { it.write(payload.toString().toByteArray()) }
 
