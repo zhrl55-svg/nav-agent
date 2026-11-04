@@ -78,7 +78,24 @@ object AmapSdkGeocoder {
         val latitude: Double,
         val longitude: Double,
         /** 详细地址（POI 搜索才有）。搜索栏列表用它做副标题 */
-        val address: String = ""
+        val address: String = "",
+        /**
+         * POI 所在城市（如「石家庄市」）。
+         *
+         * ★ 用来判断「用户是不是真的要去外地」：
+         *   解析结果城市跟当前城市不同不一定是错 —— 用户说「石家庄火车站」
+         *   就是要去石家庄（1227 公里）。
+         *   错的是用户说「水勘院超市」却匹配到石家庄的同名店。
+         *   区别在于：**用户说的地名里有没有那个城市名**。
+         */
+        val city: String = "",
+        /**
+         * POI 所在区县（如「景泰县」「甘州区」）。
+         *
+         * ★ 距离兜底要用它 —— 用户可能只说县名不说市名
+         *   （「景泰县条山路金星家园」里没有「白银」）。
+         */
+        val district: String = ""
     )
 
     /** 定位结果 */
@@ -220,6 +237,17 @@ object AmapSdkGeocoder {
      *
      * 用户说的「高铁西站」「火车站」「加油站」是 POI 不是门牌地址，
      * 所以这里走 POI 搜索而不是地理编码。
+     *
+     * ★ 2026-11-04：改走 **Web API**（PlaceWebSearch.searchLocalFirst），不用 SDK 的 PoiSearch。
+     *   原因实测过：SDK 的 `PoiSearch.Query(keyword, "", city)` + `setCityLimit(true)`
+     *   **city 参数不生效** —— 传 city=张掖市 搜「水勘院超市」，
+     *   返回的是**石家庄**的「槐中路135号水勘院(顺丰便利店)」，一路 1517 公里。
+     *   Web API 的 citylimit 语义是对的，同样查询返回张掖甘州区的水勘院超市。
+     *
+     * ★ 搜索策略：**地名不带行政区划 → 优先本地**，本地搜不到再放开全国；
+     *   带行政区划 → 直接全国搜。
+     *
+     * ★ Web API 是同步 HTTP，这里包一层到子线程，保持原接口的异步语义不变。
      */
     fun searchPoi(
         context: Context,
@@ -232,44 +260,33 @@ object AmapSdkGeocoder {
             onResult(null)
             return
         }
-        // ★ 关键词自带行政区划时放开 citylimit（跨城市导航错乱的根因）
-        val cityLimit = !city.isNullOrBlank() && !REGION_HINT.containsMatchIn(keyword)
-        val query = PoiSearch.Query(keyword, "", city.takeIf { cityLimit })
-        query.pageSize = 10
-        query.pageNum = 1
-        query.setCityLimit(cityLimit)
-
-        runCatching {
-            val search = PoiSearch(context.applicationContext, query)
-            search.setOnPoiSearchListener(object : PoiSearch.OnPoiSearchListener {
-                override fun onPoiSearched(result: PoiResult?, code: Int) {
-                    if (code != 1000) {
-                        Dbg.log("高德 POI 搜索失败 code=$code keyword=$keyword")
-                        onResult(null)
-                        return
-                    }
-                    val item = result?.pois?.firstOrNull()
-                    if (item == null) {
-                        Dbg.log("高德 POI 搜索无结果 keyword=$keyword")
-                        onResult(null)
-                        return
-                    }
-                    Dbg.log(
-                        "高德 POI 命中「${item.title}」${item.latLonPoint.latitude}," +
-                            "${item.latLonPoint.longitude} city=${item.cityName}"
-                    )
-                    onResult(item.toGeoPoint())
-                }
-
-                override fun onPoiItemSearched(item: PoiItem?, code: Int) {
-                    // 单条查询的回调，这里用不到
-                }
-            })
-            search.searchPOIAsyn()
-        }.onFailure {
-            Dbg.log("高德 POI 搜索异常 keyword=$keyword：${it.message}")
-            onResult(null)
-        }
+        Thread {
+            val pois = runCatching {
+                PlaceWebSearch.searchLocalFirst(keyword, city, limit = 5)
+            }.getOrElse {
+                Dbg.log("POI 搜索异常 keyword=$keyword：${it.message}")
+                emptyList()
+            }
+            val point = pois.firstOrNull()?.let {
+                GeoPoint(
+                    latitude = it.latitude,
+                    longitude = it.longitude,
+                    formatted = it.name,
+                    // ★ 必须是**城市名**（如「石家庄市」），不是拼好的完整地址 ——
+                    //   距离兜底要拿它跟用户说的地名比对（「石家庄火车站」里有没有「石家庄」）
+                    city = it.city,
+                    district = it.district
+                )
+            }
+            if (point == null) {
+                Dbg.log("POI 搜索无结果 keyword=$keyword")
+            } else {
+                Dbg.log(
+                    "POI 命中「${point.formatted}」${point.latitude},${point.longitude}"
+                )
+            }
+            onResult(point)
+        }.apply { isDaemon = true; name = "poi-search" }.start()
     }
 
     /**

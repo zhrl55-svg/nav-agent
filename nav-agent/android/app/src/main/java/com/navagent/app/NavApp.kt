@@ -162,7 +162,8 @@ class NavApp : Application() {
             searchPlaces = { keyword -> searchPlaceCandidates(keyword) },
             showCandidates = { keyword, pois -> setPendingPois(keyword, pois) },
             currentCandidates = { pendingPois },
-            clearCandidates = { selected -> clearPendingPois(selected) }
+            clearCandidates = { selected -> clearPendingPois(selected) },
+            lastConfirmedPoi = ::freshLastConfirmedPoi
         )
         navigationTool = navTool
 
@@ -355,6 +356,38 @@ class NavApp : Application() {
     var pendingKeyword: String = ""
         private set
 
+    /**
+     * 最近一次**用户确认过**的候选（带精确坐标）。
+     *
+     * ★ 为什么留着（2026-11-04）：
+     *   候选列表用完就清，但目的地本身还可能再被提到
+     *   （比如模型在闲聊后自作主张又调一次 navigate）。
+     *   有了这个坐标，同名地点再怎么解析都不会跑到外地去。
+     */
+    @Volatile
+    var lastConfirmedPoi: AmapSdkGeocoder.Poi? = null
+        private set
+
+    /** lastConfirmedPoi 的记录时刻（毫秒），用来判过期 */
+    @Volatile
+    private var lastConfirmedAt = 0L
+
+    /**
+     * 最近一次**用户确认过**的候选（带坐标），超过 30 分钟就不算数。
+     *
+     * ★ 为什么要时效：
+     *   一路导航可能开几小时。用户中途说「去刚才那个地方」，
+     *   几小时前确认的候选早就不是他说的那个了。
+     */
+    fun freshLastConfirmedPoi(): AmapSdkGeocoder.Poi? {
+        val poi = lastConfirmedPoi ?: return null
+        if (System.currentTimeMillis() - lastConfirmedAt > CONFIRMED_TTL_MS) {
+            Dbg.log("已确认的候选过期：${poi.name}")
+            return null
+        }
+        return poi
+    }
+
     /** 记下候选并推给界面 */
     fun setPendingPois(keyword: String, pois: List<AmapSdkGeocoder.Poi>) {
         pendingPois = pois
@@ -372,6 +405,14 @@ class NavApp : Application() {
     fun clearPendingPois(selected: AmapSdkGeocoder.Poi? = null) {
         pendingPois = emptyList()
         pendingKeyword = ""
+        // ★ 记住用户确认过的那个（带坐标）——
+        //   之后模型再提到这个名字时，用坐标而不是重新解析地名
+        //   （重新解析会命中同名的外地地点，实测「水勘院超市」→ 石家庄，1517 公里）。
+        if (selected != null) {
+            lastConfirmedPoi = selected
+            lastConfirmedAt = System.currentTimeMillis()
+            Dbg.log("记住已确认的候选：${selected.name} (${selected.latitude},${selected.longitude})")
+        }
         // ★ 通知界面把候选列表收起来（2026-11-04）。
         //   语音确认走的是「模型调工具」这条路，不经过点击处理，
         //   列表没人收 —— 用户确认完了列表还挂在屏幕上（用户反馈）。
@@ -497,17 +538,15 @@ class NavApp : Application() {
      *   所以这里无条件切子线程，谁调都一样。
      */
     private fun searchPlaceCandidates(keyword: String): List<AmapSdkGeocoder.Poi> {
-        // ① 本市优先
-        val local = searchInBackground(keyword, nav?.currentCity, cityLimit = true)
-        if (local.size >= 2) {
-            Dbg.log("候选搜索「$keyword」→ 本市 ${local.size} 条")
-            return local
-        }
-        // ② 本市不够 → 全国
-        val all = searchInBackground(keyword, null, cityLimit = false)
-        val merged = (local + all).distinctBy { "${it.latitude},${it.longitude}" }.take(5)
-        Dbg.log("候选搜索「$keyword」→ 本市 ${local.size} 条 + 全国 ${all.size} 条 = ${merged.size} 条")
-        return merged
+        // ★ 一次请求就够：city=当前城市 + citylimit=false（city 只作偏置）。
+        //   高德自己的排序在这个组合下是对的（实测）：
+        //     「水勘院超市」→ 张掖市甘州区的水勘院超市（本地优先）
+        //     「景泰县条山路金星家园」→ 白银市景泰县的金星家园（跨城也对）
+        //   之前自己分两段搜（先 citylimit=true 再 false）反而错 ——
+        //   citylimit=true 搜不到跨城地名，本市又只有「金星灯饰」这种碰巧含「金星」的店。
+        val pois = searchInBackground(keyword, nav?.currentCity, cityLimit = false)
+        Dbg.log("候选搜索「$keyword」→ ${pois.size} 条：${pois.joinToString { it.name }}")
+        return pois
     }
 
     /**
@@ -767,5 +806,8 @@ class NavApp : Application() {
     private companion object {
         /** 周边结果的保质期。车在开，久了就失效 */
         const val NEARBY_TTL_MS = 2 * 60 * 1000L
+
+        /** 已确认候选的有效期：30 分钟 */
+        const val CONFIRMED_TTL_MS = 30 * 60 * 1000L
     }
 }

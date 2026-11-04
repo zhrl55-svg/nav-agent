@@ -575,7 +575,16 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
         val seq = ++searchSeq
         // ★ 最多 4 条。8 条会被键盘压掉大半（实测第 5 条就看不见），
         //   而开车时也不需要第 8 个候选 —— 前面几条不对，说明关键词该改。
-        AmapSdkGeocoder.searchKeyword(this, keyword, nav.currentCity, limit = 4) { pois ->
+        //
+        // ★ 走 Web API（PlaceWebSearch.searchLocalFirst），不用 SDK 的 PoiSearch：
+        //   SDK 的 city 参数不生效（实测 city=张掖市 搜「水勘院超市」
+        //   返回石家庄的同名地点）。Web API 的 citylimit 是准的。
+        //   而且是「本地优先」：地名不带行政区划先搜本地，
+        //   本地没有真正命中才放开全国（跨城地名要能搜到）。
+        Thread {
+            val pois = runCatching {
+                PlaceWebSearch.searchLocalFirst(keyword, nav.currentCity, limit = 4)
+            }.getOrDefault(emptyList())
             runOnUiThread {
                 if (seq != searchSeq) return@runOnUiThread
                 if (pois.isEmpty()) {
@@ -586,7 +595,7 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
                 toast("搜到 ${pois.size} 个结果，点一条直接导航")
                 renderSearchResults(pois)
             }
-        }
+        }.apply { isDaemon = true; name = "search-bar" }.start()
     }
 
     private fun renderSearchResults(pois: List<AmapSdkGeocoder.Poi>) {

@@ -361,6 +361,51 @@ class AmapNavController(
      */
     private fun onPlaceResolved(point: AmapSdkGeocoder.GeoPoint) {
         val n = navi ?: return
+
+        // ★ ★ 距离兜底（2026-11-04）：
+        //   地名解析可能跑到**同名的外地地点**上。
+        //   实测：用户选的是张掖的「水勘院超市」，但高德 POI 搜索返回了
+        //   **石家庄**的「槐中路135号水勘院(顺丰便利店)」—— 一路 1517 公里。
+        //
+        //   但「远」本身不是错 —— 用户说「石家庄火车站」就是要跨城。
+        //   区别在于：**用户说的地名里有没有出现那个城市名**。
+        //     「石家庄火车站」→ 结果 city=石家庄市 → 地名里有「石家庄」→ 放行 ✅
+        //     「水勘院超市」  → 结果 city=石家庄市 → 地名里没有     → 拒绝 ❌
+        val distM: Double =
+            if (hasFix) distanceMeters(lastLat, lastLon, point.latitude, point.longitude) else -1.0
+        if (distM > FAR_AWAY_METERS) {
+            val dest = pendingDestination.orEmpty()
+            // ★ 用户是不是**明确提到了**结果所在的地方？
+            //   要比对省/市/区县三级 —— 用户可能说的是县名不是市名：
+            //     「景泰县条山路金星家园」→ 结果在白银市**景泰县**
+            //     只说「白银」比对的话就漏了（用户没提白银，提的是景泰县）。
+            //   结果地址里拼了「甘肃省白银市景泰县…」，拿地名里的每个地名片段去比对。
+            val placeWords = listOf(
+                point.city,
+                point.district,
+                point.city.removeSuffix("市"),
+                point.district.removeSuffix("县").removeSuffix("区")
+            ).filter { it.isNotBlank() }
+            val userMentioned = placeWords.any { w -> w.length >= 2 && dest.contains(w) }
+
+            if (!userMentioned) {
+                val km = (distM / 1000).toInt()
+                Dbg.log(
+                    "★ 拒绝解析结果：「$dest」命中了 ${point.city}${point.district} 的「${point.formatted}」" +
+                        "（${km}公里），但用户没提到这个城市/区县"
+                )
+                pendingPlace = null
+                onState("「$dest」搜到了${km}公里外${point.city}的同名地方，可能不对")
+                voice.speak(
+                    "$dest 搜到了${km}公里外${point.city}的同名地方，可能不是你要的，" +
+                        "说清楚点在哪个城市，我再搜一次",
+                    VoiceGuide.Priority.USER
+                )
+                return
+            }
+            Dbg.log("跨城导航放行：${point.city}${point.district}（用户提到了地名）")
+        }
+
         pendingPlace = point
         // ★ 算路**之前**再设一次车辆信息。
         //   官方文档说 setCarInfo 影响的是「路径规划时会躲避车辆限行区域和路线」，
@@ -823,6 +868,27 @@ class AmapNavController(
          * 不等的话城市偏置是 null，跨城市地名会解析错。
          */
         const val CITY_WAIT_MS = 3_000L
+
+        /**
+         * 解析结果离当前位置多远算「可疑」（米）。
+         *
+         * ★ 为什么是 100 公里：
+         *   市内跨区也就几十公里；隔壁市 100~200 公里。
+         *   100 公里这个线，能挡住「同名的外地地点」这种离谱误匹配，
+         *   又不会误伤正常的跨城长途（那种地名里会带省市，会走另一条路）。
+         */
+        const val FAR_AWAY_METERS = 100_000.0
+
+        /** 两点间直线距离（米） */
+        private fun distanceMeters(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
+            val r = 6_371_000.0
+            val dLat = Math.toRadians(lat2 - lat1)
+            val dLon = Math.toRadians(lon2 - lon1)
+            val a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+                Math.cos(Math.toRadians(lat1)) * Math.cos(Math.toRadians(lat2)) *
+                Math.sin(dLon / 2) * Math.sin(dLon / 2)
+            return r * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
+        }
 
         /** 定位超过这么久没更新，就认为信号断了（隧道、地下车库） */
         const val SIGNAL_LOST_MS = 8_000L

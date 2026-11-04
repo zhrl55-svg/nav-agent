@@ -58,7 +58,20 @@ class NavigationTool(
     /** 读当前待确认候选 */
     private val currentCandidates: () -> List<AmapSdkGeocoder.Poi> = { emptyList() },
     /** 清空待确认候选（已确认 / 换了新需求）。参数是选中/清空的那个 POI（可空） */
-    private val clearCandidates: (AmapSdkGeocoder.Poi?) -> Unit = { }
+    private val clearCandidates: (AmapSdkGeocoder.Poi?) -> Unit = { },
+    /**
+     * 最近一次**用户确认过**的候选（带精确坐标）。
+     *
+     * ★ 为什么需要（2026-11-04）：
+     *   用户确认候选 A 导航完成后，候选列表就清掉了。
+     *   之后模型如果再调 navigate("A 的名字", confirmed=true)，
+     *   候选已经找不到 → 退化成走地名解析 →
+     *   高德 POI 搜索的 city 参数不生效，「水勘院超市」命中了**石家庄**的
+     *   「槐中路135号水勘院(顺丰便利店)」，一路1517 公里（用户反馈）。
+     *
+     *   记住这个坐标，同名地点再怎么解析都不会跑偏。
+     */
+    private val lastConfirmedPoi: () -> AmapSdkGeocoder.Poi? = { null }
 ) : LlmTool {
 
     override val name = "navigate"
@@ -158,11 +171,31 @@ class NavigationTool(
                         clearCandidates(hit)
                         return navigateToPoi(hit)
                     }
-                    // 用户明确说了完整名字 + 确认过了，但候选已经清掉
-                    // → 这种情况按普通导航处理（走地名解析）
+                    // ★ 候选已清掉，但**名字跟刚确认过的那个一样** → 用记住的坐标。
+                    //   绝不能退化成地名解析 —— 那条路会命中同名的外地地点
+                    //   （「水勘院超市」→ 石家庄的「槐中路135号水勘院」，1517 公里）。
                     if (confirmed) {
+                        val recent = lastConfirmedPoi()
+                        if (recent != null && (recent.name == dest || recent.name.contains(dest) || dest.contains(recent.name))) {
+                            return navigateToPoi(recent)
+                        }
+                        // ★ 从来没确认过任何候选，却传了 confirmed=true ——
+                        //   这是模型**自作主张**（用户压根没说地址，模型自己重放了一个
+                        //   历史目的地）。必须走确认流程。
+                        //   实测：用户说「哎呀，现在很完美呀」这句闲聊，
+                        //   模型看到历史里的目的地就自己调了 navigate，
+                        //   结果跑到石家庄同名地点，1517 公里（用户反馈）。
+                        if (recent == null) {
+                            return "用户还没确认过是哪个地点，不能直接导航。" +
+                                "请调一次 navigate（**不带** confirmed）来搜索候选，" +
+                                "用 1、2、3 列出来问用户「是哪个」；" +
+                                "等用户选了之后，再调一次（destination 用完整名称、confirmed=true）。"
+                        }
                         clearCandidates(null)
-                        return navigateTo(dest)
+                        // ★ 明确告诉模型「候选没了」，别让它自作主张再导航一次。
+                        return "刚才的候选已经失效了（用户没确认或已结束导航）。" +
+                            "请先调一次 navigate（不带 confirmed）重新搜索候选，问用户是哪个；" +
+                            "**不要**直接调 confirmed=true 导航。"
                     }
 
                     // ★ 没确认 → 先搜候选，不直接导航
