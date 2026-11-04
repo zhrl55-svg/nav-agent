@@ -55,7 +55,23 @@ class VoiceprintGate(
         return true
     }
 
+    @Synchronized
     override fun score(pcm: ShortArray, sampleRate: Int): Float? {
+        return scoreInternal(pcm, sampleRate, adapt = true)
+    }
+
+    /**
+     * 唤醒打断专用评分：不更新主人声纹模板。
+     *
+     * 播报中候选音频可能同时包含 TTS 和主人说话。一个勉强过线的混合
+     * embedding 不能拿去做 EMA，否则模板会慢慢被播报声污染。
+     */
+    @Synchronized
+    fun scoreForCheck(pcm: ShortArray, sampleRate: Int): Float? {
+        return scoreInternal(pcm, sampleRate, adapt = false)
+    }
+
+    private fun scoreInternal(pcm: ShortArray, sampleRate: Int, adapt: Boolean): Float? {
         val tpl = template ?: return null
         val emb = encoder.embed(pcm) ?: return null
         if (emb.size != tpl.size) {
@@ -65,7 +81,7 @@ class VoiceprintGate(
         var dot = 0f
         for (i in emb.indices) dot += emb[i] * tpl[i]
         lastScore = dot
-        if (dot >= ADAPT_MIN) adapt(emb)
+        if (adapt && dot >= ADAPT_MIN) adapt(emb)
         return dot
     }
 

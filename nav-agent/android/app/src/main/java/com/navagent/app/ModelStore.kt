@@ -2,6 +2,8 @@ package com.navagent.app
 
 import java.io.File
 import java.io.FileOutputStream
+import java.io.ByteArrayOutputStream
+import java.io.RandomAccessFile
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.zip.ZipInputStream
@@ -35,10 +37,16 @@ object ModelStore {
     private const val WP_FILE = "cnceleb_resnet34_LM.onnx"
     private const val WP_MIN_BYTES = 20_000_000L
 
-    /** 已就绪的声纹模型；没有返回 null */
+    /**
+     * 已就绪且可被 Sherpa 加载的声纹模型；没有返回 null。
+     *
+     * WeSpeaker 发布的原始 ONNX 不带 Sherpa 需要的 metadata。直接把原始文件
+     * 交给 SpeakerEmbeddingExtractor 会在 dim() 时触发 native abort。这里首次
+     * 使用时生成带 metadata 的兼容副本，原文件保持不变，便于校验和重新生成。
+     */
     fun voiceprintModel(filesDir: File): File? {
-        val f = File(filesDir, "models/$WP_DIR/$WP_FILE")
-        return if (f.exists() && f.length() > WP_MIN_BYTES) f else null
+        val source = voiceprintSource(filesDir) ?: return null
+        return ensureSherpaMetadata(source)
     }
 
     /**
@@ -48,14 +56,17 @@ object ModelStore {
     fun ensureVoiceprint(filesDir: File, onProgress: (String) -> Unit = {}): File? {
         voiceprintModel(filesDir)?.let { return it }
 
-        val target = File(filesDir, "models/$WP_DIR/$WP_FILE")
+        val target = voiceprintSourceFile(filesDir)
         target.parentFile?.mkdirs()
 
         try {
             onProgress("正在下载声纹模型（约 26MB）…")
             if (download(WP_URL, target, onProgress) && target.length() > WP_MIN_BYTES) {
-                onProgress("声纹模型就绪")
-                return target
+                val compatible = ensureSherpaMetadata(target)
+                if (compatible != null) {
+                    onProgress("声纹模型就绪")
+                    return compatible
+                }
             }
         } catch (t: Throwable) {
             Dbg.log("声纹模型下载失败: ${t.javaClass.simpleName} ${t.message}")
@@ -63,6 +74,96 @@ object ModelStore {
         runCatching { target.delete() }
         Dbg.log("声纹模型下载失败")
         return null
+    }
+
+    private fun voiceprintSourceFile(filesDir: File): File =
+        File(filesDir, "models/$WP_DIR/$WP_FILE")
+
+    private fun voiceprintSource(filesDir: File): File? =
+        voiceprintSourceFile(filesDir).takeIf {
+            it.exists() && it.length() > WP_MIN_BYTES
+        }
+
+    /**
+     * 在 ONNX ModelProto 末尾追加 metadata_props（field 14）。
+     *
+     * protobuf 允许已知字段乱序出现，因此无需引入 ONNX/protobuf 依赖来重写
+     * 26MB 图结构。七个值取自 sherpa-onnx 官方 add_meta_data.py；该 WeSpeaker
+     * CN-Celeb 模型的输出维度是 256，且输入按 [-32768, 32767] 归一化。
+     */
+    @Synchronized
+    private fun ensureSherpaMetadata(source: File): File? {
+        val metadataVersion = "v1"
+        val target = File(
+            source.parentFile,
+            source.nameWithoutExtension + ".sherpa-$metadataVersion.onnx"
+        )
+        val metadata = encodeSherpaMetadata()
+        val expectedSize = source.length() + metadata.size
+        if (target.exists() && target.length() == expectedSize) return target
+
+        val temp = File(target.parentFile, target.name + ".tmp")
+        return try {
+            source.inputStream().use { input ->
+                FileOutputStream(temp).use { output -> input.copyTo(output) }
+            }
+            RandomAccessFile(temp, "rw").use { out ->
+                out.seek(out.length())
+                out.write(metadata)
+                out.fd.sync()
+            }
+            if (target.exists() && !target.delete()) {
+                throw IllegalStateException("无法替换旧的声纹兼容模型")
+            }
+            if (!temp.renameTo(target)) {
+                throw IllegalStateException("无法保存声纹兼容模型")
+            }
+            Dbg.log("已生成 Sherpa 声纹兼容模型 ${target.length() / 1024 / 1024}MB")
+            target
+        } catch (t: Throwable) {
+            runCatching { temp.delete() }
+            Dbg.log("生成 Sherpa 声纹兼容模型失败：${t.javaClass.simpleName} ${t.message}")
+            null
+        }
+    }
+
+    private fun encodeSherpaMetadata(): ByteArray {
+        val entries = linkedMapOf(
+            "framework" to "wespeaker",
+            "language" to "Chinese",
+            "url" to "https://github.com/wenet-e2e/wespeaker/blob/master/docs/pretrained.md",
+            "comment" to "no comment",
+            "sample_rate" to "16000",
+            "output_dim" to "256",
+            "normalize_samples" to "0"
+        )
+        return ByteArrayOutputStream().use { model ->
+            for ((key, value) in entries) {
+                val entry = ByteArrayOutputStream().use { bytes ->
+                    writeBytes(bytes, field = 1, key.toByteArray(Charsets.UTF_8))
+                    writeBytes(bytes, field = 2, value.toByteArray(Charsets.UTF_8))
+                    bytes.toByteArray()
+                }
+                // ModelProto.metadata_props = 14
+                writeBytes(model, field = 14, entry)
+            }
+            model.toByteArray()
+        }
+    }
+
+    private fun writeBytes(out: ByteArrayOutputStream, field: Int, value: ByteArray) {
+        writeVarint(out, (field shl 3) or 2)
+        writeVarint(out, value.size)
+        out.write(value)
+    }
+
+    private fun writeVarint(out: ByteArrayOutputStream, value: Int) {
+        var remaining = value
+        while (remaining and 0x7f.inv() != 0) {
+            out.write((remaining and 0x7f) or 0x80)
+            remaining = remaining ushr 7
+        }
+        out.write(remaining)
     }
 
     /** 已就绪的模型目录；没有返回 null */

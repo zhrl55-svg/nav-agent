@@ -178,6 +178,25 @@ class SettingsActivity : AppCompatActivity() {
 
         row("声纹状态", app.voiceprintGate?.statusText() ?: "模型未就绪（后台下载中）", null, chevron = false) {}
 
+        rowSwitch(
+            "声纹打断播报", Prefs.voiceprintBargeIn,
+            "播报中只有你的声音能打断；喊唤醒词也要过声纹确认。没注册声纹时退回唤醒词直断"
+        ) { Prefs.voiceprintBargeIn = it; applied() }
+
+        row(
+            "打断声纹阈值", String.format("%.2f", Prefs.voiceprintBargeThreshold),
+            "实测回声 0.02~0.11、主人 0.39~0.52，取中间最稳"
+        ) {
+            choose(
+                "打断声纹阈值", listOf(
+                    "0.20（很宽松）" to 0.20f,
+                    "0.28（实测推荐）" to 0.28f,
+                    "0.35（偏严）" to 0.35f,
+                    "0.45（等于平时阈值，主人常被挡）" to 0.45f
+                ), Prefs.voiceprintBargeThreshold
+            ) { Prefs.voiceprintBargeThreshold = it; applied() }
+        }
+
         row("重新注册声纹", "清除", "清掉当前声纹，下次开口重新录一遍") {
             val g = app.voiceprintGate
             if (g == null) {
@@ -314,7 +333,11 @@ class SettingsActivity : AppCompatActivity() {
             ) { Prefs.ttsRate = it; applied() }
         }
 
-        row("回声保护", humanDuration(Prefs.echoGuardMs), "播报结束后多久内不拾音") {
+        row(
+            "回声保护",
+            humanDuration(Prefs.echoGuardMs),
+            "只屏蔽播报结束后的回声尾巴，不影响播报中用语音打断"
+        ) {
             choose(
                 "回声保护", listOf(
                     "0.6 秒" to 600L,
@@ -325,7 +348,11 @@ class SettingsActivity : AppCompatActivity() {
             ) { Prefs.echoGuardMs = it; applied() }
         }
 
-        rowSwitch("播报时可打断", Prefs.bargeIn, "你开口就停播报，不用等它念完") {
+        rowSwitch(
+            "播报时唤醒词可打断",
+            Prefs.bargeIn,
+            "播报中喊唤醒词立即停播并开始拾音，其他声音不会打断"
+        ) {
             Prefs.bargeIn = it; applied()
         }
 

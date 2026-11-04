@@ -243,7 +243,10 @@ class NavApp : Application() {
         )
         voiceprintGate = g
         g.warmup()
-        Dbg.log("声纹门禁已挂载：${model.length() / 1024 / 1024}MB")
+        Dbg.log(
+            "声纹门禁已挂载：${model.length() / 1024 / 1024}MB " +
+                "model=${model.name}"
+        )
     }
 
     /**

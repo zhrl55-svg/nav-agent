@@ -171,11 +171,12 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
         //   am start ... --es dest 张掖西站 --es slat 38.945004 --es slon 100.418646
         readDebugStart(intent)
 
-        // 播报期间点按钮是"打断播报"，不是"开始拾音"（半双工兜底）
+        // 播报期间点按钮：先停播，再立即开始拾音。
         findViewById<View>(R.id.talk).setOnClickListener {
             if (app.voice.isSpeaking) {
                 app.voice.silence()
-            } else if (!hasMicrophonePermission()) {
+            }
+            if (!hasMicrophonePermission()) {
                 ActivityCompat.requestPermissions(
                     this,
                     arrayOf(Manifest.permission.RECORD_AUDIO),
@@ -275,6 +276,10 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
         nav.start()
         // 调试入口：冷启动时也要能接 --es say。
         consumeSayExtra(intent)
+        consumeKwsTestExtra(intent)
+        consumeVpTestExtra(intent)
+        consumeVpEnrollExtra(intent)
+        consumeTtsExtra(intent)
         if (intent?.getStringExtra(EXTRA_DEST).isNullOrBlank()) {
             toast("地图已打开 · 说个目的地就开始导航")
         } else {
@@ -1725,12 +1730,65 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
         window.decorView.postDelayed({ app.submit(say) }, 400)
     }
 
+    /**
+     * 调试入口：拿一段 wav 跑 KWS 自测。
+     *
+     * `adb shell am start -n com.navagent/com.navagent.app.NavActivity --es kws_test /sdcard/kws_test/1.wav`
+     */
+    private fun consumeKwsTestExtra(intent: Intent?) {
+        val path = intent?.getStringExtra(EXTRA_KWS_TEST)?.takeIf { it.isNotBlank() } ?: return
+        Dbg.log("NavActivity KWS 自测：$path")
+        Thread {
+            val result = SherpaKwsTester.run(this, path)
+            Dbg.log("NavActivity KWS 自测结果：$result")
+        }.apply { isDaemon = true; name = "kws-test" }.start()
+    }
+
+    /**
+     * 调试入口：声纹自测，打印最近两秒麦克风音频的声纹分数。
+     *
+     * `adb shell am start -n com.navagent/com.navagent.app.NavActivity --es vp_test 1`
+     * 喊完话再执行一次，就能拿到「主人自己的声音」在当前环境下的基线分数。
+     */
+    /** 调试入口：拿最近这段音频重新注册声纹。`--es vp_enroll 1` */
+    private fun consumeVpEnrollExtra(intent: Intent?) {
+        if (intent?.getStringExtra(EXTRA_VP_ENROLL)?.takeIf { it.isNotBlank() } == null) return
+        Dbg.log("NavActivity 声纹重新注册")
+        window.decorView.postDelayed({
+            (application as? NavApp)?.voiceEngineProvider?.invoke()?.debugEnrollVoiceprint()
+        }, 300)
+    }
+
+    /**
+     * 调试入口：直接播一段指定文本，不经过对话。
+     *
+     * `adb shell am start -n com.navagent/com.navagent.app.NavActivity --es tts "要播的内容"`
+     * 测打断必须用这个：走对话的话模型可能返回工具调用，根本不播长内容。
+     */
+    private fun consumeTtsExtra(intent: Intent?) {
+        val text = intent?.getStringExtra(EXTRA_TTS)?.takeIf { it.isNotBlank() } ?: return
+        Dbg.log("NavActivity 直接播报：" + text.take(20))
+        (application as? NavApp)?.voice?.speak(text)
+    }
+
+    private fun consumeVpTestExtra(intent: Intent?) {
+        if (intent?.getStringExtra(EXTRA_VP_TEST)?.takeIf { it.isNotBlank() } == null) return
+        Dbg.log("NavActivity 声纹自测")
+        window.decorView.postDelayed({
+            (application as? NavApp)?.voiceEngineProvider?.invoke()?.debugVoiceprintScore()
+        }, 300)
+    }
+
     override fun onNewIntent(intent: Intent?) {
         super.onNewIntent(intent)
         if (intent == null) return
         setIntent(intent)
         Dbg.log("NavActivity onNewIntent extras=${intent.extras?.keySet()?.toList()}")
         consumeSayExtra(intent)
+        consumeKwsTestExtra(intent)
+        consumeVpTestExtra(intent)
+        consumeVpEnrollExtra(intent)
+        consumeTtsExtra(intent)
         readDebugStart(intent)
         val dest = intent.getStringExtra(EXTRA_DEST)?.takeIf { it.isNotBlank() } ?: return
         app.destination = dest
@@ -2016,6 +2074,10 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
         const val EXTRA_SLAT = "slat"
         const val EXTRA_SLON = "slon"
         const val EXTRA_EMULATOR = "emulator"
+        const val EXTRA_KWS_TEST = "kws_test"
+        const val EXTRA_VP_TEST = "vp_test"
+        const val EXTRA_VP_ENROLL = "vp_enroll"
+        const val EXTRA_TTS = "tts"
         private const val REQ_PERMS = 1002
         private const val REQ_LOCATION = 1003
         private const val REQ_MICROPHONE = 1004

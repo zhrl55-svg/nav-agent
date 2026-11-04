@@ -1,27 +1,20 @@
 package com.navagent.app
 
-import ai.onnxruntime.OnnxTensor
-import ai.onnxruntime.OrtEnvironment
-import ai.onnxruntime.OrtSession
-import com.navagent.core.KaldiFbank
+import com.k2fsa.sherpa.onnx.SpeakerEmbeddingExtractor
+import com.k2fsa.sherpa.onnx.SpeakerEmbeddingExtractorConfig
 import java.io.File
-import java.nio.FloatBuffer
 import kotlin.math.sqrt
 
 /**
  * WeSpeaker 声纹编码器：一段语音 → 256 维 embedding。
  *
- * 模型 `cnceleb_resnet34_LM.onnx`（26MB，CN-Celeb 中文说话人集上训的），
- * CPU 2 线程跑，3 秒音频约 0.1s —— 跟 ASR 并行不抢资源。
- *
- * 输入必须是 **Kaldi fbank**（见 [KaldiFbank]），跟训练时一致，差一点 embedding 就不可比。
+ * 使用 Sherpa 的 SpeakerEmbeddingExtractor，因为它与播报打断 KWS 共用
+ * 完整版 AAR 自带的 ONNX Runtime。此前 Microsoft ORT 与 Sherpa 的 native
+ * 运行时版本不一致，两个同名 libonnxruntime.so 无法同时可靠加载。
  */
 class SpeakerEncoder(private val modelFile: File) {
 
-    private var env: OrtEnvironment? = null
-    private var session: OrtSession? = null
-    private var inputName: String = ""
-    private var outputName: String = ""
+    private var extractor: SpeakerEmbeddingExtractor? = null
 
     @Volatile
     var ready = false
@@ -42,20 +35,22 @@ class SpeakerEncoder(private val modelFile: File) {
         }
         return try {
             val t0 = System.currentTimeMillis()
-            val e = OrtEnvironment.getEnvironment()
-            val opts = OrtSession.SessionOptions().apply {
-                setIntraOpNumThreads(2)
-                setInterOpNumThreads(1)
-            }
-            val s = e.createSession(modelFile.absolutePath, opts)
-            env = e
-            session = s
-            inputName = s.inputNames.first()
-            outputName = s.outputNames.first()
+            val next = SpeakerEmbeddingExtractor(
+                // 声纹模型运行后才下载。传 null 让 Sherpa 走 newFromFile；
+                // 传 AssetManager 去读绝对路径时，该版本 native 层会直接 abort。
+                null,
+                SpeakerEmbeddingExtractorConfig(
+                    model = modelFile.absolutePath,
+                    numThreads = 2,
+                    debug = false,
+                    provider = "cpu"
+                )
+            )
+            extractor = next
             ready = true
             Dbg.log(
                 "SpeakerEncoder 就绪 ${modelFile.length() / 1024 / 1024}MB " +
-                    "${System.currentTimeMillis() - t0}ms in=$inputName out=$outputName"
+                    "${System.currentTimeMillis() - t0}ms dim=${next.dim()}"
             )
             true
         } catch (t: Throwable) {
@@ -71,70 +66,40 @@ class SpeakerEncoder(private val modelFile: File) {
      */
     fun embed(pcm: ShortArray): FloatArray? {
         if (!load()) return null
-        val s = session ?: return null
-        val e = env ?: return null
+        val model = extractor ?: return null
 
         // 限长：超过 15 秒只取前面一段，够判定又省算力（和桌面 prepare() 一致）
-        val maxSamples = MAX_SECONDS * KaldiFbank.SAMPLE_RATE
+        val maxSamples = MAX_SECONDS * AudioCapture.SAMPLE_RATE
         val use = if (pcm.size > maxSamples) pcm.copyOf(maxSamples) else pcm
         if (use.size < MIN_SAMPLES) return null
 
         val f32 = FloatArray(use.size) { use[it] / 32768f }
-        val feat = KaldiFbank.compute(f32)
-        if (feat.isEmpty()) return null
-
-        val t = feat.size
-        val bins = KaldiFbank.NUM_MEL_BINS
-        val flat = FloatArray(t * bins)
-        for (i in 0 until t) {
-            System.arraycopy(feat[i], 0, flat, i * bins, bins)
+        val stream = runCatching { model.createStream() }.getOrElse {
+            Dbg.log("SpeakerEncoder createStream 失败：${it.message}")
+            return null
         }
-
-        var input: OnnxTensor? = null
         return try {
-            input = OnnxTensor.createTensor(
-                e,
-                FloatBuffer.wrap(flat),
-                longArrayOf(1L, t.toLong(), bins.toLong())
-            )
-            val out = s.run(mapOf(inputName to input)).use { result ->
-                reshape(result.get(0).value)
-            }
-            if (out == null || out.isEmpty()) {
-                Dbg.log("embed 输出形状异常")
+            stream.acceptWaveform(f32, AudioCapture.SAMPLE_RATE)
+            val out = model.compute(stream)
+            if (out.isEmpty()) {
+                Dbg.log("embed 输出为空")
                 return null
             }
             val norm = sqrt(out.sumOf { (it * it).toDouble() }).toFloat()
             if (norm <= 0f) null else FloatArray(out.size) { out[it] / norm }
-        } catch (t2: Throwable) {
-            Dbg.log("embed 失败 ${t2.javaClass.simpleName}: ${t2.message}")
+        } catch (t: Throwable) {
+            Dbg.log("embed 失败 ${t.javaClass.simpleName}: ${t.message}")
             null
         } finally {
-            runCatching { input?.close() }
+            runCatching { stream.release() }
         }
     }
 
+    @Synchronized
     fun close() {
-        runCatching { session?.close() }
-        session = null
+        runCatching { extractor?.release() }
+        extractor = null
         ready = false
-    }
-
-    /** ONNX 的输出可能是 FloatArray / Array<FloatArray> / Array<Array<FloatArray>>，统统拍平 */
-    private fun reshape(v: Any?): FloatArray? = when (v) {
-        is FloatArray -> v
-        is Array<*> -> {
-            val acc = ArrayList<Float>(512)
-            fun walk(x: Any?) {
-                when (x) {
-                    is FloatArray -> x.forEach { acc.add(it) }
-                    is Array<*> -> x.forEach { walk(it) }
-                }
-            }
-            walk(v)
-            if (acc.isEmpty()) null else acc.toFloatArray()
-        }
-        else -> null
     }
 
     private companion object {
@@ -142,6 +107,6 @@ class SpeakerEncoder(private val modelFile: File) {
         const val MAX_SECONDS = 15
 
         /** 比 0.4s 还短就不算了（桌面 _MIN_AUDIO_S） */
-        const val MIN_SAMPLES = (0.4 * KaldiFbank.SAMPLE_RATE).toInt()
+        val MIN_SAMPLES = (0.4 * AudioCapture.SAMPLE_RATE).toInt()
     }
 }

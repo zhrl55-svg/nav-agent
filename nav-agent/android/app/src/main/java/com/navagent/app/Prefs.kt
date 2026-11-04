@@ -48,6 +48,8 @@ object Prefs {
     private const val K_BARGE_IN = "barge_in"
     private const val K_VOICEPRINT = "voiceprint_on"
     private const val K_VOICEPRINT_TH = "voiceprint_threshold"
+private const val K_VOICEPRINT_BARGE = "voiceprint_barge_in"
+private const val K_VOICEPRINT_BARGE_TH = "voiceprint_barge_threshold"
     private const val K_TTS_VOICE = "tts_voice"
     private const val K_TTS_CLOUD_MODEL = "tts_cloud_model"
     private const val K_TTS_RATE = "tts_rate"
@@ -397,11 +399,7 @@ object Prefs {
         get() = sp.getLong(K_ECHO_GUARD, 1_500L)
         set(v) = sp.edit().putLong(K_ECHO_GUARD, v).apply()
 
-    /**
-     * 播报时用户开口就打断播报。
-     *
-     * 关掉能少误触 —— 车内音响开得很大时，回声可能被当成用户说话。
-     */
+    /** 播报期间允许唤醒词立即停播并开始拾音。 */
     var bargeIn: Boolean
         get() = sp.getBoolean(K_BARGE_IN, true)
         set(v) = sp.edit().putBoolean(K_BARGE_IN, v).apply()
@@ -422,6 +420,40 @@ object Prefs {
     var voiceprintThreshold: Float
         get() = sp.getFloat(K_VOICEPRINT_TH, 0.35f)
         set(v) = sp.edit().putFloat(K_VOICEPRINT_TH, v.coerceIn(0.1f, 0.9f)).apply()
+
+    /**
+     * 声纹参与「打断播报」判定。
+     *
+     * ★ 和 [voiceprint] 分开，是两个不同的开关：
+     *   [voiceprint] 管的是**平时听你说话**要不要放行（关掉是为了识别更宽松）；
+     *   这个管的是**播报中谁有资格打断**。
+     *
+     * 为什么分开：用户为了「随时能打断」把 [voiceprint] 关了（关了之后声纹一开就
+     * 打断不了，命令都识别不出来），结果播报这边也没有第二道防线，
+     * 助手回答里带一句「小猪」就能把播报掐断，用户喊了也没反应。
+     *
+     * 打开后：播报中命中唤醒词必须再过声纹确认，主人的近场人声连续两次过线就直接打断。
+     * 声纹没注册 / 模型没就绪时自动退回「唤醒词直断」，不会把设备锁死。
+     */
+    var voiceprintBargeIn: Boolean
+        get() = sp.getBoolean(K_VOICEPRINT_BARGE, true)
+        set(v) = sp.edit().putBoolean(K_VOICEPRINT_BARGE, v).apply()
+
+    /**
+     * 打断播报用的声纹阈值（和 [voiceprintThreshold] 分开）。
+     *
+     * ★ 实测数据（华为 P40 Pro，2026-11-04）：
+     *   播报回声（TTS 自己）  0.02 ~ 0.11
+     *   主人声音混在播报里    0.39 ~ 0.52
+     *   主人安静时（刚注册）  0.89
+     *
+     *   0.45（平时的匹配阈值）正好卡在中间 —— 回声挡得住，主人也被挡住，
+     *   真机上表现就是「喊了无数遍小猪都没反应」。
+     *   打断这条路径取 0.28：回声最高 0.11，主人最低 0.39，分得很开。
+     */
+    var voiceprintBargeThreshold: Float
+        get() = sp.getFloat(K_VOICEPRINT_BARGE_TH, 0.28f)
+        set(v) = sp.edit().putFloat(K_VOICEPRINT_BARGE_TH, v.coerceIn(0.15f, 0.6f)).apply()
 
     /**
      * TTS 引擎包名。空串 = 系统默认。

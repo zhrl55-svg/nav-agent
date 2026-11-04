@@ -55,6 +55,16 @@ export GRADLE_OPTS="-Dorg.gradle.internal.http.socketTimeout=20000 -Dorg.gradle.
 /d/Android/gradle/gradle-8.14.6/bin/gradle.bat assembleDebug
 ```
 
+**首次构建**先拉两个不入库的二进制（在仓库根目录执行）：
+
+```bash
+bash nav-agent/tools/fetch_amap_sdk.sh   # 高德导航 SDK，187MB
+bash nav-agent/tools/fetch_sherpa.sh     # sherpa-onnx AAR，47MB（带 sha256 校验）
+```
+
+Windows 上 `curl` 容易卡住，改用 PowerShell `Invoke-WebRequest` 即可。
+sherpa 的 KWS 模型（4.5MB）**已入库**，不用拉。
+
 安装（**不要用 `adb install` / `pm install`，见下方踩坑 7**）：
 
 ```bash
@@ -93,10 +103,17 @@ app/
 ├── VoiceEngine.kt       语音状态机 ASLEEP/LISTENING/THINKING
 ├── AudioCapture.kt      AudioRecord 16k/mono/PCM16，20ms 一帧
 ├── EnergyVad.kt         能量 VAD，自适应噪声底，断句 800ms
-├── VoskWake.kt          vosk 离线唤醒 + 模糊匹配（小.{0,3}高）
+├── VoskWake.kt          vosk 离线唤醒 + 模糊匹配（词首丢失/片段/拼音兜底）
+├── SherpaBargeIn.kt     播报期间的固定关键词识别（zipformer KWS，只认「小猪」）
+├── SherpaKwsTester.kt   KWS 离线自测：拿 wav 跑一遍，验证模型认不认得唤醒词
+├── HuaweiAudioPreprocess.kt 华为 ASR_AEC 开关（隐藏 setParameters，失败静默回退）
+├── RecentAudioBuffer.kt 唤醒候选的短音频环形缓冲（喂声纹用）
+├── VoiceprintGate.kt    声纹门禁（WeSpeaker cnceleb_resnet34_LM）
+├── SpeakerEncoder.kt    sherpa-onnx SpeakerEmbeddingExtractor（256 维）
 ├── ModelStore.kt        模型下载 / 解压 / 校验
 ├── MinimaxAsr.kt        MiniMax speech_to_text，手写 multipart
-├── MinimaxLlm.kt        MiniMax 聊天：SSE 流式 + Function Calling + ThinkFilter
+├── MinimaxTts.kt        MiniMax 云端 TTS（MP3；audio 字段是 hex，不是 base64）
+├── OpenAiLlm.kt         OpenAI 兼容对话（MiniMax / 本地 minis 都走它）
 ├── NavigationTool.kt    导航控制工具（navigate / stop / open_map）
 ├── WeatherTool.kt       天气查询（高德 Web API，零额外配置）
 ├── NearbyTool.kt        周边搜索（高德 POI，返回 3 个候选）
@@ -112,6 +129,94 @@ app/
 
 **架构纪律**：`core` 只产出 `Command`，不直接调用导航 SDK。换引擎时解析逻辑一行不改。
 
+## 唤醒与打断（2026-11-04 定稿）
+
+唤醒词当前是「小猪」，两套识别器分工：
+
+| 场景 | 用谁 | 匹配强度 | 目的 |
+|---|---|---|---|
+| 待命（ASLEEP） | Vosk 自由解码 | 宽松（词首丢失、任意片段、拼音兜底） | 宁可多唤醒，别唤醒不了 |
+| 播报中（打断） | Vosk 严格模式 **+** Sherpa zipformer KWS | 严格（必须完整唤醒词） | 不许被 TTS 里的普通词打断 |
+
+播报期间的判定链：
+
+```
+麦克风帧 → Vosk(严格) ─┐
+             Sherpa KWS ─┴→ 命中唤醒词
+                              ↓
+                     ① 自打断判定（播报原文里有没有这个词）
+                              ↓ 没被自己播出来
+                     ② 声纹确认（声纹关着就跳过）
+                              ↓ 通过
+                     停播报 → 提示「已打断播报」→ 进入聆听
+```
+
+**① 声纹是裁判**（`VoiceprintGate`）：主人近场说话和 TTS 回声在 embedding 上差得开，
+这一层既能挡回声，也能让主人直接喊话打断。失败一律放行（模型没就绪、没注册 → 退回唤醒词直断），
+它防误触，不是身份认证。
+
+> ★ 2026-11-04 之前那条「播报原文里含有唤醒词就不打断」的文本判断是错的，已删：
+> AI 的名字就叫「小猪」，回答里带一句「小猪」，用户后面喊的「小猪」全被吞掉，
+> 真机表现是「喊了无数遍小猪也没反应」。
+
+**② 两条路都能打断**：
+
+| 触发 | 判定 | 实测 |
+|---|---|---|
+| 喊唤醒词（Vosk 严格 / Sherpa KWS） | 声纹 ≥ 0.28 才打断 | 回声 0.02~0.11，主人 0.39~0.52 |
+| 只说话、不喊唤醒词 | 声纹连续两次 ≥ 0.38 才打断 | 同上，多一次连续确认防误触 |
+
+**实测分数基线**（华为 P40 Pro，2026-11-04，同一份声纹模板）：
+
+| 场景 | 分数 |
+|---|---|
+| TTS 回声（播报自己在响） | 0.02 ~ 0.11 |
+| 主人声音混在播报里 | 0.39 ~ 0.52 |
+| 主人安静时说话 | 0.89 |
+
+日常的「匹配阈值」0.45 卡在主人和回声中间，会把主人一起挡掉，
+所以打断走独立阈值 `Prefs.voiceprintBargeThreshold`（默认 0.28）。
+
+**★ 声纹模板会过期**：环境变了（车里、麦克风挪了位置、自适应漂了）分数会掉到 0.1 以下，
+这时候再准的判定也认不出主人。重新注册一次比调阈值靠谱 ——
+设置页「重新注册声纹」，或调试入口 `--es vp_enroll 1`（拿最近 2.5 秒音频覆盖模板）。
+
+**回声消除**目前是三层叠加，都不完美：
+
+- `AudioCapture` 显式挂 `AcousticEchoCanceler`（系统 AEC），音源保持 `VOICE_RECOGNITION`
+  —— 换 `VOICE_COMMUNICATION` 会连主人近场语音一起压低，真机上喊「小猪」只听得到「小」。
+- `HuaweiAudioPreprocess` 在播报期间下发华为的 `ASR_AEC=ON`（隐藏 `setParameters`），失败静默回退。
+- 播报结束后 600ms 回声保护期（`Prefs.echoGuardMs`）内不拾音。
+
+**调试入口**（都需要 `-s MDX0220A21035172`，两台设备同时连着）：
+
+```bash
+# KWS 离线自测：模型认不认得唤醒词
+adb -s MDX0220A21035172 shell am start -n com.navagent/com.navagent.app.NavActivity \
+  --es kws_test /sdcard/Android/data/com.navagent/files/kws_test/1.wav
+
+# 绕过语音，直接喂一句话
+adb -s MDX0220A21035172 shell am start -n com.navagent/com.navagent.app.NavActivity \
+  --es say "请在回答里说出唤醒词小猪"
+
+# 直接播一段长文本（测打断必须用这个：走对话模型可能返回工具调用，根本不播）
+adb -s MDX0220A21035172 shell am start -n com.navagent/com.navagent.app.NavActivity \
+  --es tts "这是一段很长的播报内容..."
+
+# 声纹自测：打印最近两秒麦克风音频的声纹分数
+adb -s MDX0220A21035172 shell am start -n com.navagent/com.navagent.app.NavActivity --es vp_test 1
+
+# 声纹重新注册：拿最近 2.5 秒音频覆盖旧模板（换环境了就得重来一遍）
+adb -s MDX0220A21035172 shell am start -n com.navagent/com.navagent.app.NavActivity --es vp_enroll 1
+
+adb -s MDX0220A21035172 pull /sdcard/Android/data/com.navagent/files/nav.log .
+```
+
+`kws_test` 用的是模型包自带的 `test_wavs/` + `test_keywords.txt`
+（`android/libs/sherpa/kws.tar.bz2`），已验证能命中「周望军」「朱丽楠」等官方样例，
+所以「模型不工作」和「现场音频激不活解码器」可以分开定位。
+注意 wav 必须放在 app 自己的外部目录里，放在 `/sdcard/kws_test` 会 EACCES。
+
 ## 设置
 
 入口在导航页底部「设置」按钮。全部落 `SharedPreferences`，默认值来自 `BuildConfig`（所以「恢复默认」= 回到编译时的值）。
@@ -119,14 +224,14 @@ app/
 | 分组 | 设置项 | 默认 | 生效方式 |
 |---|---|---|---|
 | 语音识别 | ASR 模型 | `asr-1.0` | 立即 |
-| | 唤醒词 | 你好小高,小高,… | **需重建** `VoiceService.reloadWake()` |
-| | 会话休眠 | 20 秒 | 立即 |
+| | 唤醒词 | 小猪,小猪你好,你好小猪 | **需重建** `VoiceService.reloadWake()`（播报中另走 KWS，无需重建） |
+| | 会话休眠 | 60 秒 | 立即 |
 | | 唤醒提示音 | 开 | 立即 |
 | 对话 | 对话模型 | `minimax-m3.1-flash` | 立即 |
 | | 回复长度 | 400 token | 立即 |
 | | 记忆轮数 | 8 轮 | 立即 |
 | 播报 | 语速 | 1.0x | `VoiceGuide.setRate()` |
-| | 回声保护 | 1.5 秒 | 立即 |
+| | 回声保护 | 600 毫秒 | 立即 |
 | 导航 | 周边搜索半径 | 3 公里 | 立即 |
 | 车载蓝牙 | 蓝牙自动启动 | 关 | 立即（需 BLUETOOTH_CONNECT 运行时权限） |
 | | 目标设备名 | 空 | 立即（设备名包含匹配） |
@@ -197,7 +302,7 @@ app/
    解法是打包阶段从 search jar 里剔掉这 2 个类、保留 navi-3dmap 的。
    search 那份是 navi 那份的**方法子集**，运行时行为不变。详见 `core/build.gradle.kts`
    的 `stripSearchDuplicates` 任务。
-4. **半双工兜底。** 播报期间点按钮是「打断播报」而不是「开始拾音」，避免把自己的声音收进去。
+4. **唤醒词 + 声纹打断。** 播报期间暂停普通 VAD / ASR，只运行 Vosk 高召回唤醒检测；命中候选后用最近 1.5 秒音频做声纹确认。两项都通过才停播并开始拾音，既接得住被 Vosk 拆错的唤醒词，也能拦住 TTS 和旁人声音。点语音按钮也会先停播再拾音。
 5. **`NaviLatLng` 用无参构造 + setter**，避开 `NaviLatLng(double, double)` 参数顺序（lat/lon 还是 lon/lat）的歧义。
 6. **左上角 × 是「退出整个应用」，不是退出导航。**
    高德内置界面的底栏（退出 / 继续导航 / 设置）被 `setCrossLocation` 裁到屏幕外，
@@ -393,8 +498,7 @@ navi.setCarInfo(carInfo)
 - [ ] 声纹门禁（只认主人声音）—— 设计定稿在 `HANDOFF.md` 第 10 节，本轮未实现
 - [x] **通用 Web 搜索**（Tavily `web_search` + `web_extract`）——设置页配置 Key；实时/易变信息优先检索，摘要不足时读取来源网页正文。天气已通
 - [x] 周边搜索（`AmapSdkGeocoder.searchAroundList()`，SDK 异步回调 + latch 转同步，不报列表只问「最近的中石化 1.8 公里，要去吗」）
-- [ ] 回声消除 —— 现在是「播报时暂停拾音」的半双工兜底，
-      副作用是**导航播报期间喊「小高」听不见**
+- [ ] 回声消除 —— 播报中用唤醒词打断，播报结束后另有可调回声保护期
 - [ ] 聊天历史持久化（杀进程就丢）
 - [ ] `Dbg` 在 release 关闭
 - [ ] vivo X20 Plus A 上跑一遍 v0.2.0（只验了华为）

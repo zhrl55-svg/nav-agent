@@ -51,10 +51,15 @@ class VoiceService : Service() {
             (application as NavApp).voice.silence()
         }
         engine.isSpeakingProvider = {
-            val v = (application as NavApp).voice
-            // 播报中 + 播报刚结束的回声尾巴，都不拾音（半双工 + 回声保护期）。
-            // 保护期长度在设置页可调：车内音响好、混响长就调大。
-            v.isSpeaking || v.inEchoWindow(Prefs.echoGuardMs)
+            (application as NavApp).voice.isSpeaking
+        }
+        // 播报原文：用来识别「唤醒词是我们自己播出来的」，避免播报自己打断自己。
+        engine.spokenTextProvider = {
+            (application as NavApp).voice.currentText
+        }
+        engine.isEchoGuardActiveProvider = {
+            val voice = (application as NavApp).voice
+            !voice.isSpeaking && voice.inEchoWindow(Prefs.echoGuardMs)
         }
 
         // 睡眠口令本地命中：不经过 LLM，直接播一句「好」再休眠。

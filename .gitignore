@@ -73,10 +73,14 @@ nav-agent/nav_*.png
 hicar-analysis/*.png
 
 # ---------------------------------------------------------------------------
-# sherpa-onnx KWS 原生库（212MB）
-# 2026-11-02 试接 sherpa-onnx 离线唤醒词，卡在 onnxruntime 符号版本上已回退
-# （最终用 vosk-android，见 app/build.gradle.kts 的注释）。
-# 这份是废弃尝试的遗留，不进版本库。
+# sherpa-onnx AAR（47MB）
+# 2026-11-04 正式启用：播报期间用它的 KeywordSpotter 做固定关键词识别，
+# 声纹 encoder 也换成它的 SpeakerEmbeddingExtractor。
+# AAR 只在 GitHub releases 上，官方没上 Maven，构建前跑 tools/fetch_sherpa.sh 拉。
+# 脚本里带 sha256 校验。
+# ★ KWS 模型本身（app/src/main/assets/sherpa-kws/，约 4.5MB）已经入库 ——
+#   上游 release 里的 int8 encoder 和入库这份不是同一个文件，
+#   而入库这份是 2026-11-04 在 P40 Pro 上实测能命中的版本。
 # ---------------------------------------------------------------------------
 nav-agent/android/libs/sherpa/
 
@@ -90,3 +94,13 @@ nav-agent/android/libs/sherpa/
 # ---------------------------------------------------------------------------
 nav-agent/tools/probe_news*.py
 nav-agent/tools/tav.json
+
+# ---------------------------------------------------------------------------
+# 调试过程产物（2026-11-04）
+# ---------------------------------------------------------------------------
+nav-agent/.tmp-*.log
+nav-agent/android/.tmp-*.log
+nav-agent/.tmp-kws-wav/
+nav-agent/.tmp-amap-inspect/
+nav-agent/p40-*.png
+nav-agent/$null

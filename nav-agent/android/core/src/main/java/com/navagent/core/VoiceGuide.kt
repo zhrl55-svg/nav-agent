@@ -140,6 +140,16 @@ class VoiceGuide(
         System.currentTimeMillis() - lastSpokeEndMs < ms
 
     /**
+     * 当前正在播的那句话的原文（没有在播就是 null）。
+     *
+     * 用途：播报期间用它判断「刚听到的唤醒词是不是我们自己播出来的」。
+     * 真机踩过的坑 —— 助手回答里带了一句「小猪」，麦克风把这段 TTS 收了进去，
+     * 唤醒检测误判成用户喊话，直接把播报打断，用户人还在那儿根本没出声。
+     */
+    val currentText: String?
+        get() = current?.text
+
+    /**
      * 语速。由宿主在启动时注入（core 不认识 SharedPreferences）。
      *
      * 车内场景实测：1.0 在安静环境够用，但发动机噪音 + 高速风噪下容易听漏，

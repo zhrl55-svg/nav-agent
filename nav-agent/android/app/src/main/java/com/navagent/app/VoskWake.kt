@@ -48,6 +48,16 @@ class VoskWake(modelDir: File, private val wakeWords: List<String>) : WakeWord {
     override var ready = false
         private set
 
+    /**
+     * 最近一次命中时的识别文本（live 或窗口）。
+     *
+     * 播报期间用它分辨「唤醒词是播报里带的」还是「用户喊的」：
+     * 文本里唤醒词比当前播报内容多一次，多出来的那次才是用户说的。
+     */
+    @Volatile
+    override var lastMatchText: String? = null
+        private set
+
     private val normalized = wakeWords.map { normalize(it) }.filter { it.isNotEmpty() }
 
     /**
@@ -199,7 +209,7 @@ class VoskWake(modelDir: File, private val wakeWords: List<String>) : WakeWord {
         }
     }
 
-    override fun feed(pcm: ShortArray, len: Int): Boolean {
+    override fun feed(pcm: ShortArray, len: Int, strict: Boolean): Boolean {
         val r = rec ?: return false
         return try {
             r.acceptWaveForm(pcm, len)
@@ -219,16 +229,21 @@ class VoskWake(modelDir: File, private val wakeWords: List<String>) : WakeWord {
                 if (partial.isNotBlank()) append(partial)
                 if (final.isNotBlank() && !endsWith(final)) append(final)
             }
-            if (live.isNotBlank() && match(live)) {
-                Dbg.log("唤醒词命中，partial=「$partial」 final=「$final」窗口=「$window」")
+            if (live.isNotBlank() && match(live, strict)) {
+                Dbg.log(
+                    "唤醒词命中${if (strict) "（播报严格模式）" else ""}，" +
+                        "partial=「$partial」 final=「$final」窗口=「$window」"
+                )
+                lastMatchText = live
                 r.reset()
                 framesSinceReset = 0
                 resetWindow()
                 return true
             }
 
-            if (match(window.toString())) {
-                Dbg.log("唤醒词命中，窗口=「$window」")
+            if (match(window.toString(), strict)) {
+                Dbg.log("唤醒词命中${if (strict) "（播报严格模式）" else ""}，窗口=「$window」")
+                lastMatchText = window.toString()
                 r.reset()
                 framesSinceReset = 0
                 resetWindow()
@@ -307,7 +322,7 @@ class VoskWake(modelDir: File, private val wakeWords: List<String>) : WakeWord {
         return obj.optString("partial").ifEmpty { obj.optString("text") }
     }
 
-    private fun match(text: String): Boolean {
+    private fun match(text: String, strict: Boolean = false): Boolean {
         if (text.isBlank()) return false
         // 只看窗口尾部：窗口会被环境说话污染，前面的字没有意义
         val tail = if (text.length > MATCH_TAIL_CHARS) text.takeLast(MATCH_TAIL_CHARS) else text
@@ -316,6 +331,12 @@ class VoskWake(modelDir: File, private val wakeWords: List<String>) : WakeWord {
         // [unk] 是"没听懂"的占位符，归一化后会变成 "unk"，
         // 千万别让它命中（之前就是这么误唤醒的）
         if (norm == "unk") return false
+
+        // 播报期间的严格模式只认完整唤醒词。
+        // 真机日志里「要知道着急」「需要时吧」「买票而」都曾被下面的
+        // 词首丢失 / 片段 / 近似拼音兜底误判成「小猪」。这些兜底适合
+        // 待命时尽量叫醒用户，但绝不能用来判断是否要打断导航播报。
+        if (strict) return strictMatch(norm, tail)
 
         // ① 汉字精确匹配（快路径，不需要转拼音）
         if (normalized.any { norm.contains(it) }) return true
@@ -368,6 +389,36 @@ class VoskWake(modelDir: File, private val wakeWords: List<String>) : WakeWord {
 
         // ③ 老的同音兜底，只对「小X高」有意义
         return fuzzy?.containsMatchIn(norm) ?: false
+    }
+
+    /**
+     * 播报期间的严格匹配。
+     *
+     * 允许：
+     *  - 完整汉字唤醒词，例如「小猪」「你好小猪」
+     *  - 完整同音词，例如「小朱」「晓猪」
+     *  - 完整拼音等价，例如「小都」与「小度」
+     *
+     * 禁止：词首丢失、任意片段、编辑距离近似。那些规则是待命唤醒的
+     * 召回兜底，放在 TTS 自身播放的连续文本上会产生大量误打断。
+     */
+    private fun strictMatch(norm: String, tail: String): Boolean {
+        if (normalized.any { norm.contains(it) }) return true
+
+        val candidates = pinyinCandidates(tail)
+        val pinyinHit = candidates.asSequence()
+            .flatMap { candidate -> expectedPinyin.asSequence().map { candidate to it } }
+            .firstOrNull { (candidate, expected) -> candidate.contains(expected) }
+        if (pinyinHit != null) {
+            Dbg.log("严格模式完整拼音命中：「$tail」→「${pinyinHit.second}」")
+            return true
+        }
+
+        if (fuzzy?.containsMatchIn(norm) == true) {
+            Dbg.log("严格模式完整同音词命中：「$tail」")
+            return true
+        }
+        return false
     }
 
     /**

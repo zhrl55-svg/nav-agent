@@ -178,6 +178,7 @@ class ChatActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
             permLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
             return
         }
+        if (app.voice.isSpeaking) app.voice.silence()
         VoiceService.start(this)
         VoiceService.wake(this)
         status.text = "在听…"

@@ -13,7 +13,21 @@ interface WakeWord {
     /** 模型是否加载成功。失败时 [feed] 永远返回 false，界面据此提示 */
     val ready: Boolean
 
-    fun feed(pcm: ShortArray, len: Int): Boolean
+    /**
+     * 最近一次命中时的识别窗口文本。
+     *
+     * 用来判断命中的唤醒词是「用户喊的」还是「播报内容里带的」：
+     * 窗口里唤醒词出现的次数比当前播报文本里多，说明多出来那一次是用户说的。
+     * 没命中过就是 null。
+     */
+    val lastMatchText: String?
+
+    /**
+     * @param strict true 时只接受完整唤醒词或完整同音词，禁用词首丢失、
+     *               任意片段和近似拼音兜底。播报期间必须使用严格模式，
+     *               防止 TTS 正文中的普通词误触发打断。
+     */
+    fun feed(pcm: ShortArray, len: Int, strict: Boolean = false): Boolean
     fun reset()
     fun shutdown()
 }
