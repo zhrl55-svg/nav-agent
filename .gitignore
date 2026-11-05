@@ -34,19 +34,6 @@ Thumbs.db
 .workbuddy-ai/
 
 # ---------------------------------------------------------------------------
-# HiCar 逆向分析产物
-# 体积巨大（APK 原件 ~150MB + 反编译源码 14000+ 文件），且属于第三方软件的
-# 逆向产物，不宜入库。结论文档 HICAR_LOGIC.md 保留在 hicar-analysis/ 根目录。
-# ---------------------------------------------------------------------------
-hicar-analysis/*.apk
-hicar-analysis/jadx/
-hicar-analysis/jadx_base/
-hicar-analysis/jadx_da/
-hicar-analysis/base_x/
-hicar-analysis/da_x/
-hicar-analysis/base-manifest.txt
-hicar-analysis/jadx_base.log
-hicar-analysis/jadx_da.log
 
 # 归档包
 *.zip
@@ -70,7 +57,6 @@ nav-agent/android/libs/amap/
 # ---------------------------------------------------------------------------
 nav-agent/shot*.png
 nav-agent/nav_*.png
-hicar-analysis/*.png
 
 # ---------------------------------------------------------------------------
 # sherpa-onnx AAR（47MB）
