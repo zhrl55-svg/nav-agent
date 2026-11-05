@@ -70,7 +70,22 @@ class OpenAiLlm(
         var slimmed = false
 
         while (true) {
-            val outcome = request(messages, allowTools = round == 0, onDelta)
+            // ★ 2026-11-05：允许**多轮**工具调用。
+            //   原来只有第 1 轮能调工具（第 2 轮起 tool_choice=none），模型最多搜一次，
+            //   「搜 → 读正文 → 发现不对 → 换个词再搜」这套真正的调研做不了。
+            //   现在前 MAX_TOOL_ROUNDS 轮都能调工具，到上限后强制总结，防止绕圈。
+            //
+            // ★ 播报策略：只有**第 1 轮**实时播报（模型通常先说「我帮你查一下」，
+            //   是有用的过渡语）；中间轮静音执行，否则模型每轮都说一句「我再查一下」，
+            //   语音会重复播报好几次。
+            //   最后一轮（没有 tool_calls 的那轮）若处于静音状态，把整段文本一次性播出来
+            //   —— 宁可晚一点，不要丢答案。
+            val speakThisRound = (round == 0)
+            val outcome = request(
+                messages,
+                allowTools = round < MAX_TOOL_ROUNDS,
+                onDelta = if (speakThisRound) onDelta else ({ _: String -> })
+            )
 
             if (outcome is Attempt.Err) {
                 // ① 第二轮被内容审核拒（422）：触发点几乎都在工具结果的正文里。
@@ -92,11 +107,19 @@ class OpenAiLlm(
             }
 
             val r = (outcome as Attempt.Ok).round
-            answer.append(r.text)
+            // ★ 只有会播报的轮次（第 1 轮）和最终答案轮才进 answer。
+            //   中间轮模型说的是「我再查一下」这类过渡语，混进最终回答会被 TTS 念出来。
+            //   （最后一轮若静音，会在上面统一补播。）
+            if (speakThisRound || r.calls.isEmpty()) answer.append(r.text)
 
-            // 工具结果回填后，即使服务端仍返回 tool_calls 也不能执行：
-            // 这一轮请求已经声明 tool_choice=none，继续执行只会重复搜索。
-            if (r.calls.isEmpty() || round > 0) {
+            // 没有 tool_calls = 模型在出答案，这一轮就是终局。
+            // ★ 2026-11-05：原来这里还有 `|| round > 0`，即第 2 轮起无条件收尾。
+            //   现在允许多轮，只要模型还要工具就继续；到 MAX_TOOL_ROUNDS 上限时
+            //   request() 会用 tool_choice=none 逼它总结，tool_calls 自然为空。
+            if (r.calls.isEmpty()) {
+                // 静音轮（中间轮）走到这里，说明它其实是在出最终答案：
+                // 把这一段一次性播出去，别让用户只听到半句。
+                if (!speakThisRound && r.text.isNotBlank()) onDelta(r.text)
                 val text = answer.toString().trim()
                 // 总结为空时保留工具结果，让 ChatEngine 的重试可以通过
                 // chatText() 直接基于已经搜到的资料回答，避免白搜一次。
@@ -1000,5 +1023,15 @@ class OpenAiLlm(
 
         /** 覆盖地点搜索 + 城市等待 + 高德算路的最长链路 */
         const val TOOL_TIMEOUT_SECONDS = 30L
+
+        /**
+         * 一次对话里最多允许几轮工具调用。
+         *
+         * ★ 2026-11-05 新增。原来只有 1 轮（搜一次就总结），做不了真正的调研。
+         *   3 轮是平衡点：够完成「搜 → 读正文 → 换个词再搜」，
+         *   又不至于让语音助手的等待时间失控（每轮都要一次 LLM 往返）。
+         *   到上限后 request() 用 tool_choice=none 强制总结，不会无限绕圈。
+         */
+        const val MAX_TOOL_ROUNDS = 3
     }
 }

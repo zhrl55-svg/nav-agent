@@ -191,7 +191,8 @@ class NavApp : Application() {
                         }
                     ),
                     WebSearchTool { Prefs.tavilyKey },
-                    WebExtractTool { Prefs.tavilyKey }
+                    // 需要 Context：WebView 兜底要在本机浏览器内核里渲染页面
+                    WebExtractTool(this) { Prefs.tavilyKey }
                 )
             ),
             onDelta = { piece -> chatObservers.forEach { it.onAssistantDelta(piece) } },
