@@ -61,14 +61,8 @@ class MinimaxTts(private val context: Context) : CloudTts {
 
             val mp = MediaPlayer()
             player = mp
-            // ★ 必须标成「导航语音」，不能留默认的 USAGE_MEDIA/MUSIC。
-            //
-            //   默认值是音乐类音频，只走 A2DP（媒体）通道；车机如果只接了通话通道
-            //   （HFP），或者媒体音量是 0，播报就完全没声 —— 这就是用户反馈的
-            //   「声音传不到车机，高德 App 可以」。高德能响是因为它标了导航语音。
-            //
-            //   类型也要给 SPEECH：系统据此决定是否走语音增强链路。
-            //   必须在 setDataSource 之前设，否则不生效。
+            // 标成导航语音，但保持系统普通模式，由系统路由到蓝牙 A2DP 媒体通道。
+            // 不能在播报期间切 MODE_IN_COMMUNICATION / SCO，否则会落到窄带通话通道。
             runCatching {
                 mp.setAudioAttributes(
                     android.media.AudioAttributes.Builder()
@@ -90,6 +84,16 @@ class MinimaxTts(private val context: Context) : CloudTts {
                 true
             }
             mp.prepare()
+            // 蓝牙连接时优先绑定 A2DP 输出。系统通常会自动选择，
+            // 显式指定可避免部分车机在媒体和通话通道之间选错。
+            runCatching {
+                val audio = context.getSystemService(android.media.AudioManager::class.java)
+                val a2dp = audio?.getDevices(android.media.AudioManager.GET_DEVICES_OUTPUTS)
+                    ?.firstOrNull {
+                        it.type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
+                    }
+                if (a2dp != null) mp.preferredDevice = a2dp
+            }.onFailure { Dbg.log("TTS 指定 A2DP 输出失败：${it.message}") }
             mp.start()
         }.onFailure {
             Dbg.log("播放异常 ${it.javaClass.simpleName}: ${it.message}")
@@ -133,6 +137,8 @@ class MinimaxTts(private val context: Context) : CloudTts {
                     .put("sample_rate", 32000)
                     .put("bitrate", 128_000)
                     .put("format", "mp3")
+                    // 人声播报没有左右声像信息，单声道足够，也能减少流量和车机混音负担。
+                    .put("channel", 1)
             )
             .toString()
 

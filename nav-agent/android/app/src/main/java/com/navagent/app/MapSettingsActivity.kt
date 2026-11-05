@@ -176,13 +176,11 @@ class MapSettingsActivity : AppCompatActivity() {
                 applied()
             }
         }
-        rowSwitch(
-            "车载蓝牙播报", Prefs.carBluetoothAudio,
-            "播报走蓝牙通话通道，车机才出得来声。关掉只改音频类型，个别车机仍可能没声"
-        ) {
-            Prefs.carBluetoothAudio = it
-            applied()
-        }
+        row(
+            "蓝牙声音模式", "媒体音频（A2DP）",
+            "导航播报使用媒体声道，不切换到通话或 SCO 窄带通道",
+            chevron = false
+        ) {}
         row(
             "语音引擎", voiceEngineLabel(),
             "播报用哪个 TTS。云端音色更自然，本地引擎零延迟、没网也能用"

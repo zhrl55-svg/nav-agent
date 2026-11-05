@@ -144,8 +144,7 @@ class NavApp : Application() {
         voice = VoiceGuide(this, Prefs.ttsEngine)
         // 云端合成器：设置里选「MiniMax 云端」时才会被用到
         voice.cloudTts = MinimaxTts(this)
-        // ★ 车载蓝牙路由：播报期间把音频送到车机，播完立刻还原
-        //   （不还原的话 SCO 会把麦克风锁在 8kHz，下一句指令就听不清了）
+        // ★ 车载蓝牙路由：播报走 A2DP 媒体通道，不切通信模式或 SCO
         carAudio = CarAudioRoute(this)
         voice.speakWindowListener = { speaking, navPriority ->
             runCatching {

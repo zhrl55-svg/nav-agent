@@ -105,8 +105,8 @@ class VoiceGuide(
      * 播报窗口回调：(是否开始播报, 是否导航级)。
      *
      * ★ 2026-11-03 加。宿主用它切车载蓝牙通道（见 app 层 CarAudioRoute）：
-     *   播报开始前把音频路由到车机，播报一结束立刻还原 ——
-     *   不还原的话 SCO 会把麦克风锁在 8kHz 窄带，下一句指令就识别不准了。
+     *   播报期间申请音频焦点；播放流固定使用 STREAM_MUSIC，由系统送到蓝牙 A2DP。
+     *   不切通信模式，也不启动 SCO。
      */
     @Volatile
     var speakWindowListener: ((Boolean, Boolean) -> Unit)? = null

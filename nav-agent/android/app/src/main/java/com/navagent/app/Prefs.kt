@@ -69,7 +69,6 @@ private const val K_VOICEPRINT_BARGE_TH = "voiceprint_barge_threshold"
     private const val K_NAV_TRAFFIC_LIGHT = "nav_traffic_light"
     private const val K_NAV_SEARCH_BAR = "nav_search_bar"
     private const val K_NAV_ZOOM = "nav_zoom"
-    private const val K_CAR_BT_AUDIO = "car_bt_audio"
     private const val K_CAR_NUMBER = "car_number"
     private const val K_MEMORY_USER_ID = "memory_user_id"
     private const val K_MINIS_PROVIDER_MIGRATED = "minis_provider_migrated"
@@ -536,20 +535,6 @@ private const val K_VOICEPRINT_BARGE_TH = "voiceprint_barge_threshold"
     var navZoom: Int
         get() = sp.getInt(K_NAV_ZOOM, 16)
         set(v) = sp.edit().putInt(K_NAV_ZOOM, v.coerceIn(3, 20)).apply()
-
-    /**
-     * 车载蓝牙播报。
-     *
-     * ★ 为什么需要这个开关：车机蓝牙常常只接通话通道（HFP），没接媒体通道（A2DP）。
-     *   MediaPlayer 默认走 USAGE_MEDIA，这种车机上就完全没有声音；
-     *   高德能响是因为它把播报标成「导航语音」，系统会把它往蓝牙通话通道送。
-     *
-     *   打开后：播报期间把音频模式切到通信模式并启用蓝牙 SCO，播完立刻恢复。
-     *   关掉则只改 AudioAttributes（更省事，但个别车机仍可能没声）。
-     */
-    var carBluetoothAudio: Boolean
-        get() = sp.getBoolean(K_CAR_BT_AUDIO, true)
-        set(v) = sp.edit().putBoolean(K_CAR_BT_AUDIO, v).apply()
 
     /**
      * 车牌号（如「甘G12345」）。
