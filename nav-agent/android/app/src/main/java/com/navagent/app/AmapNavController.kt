@@ -9,6 +9,7 @@ import com.amap.api.location.AMapLocation
 import com.amap.api.location.AMapLocationClient
 import com.amap.api.location.AMapLocationClientOption
 import com.amap.api.navi.AMapNavi
+import com.amap.api.navi.FullLinkLogCallback
 import com.amap.api.navi.enums.NaviTTSType
 import com.amap.api.navi.enums.NaviType
 import com.amap.api.navi.enums.PathPlanningStrategy
@@ -203,18 +204,33 @@ class AmapNavController(
     /** SDK 回调来自工作线程，UI/播报统一切回主线程 */
     private val main = Handler(Looper.getMainLooper())
 
+    /**
+     * SDK 全链路日志里与动态红绿灯相关的诊断。
+     *
+     * 动态倒计时由 SDK 内部的 TrafficSignalDataManager 和 Eyrie View 完成，
+     * 公开回调只给出“红绿灯状态更新”，拿不到秒数。这里保留少量关键日志，
+     * 用来区分数据没有下发、Lottie 资源不完整和动态视图没有挂载三种情况。
+     */
+    private val fullLinkLogLock = Any()
+    private var fullLinkLogCount = 0
+    private var lastFullLinkLogAt = 0L
+    private var lastFullLinkLog = ""
+    private var fullLinkLogWindowStartedAt = 0L
+
     /** 必须在 AMapNaviView.onCreate() 之后调用 */
     fun start() {
         Dbg.log("nav.start()")
         runCatching {
+            // 全链路日志必须在 AMapNavi 单例初始化之前安装，否则会漏掉
+            // TrafficSignalDataManager 初始化阶段的关键日志。
+            installTrafficDiagnostics()
             navi = AMapNavi.getInstance(context).also {
                 it.addAMapNaviListener(listener)
                 Dbg.log("AMapNavi.getInstance 成功 ver=" + AMapNavi.getVersion())
                 // 关掉内置语音，否则会和我们自己的 TTS 双重播报
                 it.setUseInnerVoice(false)
 
-                // ★ 红绿灯信号数据。V11.3 里 setTrafficSignalEnable 只打开数据源；
-                //   官方倒计时视图还需要 setIsOpenTrafficLight("TLTRUE")。
+                // ★ 红绿灯信号数据。V11.3 需要同时打开信号订阅、路况信息更新和状态更新。
                 setTrafficLightEnabled(Prefs.navTrafficLight)
 
                 // 多路径选择在算路成功后开启。此时候选路线已经就绪，SDK 才能把
@@ -271,6 +287,37 @@ class AmapNavController(
             Log.e(TAG, "定位客户端初始化失败", it)
             onState("定位初始化失败：${it.message}")
         }
+    }
+
+    private fun installTrafficDiagnostics() {
+        if (!BuildConfig.DEBUG || !Prefs.fileLog) return
+        fullLinkLogWindowStartedAt = System.currentTimeMillis()
+        AMapNavi.setFullLinkLogCallback(
+            FullLinkLogCallback { info, timestamp ->
+                val message = info ?: return@FullLinkLogCallback
+                val lower = message.lowercase(Locale.US)
+                synchronized(fullLinkLogLock) {
+                    val now = System.currentTimeMillis()
+                    if (fullLinkLogCount >= MAX_TRAFFIC_LOG_LINES) return@FullLinkLogCallback
+                    val inDiagnosticWindow =
+                        now - fullLinkLogWindowStartedAt <= TRAFFIC_DIAGNOSTIC_WINDOW_MS
+                    if (!inDiagnosticWindow && TRAFFIC_LOG_KEYS.none(lower::contains)) {
+                        return@FullLinkLogCallback
+                    }
+                    if (message == lastFullLinkLog && now - lastFullLinkLogAt < 500L) {
+                        return@FullLinkLogCallback
+                    }
+                    fullLinkLogCount++
+                    lastFullLinkLog = message
+                    lastFullLinkLogAt = now
+                }
+                Dbg.log(
+                    "SDK全链路诊断 ts=$timestamp " +
+                        message.take(MAX_TRAFFIC_LOG_CHARS)
+                )
+            }
+        )
+        Dbg.log("SDK红灯全链路诊断已启用")
     }
 
     override fun navigateTo(destination: String) {
@@ -479,6 +526,10 @@ class AmapNavController(
         //   官方文档说 setCarInfo 影响的是「路径规划时会躲避车辆限行区域和路线」，
         //   所以必须在 calculateDriveRoute 之前生效，不能只在 start() 里设一次。
         applyCarInfo(n)
+        // 动态红绿灯服务和 Core 的信号订阅必须在算路前就处于开启状态。
+        // 如果等到 startNavi() 后再打开，部分 SDK 版本已经用“关闭”状态完成
+        // 信号管理器初始化，后续刷新只能拿到灯态，拿不到倒计时秒数。
+        setTrafficLightEnabled(Prefs.navTrafficLight)
         // 用无参构造 + setter，避开 NaviLatLng(double,double) 参数顺序的歧义
         val start = NaviLatLng().apply {
             latitude = lastLat
@@ -696,21 +747,56 @@ class AmapNavController(
     /**
      * 开关高德红绿灯信号源。
      *
-     * `setTrafficSignalEnable(true)` 打开数据订阅；
-     * `setIsOpenTrafficLight("TLTRUE")` 才是 V11.3 官方倒计时视图的总开关。
+     * `setTrafficSignalEnable(true)` 打开路线信号数据订阅；
+     * `setTrafficInfoUpdateEnabled(true)` 开启路况信息更新；
+     * `setIsOpenTrafficLight("TLTRUE")` 才是 V11.3 动态倒计时信号的总开关。
      */
     fun setTrafficLightEnabled(enabled: Boolean) {
         val n = navi ?: return
-        // 三个开关相互独立，某一个失败时不能让后面的开关也被跳过。
+        // V11.3 公开的 AMapNavi.setTrafficSignalEnable(boolean) 在 Java 包装层
+        // 丢弃了布尔参数，实际上不会控制 native 信号订阅。必须直接调用
+        // CoreManager 的同名实例方法，否则倒计时数据服务可能从未启动。
+        setNativeTrafficSignalEnable(enabled)
+        // 五个开关相互独立，某一个失败时不能让后面的开关也被跳过。
         runCatching { n.setTrafficSignalEnable(enabled) }
             .onFailure { Dbg.log("红绿灯信号订阅失败：${it.message}") }
+        runCatching { n.setTrafficInfoUpdateEnabled(enabled) }
+            .onFailure { Dbg.log("路况信息更新开关失败：${it.message}") }
         runCatching { n.setTrafficStatusUpdateEnabled(enabled) }
             .onFailure { Dbg.log("红绿灯状态更新失败：${it.message}") }
         if (enabled) {
-            runCatching { n.setIsOpenTrafficLight("TLTRUE") }
+            runCatching { n.setIsOpenTrafficLight(TRAFFIC_LIGHT_ENABLE_TOKEN) }
                 .onFailure { Dbg.log("红绿灯倒计时开关失败：${it.message}") }
         }
         Dbg.log("红绿灯信号源 → $enabled")
+    }
+
+    private fun setNativeTrafficSignalEnable(enabled: Boolean) {
+        val n = navi ?: return
+        runCatching {
+            val innerField = AMapNavi::class.java
+                .getDeclaredField("mINavi")
+                .apply { isAccessible = true }
+            val inner = innerField.get(n)
+            val coreOwnerField = inner.javaClass.declaredFields.firstOrNull {
+                it.type.name == "com.amap.api.navi.core.h"
+            } ?: error("找不到 AMapNavi Core 所有者字段")
+            coreOwnerField.isAccessible = true
+            val coreOwner = coreOwnerField.get(inner)
+            val coreManagerField = coreOwner.javaClass.declaredFields.firstOrNull {
+                it.type.name == "com.autonavi.amap.navicore.AMapNaviCoreManager"
+            } ?: error("找不到 AMapNaviCoreManager 字段")
+            coreManagerField.isAccessible = true
+            val coreManager = coreManagerField.get(coreOwner)
+            val method = coreManager.javaClass.getDeclaredMethod(
+                "setTrafficSignalEnable",
+                Boolean::class.javaPrimitiveType
+            ).apply { isAccessible = true }
+            val result = method.invoke(coreManager, enabled)
+            Dbg.log("Core 红绿灯信号订阅配置 → $enabled result=$result")
+        }.onFailure {
+            Dbg.log("Core 红绿灯信号订阅配置失败：${it.javaClass.simpleName}: ${it.message}")
+        }
     }
 
     override fun stop() {
@@ -974,6 +1060,9 @@ class AmapNavController(
             if (debugEmulator) {
                 n.setEmulatorNaviSpeed(80)
             }
+            // 候选路线已经生成、即将进入导航态，再确保一次信号开关为开启。
+            // 这一步发生在 startNavi 之前，避免动态红绿灯管理器按关闭状态启动。
+            setTrafficLightEnabled(Prefs.navTrafficLight)
             val started = n.startNavi(
                 if (debugEmulator) NaviType.EMULATOR else NaviType.GPS
             )
@@ -1100,6 +1189,7 @@ class AmapNavController(
 
         override fun onTrafficStatusUpdate() {
             if (stopRequested) return
+            Dbg.log("红绿灯状态更新回调")
             logStructuredTrafficInfo()
         }
 
@@ -1193,8 +1283,31 @@ class AmapNavController(
     private companion object {
         const val TAG = "AmapNav"
 
+        /**
+         * AMapNavi V11.3 的 `setIsOpenTrafficLight` 参数。
+         */
+        const val TRAFFIC_LIGHT_ENABLE_TOKEN = "TLTRUE"
+
         /** 高德对没有正式名称的道路统一返回这个字符串 */
         const val UNNAMED_ROAD = "无名道路"
+
+        val TRAFFIC_LOG_KEYS = arrayOf(
+            "trafficlight",
+            "traffic signal",
+            "trafficsignal",
+            "lightstatus",
+            "countdown",
+            "redlight",
+            "greenlight",
+            "lottie",
+            "full package",
+            "basic package",
+            "lbsnavitraffic",
+            "dynamicinfo"
+        )
+        const val MAX_TRAFFIC_LOG_LINES = 4_000
+        const val MAX_TRAFFIC_LOG_CHARS = 3_000
+        const val TRAFFIC_DIAGNOSTIC_WINDOW_MS = 20_000L
 
         const val SDK_CALLBACK_DUPLICATE_MS = 500L
 
