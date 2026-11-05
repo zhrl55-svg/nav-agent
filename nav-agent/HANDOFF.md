@@ -65,17 +65,9 @@ NavApp（Application 单例）
 
 ## 3. 五分钟跑起来
 
-**一条命令搞定（推荐）**：
-
-```bash
-tools/deploy.sh                                   # 编译+安装+启动+截图+日志
-tools/deploy.sh -s 192.168.2.21:5555 --no-build   # 无线设备，跳过编译
-tools/deploy.sh --say "导航去张掖西站"              # 启动后直接喂一句话
-tools/deploy.sh --chat                            # 起对话页
-```
-
-脚本会自己挑设备（只有一台时）、自动重连无线设备、走三段式安装、截图存
-`shots/`、最后打印 `nav.log` 尾部。
+**本地开发辅助脚本（不入库）**：开发机上有一个 `tools/deploy.sh`，能一条命令完成
+编译+安装+启动+截图+日志。但它绑定具体的开发机环境（设备 IP、Gradle 路径），
+不随仓库分发，clone 下来的人用不了，需要的话自己写一份。
 
 **为什么不用模拟器**（2026-11-05 结论）：高德只提供 `arm64-v8a` 和
 `armeabi-v7a` 的 so（`libs/amap/` 下就这两套，jar 里一个 so 都没有）。
