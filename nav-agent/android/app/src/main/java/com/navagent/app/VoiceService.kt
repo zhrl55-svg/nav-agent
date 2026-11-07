@@ -46,9 +46,22 @@ class VoiceService : Service() {
         // 声纹门禁：每次用时从 Application 取（模型可能是后台下载完才挂上的）
         engine.voiceprintProvider = { (application as NavApp).voiceprintGate }
 
-        // 播报中用户开口 → 停播报
+        // 播报中用户开口 → 停播报。
+        //
+        // ★ 2026-11-07 从 `voice.silence()` 换成 app.bargeInChat()：
+        //   silence() 会把导航播报一起清掉，而导航播报是不能被打断的；
+        //   bargeInChat() 只停闲聊，并且顺手把这一轮对话静音（否则模型还在流式
+        //   输出，下一句又会念出来）。
         engine.onBargeIn = {
-            (application as NavApp).voice.silence()
+            (application as NavApp).bargeInChat()
+        }
+        // 导航播报期间只记录不执行（见 VoiceEngine.stageDeferredBarge）
+        engine.navSpeakingProvider = {
+            (application as NavApp).voice.speakingPriority == VoiceGuide.Priority.NAV
+        }
+        // 助手刚念过 1、2、3 让用户挑 → 允许用序号打断
+        engine.choiceModeProvider = {
+            (application as NavApp).choiceModeActive()
         }
         engine.isSpeakingProvider = {
             (application as NavApp).voice.isSpeaking

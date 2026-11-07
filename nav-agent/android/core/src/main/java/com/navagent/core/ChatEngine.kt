@@ -49,6 +49,14 @@ class ChatEngine(
     /** 明确的本地动作意图可由宿主直接执行，避免不支持工具调用的模型只给文字承诺。 */
     private val interceptAction: (String, List<ChatMessage>) -> String? = { _, _ -> null },
     /**
+     * 选择列表状态回调：(是否进入列表, 条数)。
+     *
+     * ★ 2026-11-07 加。宿主用它开一个「选择窗口」：窗口期内用户说
+     *   「第2个」「最后一个」可以直接打断播报并当成选择提交。
+     *   窗口什么时候关由宿主决定（下一句话进来 / 超时）。
+     */
+    private val onChoiceMode: (Boolean, Int) -> Unit = { _, _ -> },
+    /**
      * App 本地记忆。启动时恢复最近对话，每轮把相关长期事实注入 system prompt。
      *
      * 记忆与模型提供商解耦：无论请求发往 Minis、MiniMax、OpenAI 还是本地模型，
@@ -86,6 +94,26 @@ class ChatEngine(
     /** reset() 时递增；旧请求晚到的结果不能写回新一轮对话。 */
     private var generation = 0L
 
+    /**
+     * 本轮生成已被用户打断：只上屏，不再送 TTS。
+     *
+     * ★ 2026-11-07 加。原来「打断」只调 `voice.silence()`，可模型还在流式输出，
+     *   下一段增量攒够一句又 `speak()` 出去了 —— 用户听到的是「说了一半停一下、
+     *   接着又说」，打断等于没打断。现在打断时把这一轮静音，文字照常进界面。
+     *
+     * 每句话（[process]）开始时复位，所以下一轮不受影响。
+     */
+    @Volatile
+    private var muted = false
+
+    /** 本轮是否已经上报过"在选择列表里" */
+    private var choiceMarked = false
+
+    /** 用户打断播报：当前这轮生成只上屏、不再出声 */
+    fun muteCurrent() {
+        muted = true
+    }
+
     @Volatile
     var busy: Boolean = false
         private set
@@ -107,6 +135,9 @@ class ChatEngine(
     }
 
     private fun process(utterance: String) {
+        // 新一轮 = 重新允许出声、重新判定选择列表
+        muted = false
+        choiceMarked = false
         val userMessage = ChatMessage(ChatMessage.Role.USER, utterance)
         val runGeneration = synchronized(lock) {
             history += userMessage
@@ -122,7 +153,8 @@ class ChatEngine(
                     appendAssistant(runGeneration, intercepted)
                     onDelta(intercepted)
                     onReply(intercepted)
-                    runCatching { speak(intercepted) }
+                    // 本地拦截的回复都很短（「好，正在导航」），不会是列表
+                    if (!muted) runCatching { speak(intercepted) }
                 }
                 return
             }
@@ -137,6 +169,9 @@ class ChatEngine(
                 sb.append(piece)
                 if (!isCurrent(runGeneration)) return
                 onDelta(piece)
+                detectChoice(sb)
+                // 被打断之后：文字继续上屏，但一个字都不再念
+                if (muted) return
                 spoken.append(piece)
                 if (speakCompletedSentences(spoken)) spokenAny = true
             }
@@ -197,13 +232,19 @@ class ChatEngine(
 
             // 收尾：把没说完的半句念掉
             if (spoken.isNotBlank()) {
-                speak(spoken.toString().trim())
-                spokenAny = true
+                val tail = spoken.toString().trim()
                 spoken.setLength(0)
+                if (!muted) {
+                    speak(tail)
+                    spokenAny = true
+                }
             }
             // 兜底：整段回复一个句末标点都没有（或模型返回空）时上面一句都没念，
             // 这里必须补上，否则界面上有字、耳朵里没声。
-            if (!spokenAny) speak(answer)
+            if (!spokenAny && !muted) speak(answer)
+
+            // 整段回来之后再判一次：流式时可能刚好把最后一条编号切在两个增量之间
+            detectChoice(sb)
 
             appendAssistant(runGeneration, answer)
             onReply(answer)
@@ -249,6 +290,22 @@ class ChatEngine(
             }
         }
         if (next != null) worker.execute { process(next) }
+    }
+
+    /**
+     * 流式过程中判断「这轮回复在念选择列表」。
+     *
+     * 一旦判定过就不再重复判定（[choiceMarked]）：列表条数会随流式增长，
+     * 每段都上报一次会把宿主的窗口反复重置，没有意义。
+     *
+     * 失败不影响对话 —— 判不出来最多是用户的序号打断无效，不会丢内容。
+     */
+    private fun detectChoice(sb: CharSequence) {
+        if (choiceMarked) return
+        val n = runCatching { ChoiceList.count(sb.toString()) }.getOrDefault(0)
+        if (n < 2) return
+        choiceMarked = true
+        runCatching { onChoiceMode(true, n) }
     }
 
     /**

@@ -65,6 +65,13 @@ class VoiceprintGate(
      *
      * 播报中候选音频可能同时包含 TTS 和主人说话。一个勉强过线的混合
      * embedding 不能拿去做 EMA，否则模板会慢慢被播报声污染。
+     *
+     * ★ 2026-11-07 用户换了女声之后反馈"声纹没过滤掉播报声"，顺着查到的
+     *   根源就在这条 EMA 上：以前普通识别路径（[allow] → [score] adapt=true）
+     *   对**每一句**都自适应，包括播报混音里的句子。主人声音 0.6~0.7 过线，
+     *   模板就被 TTS 成分一点点拉过去；用得越久，模板越像"主人 + 女声"的混合，
+     *   于是播报声的分数越来越高，最后就"过滤不掉"了。
+     *   现在只要这段音频和播报有重叠，一律走这里（不自适应 + 更高阈值）。
      */
     @Synchronized
     fun scoreForCheck(pcm: ShortArray, sampleRate: Int): Float? {
@@ -85,18 +92,35 @@ class VoiceprintGate(
         return dot
     }
 
-    /** 是否放行。没注册 / 算不出 / 太短 —— 全部放行 */
-    fun allow(pcm: ShortArray, sampleRate: Int = 16_000): Boolean {
+    /**
+     * 是否放行。没注册 / 算不出 / 太短 —— 全部放行。
+     *
+     * @param margin 额外收紧量。播报混音里主人自己的声音只有 0.6 左右，
+     *   而 TTS 回声偶尔能蹭到 0.3+，所以这段音频要更严。
+     * @param adaptAllowed 是否允许用这段音频更新模板。
+     *   ★ 和播报重叠的音频**必须**传 false —— 见 [adapt] 的注释。
+     */
+    fun allow(
+        pcm: ShortArray,
+        sampleRate: Int = 16_000,
+        margin: Float = 0f,
+        adaptAllowed: Boolean = true
+    ): Boolean {
         val tpl = template ?: return true
         val seconds = pcm.size.toDouble() / sampleRate
         if (seconds < MIN_CHECK_SECONDS) {
             Dbg.log("声纹：${"%.2f".format(seconds)}s 太短，跳过判定直接放行")
             return true
         }
-        val s = score(pcm, sampleRate) ?: return true
-        val th = threshold()
+        val s = if (adaptAllowed) score(pcm, sampleRate) else scoreForCheck(pcm, sampleRate)
+        if (s == null) return true
+        val th = threshold() + margin
         val ok = s >= th
-        Dbg.log("声纹 ${"%.3f".format(s)} vs 阈值 ${"%.2f".format(th)} → ${if (ok) "放行" else "丢弃"}")
+        Dbg.log(
+            "声纹 ${"%.3f".format(s)} vs 阈值 ${"%.2f".format(th)}" +
+                (if (margin > 0f) "(+${"%.2f".format(margin)} 播报重叠)" else "") +
+                " → ${if (ok) "放行" else "丢弃"}"
+        )
         return ok
     }
 

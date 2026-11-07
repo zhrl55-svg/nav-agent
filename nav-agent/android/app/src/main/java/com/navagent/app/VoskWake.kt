@@ -58,6 +58,15 @@ class VoskWake(modelDir: File, private val wakeWords: List<String>) : WakeWord {
     override var lastMatchText: String? = null
         private set
 
+    /**
+     * 当前滑动窗口文本。宿主的打断词匹配（[com.navagent.core.BargeIn]）用。
+     *
+     * 只在采集线程上、紧跟 [feed] 之后读（VoiceEngine 里包在 wakeLock 中）。
+     * 返回副本而不是 StringBuilder，避免调用方拿着引用跨帧读到半截。
+     */
+    override val heardText: String
+        get() = window.toString()
+
     private val normalized = wakeWords.map { normalize(it) }.filter { it.isNotEmpty() }
 
     /**

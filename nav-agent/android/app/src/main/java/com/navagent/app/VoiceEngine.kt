@@ -5,6 +5,10 @@ import android.media.AudioManager
 import android.media.ToneGenerator
 import android.os.Handler
 import android.os.Looper
+import com.navagent.core.BargeHit
+import com.navagent.core.BargeIn
+import com.navagent.core.BargeKind
+import com.navagent.core.BargeMode
 import java.io.File
 import java.util.concurrent.Executors
 
@@ -79,9 +83,31 @@ class VoiceEngine(private val context: Context) {
     @Volatile
     var spokenTextProvider: () -> String? = { null }
 
-    /** 播报被唤醒词打断时回调。宿主注入 `voice.silence()`。 */
+    /**
+     * 打断播报时回调。宿主注入 `app.bargeInChat()`（停闲聊 + 让本轮生成静音）。
+     *
+     * @return 真的停掉了东西才返回 true。导航播报在播时返回 false ——
+     *   界面就不该说"已打断播报"，否则用户听着导航还在念、助手却说打断了。
+     */
     @Volatile
-    var onBargeIn: (() -> Unit)? = null
+    var onBargeIn: (() -> Boolean)? = null
+
+    /**
+     * 当前在播的是不是导航播报。宿主注入 `voice.speakingPriority == NAV`。
+     *
+     * ★ 2026-11-07：导航播报**永不打断**。开车时「前方 200 米左转」被一句
+     *   「小猪」掐掉是安全问题，所以播报期间按这个标志选 [BargeMode.NONE]。
+     */
+    @Volatile
+    var navSpeakingProvider: () -> Boolean = { false }
+
+    /**
+     * 现在是不是「选择列表」窗口（助手刚念过 1、2、3 让用户挑）。
+     *
+     * 窗口期内才认「第2个」「最后一个」这类序号打断。
+     */
+    @Volatile
+    var choiceModeProvider: () -> Boolean = { false }
 
     /**
      * 本地命中睡眠口令时回调。宿主注入「播一句『好』然后休眠」。
@@ -115,6 +141,13 @@ class VoiceEngine(private val context: Context) {
     private val huaweiPreprocess = HuaweiAudioPreprocess(context)
     private val sherpaBargeIn = SherpaBargeIn(context)
 
+    /** 播报中要盯的关键词：唤醒词 + 停止口令 + 序号词，全部来自设置 */
+    private fun bargeKeywordList(): List<String> =
+        (Prefs.wakeWordList() + Prefs.bargeStopWordList() + CHOICE_KEYWORDS)
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+
     private val main = Handler(Looper.getMainLooper())
     private val worker = Executors.newSingleThreadExecutor { r ->
         Thread(r, "voice-worker").apply { isDaemon = true }
@@ -123,6 +156,14 @@ class VoiceEngine(private val context: Context) {
     @Volatile private var lastActivityMs = 0L
     @Volatile private var busyRecognizing = false
     @Volatile private var speakingNow = false
+
+    /**
+     * 最近一次「确认正在播报」的时刻。
+     *
+     * 用来判断一段识别音频有没有和播报重叠：重叠的音频**不能**拿去
+     * 更新声纹模板（会把 TTS 的声音揉进主人模板，见 VoiceprintGate.allow）。
+     */
+    @Volatile private var lastPlaybackAtMs = 0L
     @Volatile private var wakeInterruptPending = false
     @Volatile private var wakeConfirmPending = false
     @Volatile private var skipEchoGuard = false
@@ -131,6 +172,32 @@ class VoiceEngine(private val context: Context) {
     private var ownerPollLogCount = 0
     private val ownerStreak = java.util.concurrent.atomic.AtomicInteger(0)
     private var asleepFrames = 0L
+
+    /**
+     * 导航播报期间命中的打断词，等播完再执行（用户选择的方案 1）。
+     *
+     * 为什么不能在播报中直接执行：导航播报被打断本身就是这次要修的问题。
+     * 为什么不能直接丢掉：用户喊了「先停下」却毫无反应，比打断更糟。
+     */
+    @Volatile private var deferredHit: BargeHit? = null
+    @Volatile private var deferredAtMs = 0L
+
+    /** 上一次命中的签名，用来给同一句话去抖（窗口会保留 4 秒，否则连续几十帧都命中） */
+    @Volatile private var lastHitKey: String = ""
+    @Volatile private var lastHitAtMs: Long = 0L
+
+
+    /**
+     * 本次播报期间的唤醒词表。
+     *
+     * `Prefs.wakeWordList()` 每次都要读 prefs + 切分字符串，而打断判定是
+     * 每 20ms 一帧跑的，全放在采集线程上不合适。播报开始时取一次就够 ——
+     * 正在播报这一小段时间里改唤醒词的概率约等于零。
+     */
+    @Volatile private var bargeWakeWords: List<String> = emptyList()
+
+    /** 本次播报期间的停止口令（来自设置，播报开始时取一次） */
+    @Volatile private var bargeStopWords: List<String> = emptyList()
 
     private val tone by lazy {
         runCatching { ToneGenerator(AudioManager.STREAM_MUSIC, 60) }.getOrNull()
@@ -148,7 +215,8 @@ class VoiceEngine(private val context: Context) {
 
         worker.execute {
             ensureWake()
-            if (Prefs.bargeIn) sherpaBargeIn.load()
+            // 播报中的关键词词表：唤醒词 + 停止口令 + 序号词，全部来自设置
+            if (Prefs.bargeIn) sherpaBargeIn.load(bargeKeywordList())
             ready = true
 
             if (vad == null) {
@@ -183,6 +251,8 @@ class VoiceEngine(private val context: Context) {
         worker.execute {
             shutdownWake()
             ensureWake()
+            // 唤醒词变了，KWS 词表也要跟着重建（否则又是"改了没生效"）
+            if (Prefs.bargeIn) sherpaBargeIn.load(bargeKeywordList())
             notify(if (wakeReady()) "唤醒词已更新：${Prefs.wakeWords}" else "唤醒模型加载失败")
         }
     }
@@ -211,9 +281,9 @@ class VoiceEngine(private val context: Context) {
     fun stop() {
         capture?.stop()
         capture = null
+        sherpaBargeIn.close()
         vad?.reset()
         shutdownWake()
-        sherpaBargeIn.close()
         huaweiPreprocess.setActive(false)
         ready = false
         setState(State.ASLEEP)
@@ -292,6 +362,7 @@ class VoiceEngine(private val context: Context) {
 
     private fun onFrame(frame: ShortArray, len: Int) {
         val speaking = isSpeakingProvider()
+        if (speaking) lastPlaybackAtMs = System.currentTimeMillis()
         if (speaking && !speakingNow) {
             speakingNow = true
             skipEchoGuard = false
@@ -299,6 +370,8 @@ class VoiceEngine(private val context: Context) {
             ownerPollFrames = 0
             ownerStreak.set(0)
             huaweiPreprocess.setActive(true)
+            bargeWakeWords = Prefs.wakeWordList()
+            bargeStopWords = Prefs.bargeStopWordList()
             sherpaBargeIn.reset()
             // 播报期间只保留唤醒检测。重置解码器，避免上一轮连续会话
             // 或刚结束的 TTS 残留文本影响这一轮唤醒判定。
@@ -309,45 +382,86 @@ class VoiceEngine(private val context: Context) {
         // 缓冲空着就没法判（之前只在待命和播报时写，听话过程中是空的）。
         wakeAudio.add(frame, len)
         if (speaking) {
-            // 普通 VAD、ASR 和声纹判定在播报期间全部暂停。
-            // 只有唤醒词或主人声纹能触发打断，避免导航播报、收音机和
-            // 乘客说话被当成用户指令。
-            if (Prefs.bargeIn && sherpaBargeIn.feed(frame, len)) {
-                Dbg.log("播报中 Sherpa 命中「小猪」，等待声纹确认 state=$state")
-                requestWakeOwnerConfirmation(
-                    "Sherpa 播报中",
-                    interruptedSpeech = true,
-                    heardText = null
-                )
+            // 普通 VAD、ASR 和声纹判定在播报期间全部暂停（没有 AEC，只能半双工）。
+            // 只剩「打断判定」在跑：唤醒词 / 停止口令 / 选择列表序号。
+            if (!Prefs.bargeIn) return
+
+            // 判定用哪一档规则。导航播报期间是 NONE —— 只记录，不执行。
+            val navSpeaking = navSpeakingProvider()
+            val choiceActive = choiceModeProvider()
+            val mode = BargeIn.mode(
+                speaking = true,
+                navSpeaking = navSpeaking,
+                choiceActive = choiceActive
+            )
+            // ★ 导航播报期间照样要认词，只是不执行（记下来播完再说）。
+            //   所以匹配档位按「如果在播闲聊」算，不能因为 mode=NONE 就跳过识别。
+            val matchMode = if (mode == BargeMode.NONE) {
+                BargeIn.mode(speaking = true, navSpeaking = false, choiceActive = choiceActive)
+            } else {
+                mode
             }
-            // 播报中必须等完整唤醒词，不能用待命状态的词首丢失、任意片段
-            // 和近似拼音兜底。宽匹配会把 TTS 连续文本拼成“小猪”，也会在
-            // 真主人只说出“小”时提前触发；完整拼音匹配仍能兜住“晓猪”等同音词。
-            if (Prefs.bargeIn && feedWake(frame, len, strict = true)) {
-                Dbg.log("播报中命中唤醒候选，等待声纹确认 state=$state")
-                requestWakeOwnerConfirmation(
-                    "播报中",
-                    interruptedSpeech = true,
-                    heardText = wakeMatchText()
-                )
-            }
-            // 声纹轮询：主人开口就能打断，不要求一定喊了唤醒词。
+            // ★ 2026-11-07：Sherpa KWS 回归，但词表是**运行时生成**的。
             //
-            // 真机 21:50 那次的问题：唤醒词其实命中了（Sherpa 命中两次），
-            // 但被「播报原文里含有小猪」这条文本判断挡了回去，用户喊了也没反应。
-            // 文本判断本来就不可靠 —— 回答里出现一次「小猪」就把整段播报变成哑巴。
-            // 现在改成用声纹当唯一裁判：主人的声音（近场、不同于 TTS）才打断。
-            pollOwnerVoice()
+            //   为什么不是"只用 Vosk"：真机实测 Vosk 在 TTS 混音里只会输出碎片
+            //   （「足了啊与其了的啊的的 事了呢」），长文本播报中一句都匹配不上。
+            //   Sherpa 把解码约束在关键词路径上，同样条件下能命中。
+            //   词表由 KwsKeywords 现场转拼音，改设置即生效，不再是写死的「小猪」。
+            val sherpaLabel = if (Prefs.bargeIn) sherpaBargeIn.feed(frame, len) else null
+            val sherpaHit = sherpaLabel?.let {
+                BargeIn.match(it, matchMode, bargeWakeWords, bargeStopWords)
+            }
+            val wakeFed = feedWake(frame, len, strict = true)
+            val heard = wakeHeardText()
+            val textHit = BargeIn.match(heard, matchMode, bargeWakeWords, bargeStopWords)
+            val hit = sherpaHit ?: textHit ?: if (wakeFed) {
+                BargeHit(BargeKind.WAKE, "", wakeMatchText().orEmpty(), 0)
+            } else {
+                null
+            }
+
+            if (hit == null) {
+                // 词表没中，还有第三条腿：声纹。
+                pollOwnerVoice()
+                return
+            }
+
+            val source = when {
+                sherpaHit != null -> "KWS「${sherpaLabel}」"
+                textHit != null -> "Vosk 关键词"
+                else -> "播报中唤醒词"
+            }
+
+            // 导航播报：记下来，等它说完再执行
+            if (mode == BargeMode.NONE) {
+                stageDeferredBarge(hit)
+                return
+            }
+            if (debounced(hit)) return
+            // 停止口令/序号如果正是我们自己念出来的，不算（回声保护）
+            if (hit.kind != BargeKind.WAKE && isSpokenEcho(hit.matched)) {
+                Dbg.log("$source 命中「${hit.matched}」来自播报内容，忽略")
+                pollOwnerVoice()
+                return
+            }
+            // ★ 2026-11-07 用户定的策略：声纹 / 关键词 / 唤醒词，
+            //   任意一样命中就打断（或关系）。
+            //   以前关键词还要再过一次声纹确认（与关系），那是"召回杀手"：
+            //   主人喊了关键词，声纹因为混音打分偏低就被否掉，等于没喊。
+            Dbg.log("$source 命中「${hit.matched}」kind=${hit.kind} mode=$mode，打断")
+            handleWakeDetected(interruptedSpeech = true, hit = hit)
             return
         }
         if (speakingNow) {
             // 播报自然结束或被打断后，Vosk 不能带着上一段解码状态进入下一轮。
             speakingNow = false
+            sherpaBargeIn.reset()
             ownerPollFrames = 0
             ownerStreak.set(0)
             huaweiPreprocess.setActive(false)
-            sherpaBargeIn.reset()
             resetWake()
+            // 导航播报期间用户喊的打断词，现在播完了，立刻执行
+            runDeferredBarge()
         }
         // 只有播报真正结束后才屏蔽回声尾巴。这里不能包含播报中的阶段，
         // 否则用户会在整段导航提示期间都无法打断。
@@ -398,8 +512,16 @@ class VoiceEngine(private val context: Context) {
     private fun requestWakeOwnerConfirmation(
         source: String,
         interruptedSpeech: Boolean,
-        heardText: String? = null
+        heardText: String? = null,
+        hit: BargeHit? = null
     ) {
+        // ★ 停止口令和序号不走唤醒词那套回声判断：判的是「这个词是不是我们自己
+        //   正在念的内容」。助手刚说过「别说了」，用户紧接着也说「别说了」，
+        //   这两句在识别文本里长得一样，只能靠时间窗口区分，所以宁严勿宽。
+        if (hit != null && hit.kind != BargeKind.WAKE && isSpokenEcho(hit.matched)) {
+            Dbg.log("$source 命中「${hit.matched}」来自播报内容，忽略")
+            return
+        }
         // ★ 声纹是打断播报的裁判。
         //
         // 取舍很明确：
@@ -425,7 +547,7 @@ class VoiceEngine(private val context: Context) {
                 Dbg.log("$source 唤醒词来自播报内容，忽略（不打断，声纹不可用）")
                 return
             }
-            handleWakeDetected(interruptedSpeech)
+            handleWakeDetected(interruptedSpeech, hit)
             return
         }
         if (wakeConfirmPending) return
@@ -450,13 +572,13 @@ class VoiceEngine(private val context: Context) {
                 val evidence = strongestOwnerWindow(gate, pcm)
                 if (evidence == null) {
                     Dbg.log("$source 声纹无法计算，按失败放行策略继续唤醒")
-                    handleWakeDetected(interruptedSpeech)
+                    handleWakeDetected(interruptedSpeech, hit)
                 } else if (evidence.score >= threshold) {
                     Dbg.log(
                         "$source 声纹确认通过 ${"%.3f".format(evidence.score)} " +
                             "vs 阈值 ${"%.2f".format(threshold)}（${evidence.label}）"
                     )
-                    handleWakeDetected(interruptedSpeech)
+                    handleWakeDetected(interruptedSpeech, hit)
                 } else {
                     Dbg.log(
                         "$source 声纹确认拒绝 ${"%.3f".format(evidence.score)} " +
@@ -552,15 +674,14 @@ class VoiceEngine(private val context: Context) {
     }
 
     /**
-     * 播报期间的声纹轮询：主人在说话就打断，不要求一定喊了唤醒词。
+     * 播报期间的声纹轮询：主人真的在说话时打断。
      *
-     * 为什么需要它：
-     *   唤醒词检测在 TTS 混音里本来就不稳 —— 真机 21:50 那次 Vosk 一个字都没匹上，
-     *   只有 Sherpa KWS 命中。所以光靠唤醒词，主人的打断请求有概率整段丢掉。
-     *   声纹是另一条独立证据：主人的近场人声和 TTS 回声在 embedding 上差得开，
-     *   连续两次过线就打断。
+     * ★ 2026-11-07 起默认**不**打断，只记录。播报中的打断统一由 Vosk 认出来的
+     *   关键词决定（先停下 / 别说了 / 第N个…）。这条路留着兜底：
+     *   真机上如果发现关键词召回还是不够，把设置里的 bargeInOnOwnerVoice 打开，
+     *   就退回"主人一开口就停"的老行为。
      *
-     * 为什么要求连续两次：单次窗口可能正好压在 TTS 的换气处，分数偶然抬高。
+     * 为什么要求连续两次过线：单次窗口可能正好压在 TTS 的换气处，分数偶然抬高。
      *
      * 跑在 worker 线程上（ONNX 推理约 0.1s，不能压在采集线程上）。
      */
@@ -593,8 +714,16 @@ class VoiceEngine(private val context: Context) {
                     Dbg.log("声纹轮询 " + fmt(score) + " ≥ " + fmt(threshold) + "（连续 $streak 次）")
                     if (streak >= OWNER_STREAK) {
                         ownerStreak.set(0)
-                        Dbg.log("声纹确认是主人在说话，打断播报")
-                        handleWakeDetected(true)
+                        // ★ 导航播报期间一律不打断（真机 17:49:05 踩过）：
+                        //   声纹过线后照样 beep + 切聆听 + 弹"已打断播报"，
+                        //   而导航音频其实还在念 —— 用户听到的就是"导航被打断"。
+                        if (navSpeakingProvider()) {
+                            Dbg.log("声纹确认主人在说话，但导航播报中 → 播完再听")
+                            stageDeferredBarge(BargeHit(BargeKind.WAKE, "", "声纹", 0))
+                        } else {
+                            Dbg.log("声纹确认主人在说话，打断播报")
+                            handleWakeDetected(interruptedSpeech = true)
+                        }
                     }
                 } else {
                     if (ownerStreak.getAndSet(0) > 0) {
@@ -652,9 +781,29 @@ class VoiceEngine(private val context: Context) {
         return heardCount <= spokenCount
     }
 
+    /**
+     * 刚命中的停止口令/序号，是不是当前正在播的内容本身。
+     *
+     * 唤醒词那套判断（[isBroadcastEcho]）比的是"次数"，因为播报里出现一次
+     * 「小猪」不代表用户喊了；但「别说了」这种口令没有次数可数 ——
+     * 播报里正在念它，同时也可能是用户在说，只能保守处理：**播报里含这个词就不认**。
+     * 代价是助手正好在说「别说了」时用户喊同一句无效，这个窗口很短，可以接受。
+     */
+    private fun isSpokenEcho(matched: String): Boolean {
+        val spoken = spokenTextProvider() ?: return false
+        val norm = spoken.filter { it.isLetterOrDigit() }
+        val m = matched.filter { it.isLetterOrDigit() }
+        return m.isNotEmpty() && norm.contains(m)
+    }
+
     /** 命中时的识别文本（Vosk 窗口）。拿不到就 null。 */
     private fun wakeMatchText(): String? = synchronized(wakeLock) {
         wake?.lastMatchText
+    }
+
+    /** 当前识别窗口文本（打断词匹配用）。只在采集线程调用。 */
+    private fun wakeHeardText(): String = synchronized(wakeLock) {
+        wake?.heardText.orEmpty()
     }
 
     private fun countOccurrences(text: String, word: String): Int {
@@ -669,26 +818,96 @@ class VoiceEngine(private val context: Context) {
     }
 
     /**
-     * 命中唤醒词后统一切到完整聆听。
+     * 命中打断词后统一切到完整聆听。
      *
      * audio 线程可能连续命中多帧，用 [wakeInterruptPending] 合并成一个主线程任务。
-     * 播报中命中时先停播，再进入 LISTENING；已经确认是用户主动唤醒，因此本次
-     * 跳过播报结束时间戳带来的回声窗口，避免唤醒词之后的第一句话又被挡住。
+     * 播报中命中时先停播（只停闲聊，导航播报由 [onBargeIn] 那边的策略挡掉），
+     * 再进入 LISTENING。
+     *
+     * @param hit 命中的是哪一类。序号（[BargeKind.INDEX]）命中时不用等用户再说一遍：
+     *   直接把它规范化成「第2个」提交给大脑 —— 用户说的就是这句，让他重复一遍很蠢。
      */
-    private fun handleWakeDetected(interruptedSpeech: Boolean) {
+    private fun handleWakeDetected(
+        interruptedSpeech: Boolean,
+        hit: BargeHit? = null
+    ) {
         if (wakeInterruptPending) return
         wakeInterruptPending = true
         lastActivityMs = System.currentTimeMillis()
         vad?.reset()
+
+        // 序号命中时把规范化说法直接提交：用户说的就是这句，
+        // 让他等列表念完再说一遍等于这个功能没做。
+        val indexHit = hit?.takeIf { it.kind == BargeKind.INDEX }
+
         main.postAtFrontOfQueue {
-            if (interruptedSpeech) onBargeIn?.invoke()
+            // 不论是不是"打断"，都让宿主把这一轮对话闭嘴：
+            // 导航播报期间攒下的打断等到播完才执行，那时模型可能刚好又开始念下一句，
+            // 这时候还是要静音，否则用户刚喊完又被塞一句进来。
+            val interrupted = onBargeIn?.invoke() == true
             beep()
             setState(State.LISTENING)
-            if (interruptedSpeech) {
-                listener?.onNotice("已打断播报，我在听…")
+            // ★ 打断之后马上要听用户接下来的话，不能被「播报结束回声保护期」挡住。
+            //   打断时 lastSpokeEndMs 刚被刷新，正常会锁 1.5 秒 —— 用户紧跟着说的
+            //   半句话会被整段吞掉（这是之前「打断后第一句老丢」的原因之一）。
+            skipEchoGuard = true
+            main.postDelayed({ skipEchoGuard = false }, ECHO_SKIP_MS)
+            when {
+                indexHit != null -> {
+                    Dbg.log("序号打断：提交「${indexHit.canonical}」")
+                    listener?.onNotice("好，${indexHit.canonical}")
+                    listener?.onUtterance(indexHit.canonical)
+                }
+                interrupted -> listener?.onNotice("已打断播报，我在听…")
+                interruptedSpeech -> listener?.onNotice("我在听…")
             }
             wakeInterruptPending = false
         }
+    }
+
+    /**
+     * 导航播报期间命中的打断词先存着。
+     *
+     * 反复命中同一句只刷新时间，不重复记日志 —— 窗口会保留 4 秒，
+     * 一句话能触发几十次。
+     */
+    private fun stageDeferredBarge(hit: BargeHit) {
+        val first = deferredHit == null
+        deferredHit = hit
+        deferredAtMs = System.currentTimeMillis()
+        if (first) {
+            Dbg.log("导航播报中命中「${hit.matched}」kind=${hit.kind}，播完再执行")
+        }
+    }
+
+    /** 播报结束：把导航期间攒下的打断执行掉 */
+    private fun runDeferredBarge() {
+        val hit = deferredHit ?: return
+        deferredHit = null
+        val age = System.currentTimeMillis() - deferredAtMs
+        if (age > DEFER_MAX_AGE_MS) {
+            Dbg.log("延迟打断已过期 ${age}ms，丢弃 kind=${hit.kind}")
+            return
+        }
+        // interruptedSpeech=false：播报已经结束，没有东西要停了，
+        // 只需要「响一下 + 进入聆听」（序号则顺带把选择提交掉）
+        Dbg.log("导航播报结束，执行延迟打断 kind=${hit.kind} age=${age}ms")
+        handleWakeDetected(interruptedSpeech = false, hit = hit)
+    }
+
+    /**
+     * 同一句命中去抖。
+     *
+     * 声纹拒绝后播报继续，滑动窗口里那几个字还在 —— 不去抖的话每 20ms 就再发一次
+     * 声纹请求，把 worker 线程打满，真正的主人喊话反而排不进去。
+     */
+    private fun debounced(hit: BargeHit): Boolean {
+        val now = System.currentTimeMillis()
+        val key = "${hit.kind}:${hit.matched}"
+        if (key == lastHitKey && now - lastHitAtMs < HIT_DEBOUNCE_MS) return true
+        lastHitKey = key
+        lastHitAtMs = now
+        return false
     }
 
     private fun onSegment(pcm: ShortArray) {
@@ -748,11 +967,36 @@ class VoiceEngine(private val context: Context) {
     private fun passVoiceprint(pcm: ShortArray): Boolean {
         if (!Prefs.voiceprint) return true
         val gate = voiceprintProvider?.invoke() ?: return true
+        // 这段音频是不是和播报重叠（含刚播完的尾巴）
+        val overlap = System.currentTimeMillis() - lastPlaybackAtMs < OVERLAP_GUARD_MS
         if (!gate.enrolled) {
+            // ★ 模板只允许用"干净"的音频注册。播报混音里注册出来的模板是
+            //   主人 + TTS 的混合，之后会认不出主人也拦不住 TTS（用户实测）。
+            if (overlap) {
+                Dbg.log("声纹注册跳过：这段音频和播报重叠，等一句干净的")
+                return true
+            }
             gate.enroll(pcm)
             return true
         }
-        return gate.allow(pcm)
+        // 和播报重叠：不自适应模板 + 阈值再抬 0.10
+        if (gate.allow(
+                pcm,
+                AudioCapture.SAMPLE_RATE,
+                margin = if (overlap) OVERLAP_MARGIN else 0f,
+                adaptAllowed = !overlap
+            )
+        ) return true
+        // ★ 2026-11-07：选择列表窗口里不卡声纹。
+        //   真机日志 16:52:11：用户回答列表，声纹 0.424 < 0.45 被丢掉 ——
+        //   界面上什么都没发生，用户只会说「列表没反应」。
+        //   这个窗口只有 120 秒、而且是我们主动问"要哪个"，短时间内放宽是值得的；
+        //   非窗口期仍然按阈值卡，乘客说话照样挡。
+        if (choiceModeProvider()) {
+            Dbg.log("选择窗口内声纹未过，仍然放行（正在等用户作答）")
+            return true
+        }
+        return false
     }
 
     /**
@@ -932,10 +1176,55 @@ class VoiceEngine(private val context: Context) {
         const val OWNER_POLL_FRAMES = 20
         const val OWNER_POLL_SECONDS = 1.0f
         const val OWNER_STREAK = 2
-        const val OWNER_ONLY_MARGIN = 0.10f
+
+        /**
+         * 「只靠声纹、不用唤醒词」这条路的额外余量。
+         *
+         * ★ 2026-11-07：从 0.10 降到 0.05。意义变了 —— 现在声纹过线不再直接打断，
+         *   只是"送云端 ASR 判词"的触发条件。误触的代价从"播报被莫名掐断"
+         *   变成"白跑一次 ASR"，所以宁可放宽一点，别再出现"喊了没反应"。
+         */
+        const val OWNER_ONLY_MARGIN = 0.05f
 
         /** 每 5 次轮询打一条基线分数（0.4s 一次 → 2s 一条），别把日志淹掉 */
         const val OWNER_POLL_LOG_EVERY = 5
+
+        /**
+         * 打断之后临时跳过回声保护期的时长。
+         *
+         * 打断的一瞬间 TTS 刚停，`lastSpokeEndMs` 被刷新，正常会锁住拾音
+         * [Prefs.echoGuardMs]（默认 1.5s）—— 用户紧跟着说的那句话就整段丢了。
+         * 这里放开 2 秒：比默认保护期长一点，之后自动恢复，不会永久失效。
+         */
+        const val ECHO_SKIP_MS = 2_000L
+
+        /**
+         * 导航播报期间攒下的打断，最多认这么久。
+         *
+         * 太长会把「上一段播报时随口说的词」当成现在要说的话；
+         * 太短则用户喊完之后导航还在念，等于白喊。4 秒覆盖大多数导航提示。
+         */
+        const val DEFER_MAX_AGE_MS = 4_000L
+
+        /**
+         * 序号词。选择列表里用户会说「第一个…第六个」「最后一个」，候选一般不超过 6 条。
+         *
+         * ★ 必须写**中文数字**：ICU 把「第1个」转成 `dì1gè`（数字和「个」黏在一起），
+         *   拆出来的 `1gè` 不是模型 token，整行会被丢弃（真机日志验证过）。
+         *   「第一个」转成 `dì yī gè`，三个音节干干净净。
+         */
+        val CHOICE_KEYWORDS: List<String> =
+            listOf("我选择", "最后一个") +
+                listOf("第一个", "第二个", "第三个", "第四个", "第五个", "第六个")
+
+        /** 播报结束后这么久内的音频仍算"重叠"，不拿去做声纹自适应 */
+        const val OVERLAP_GUARD_MS = 2_000L
+
+        /** 重叠音频的额外阈值（防止 TTS 回声蹭过线） */
+        const val OVERLAP_MARGIN = 0.10f
+
+        /** 同一句命中的去抖间隔（声纹拒绝时窗口里的字还会留一会儿） */
+        const val HIT_DEBOUNCE_MS = 1_500L
 
         /** 唤醒提示音：单声时长 / 两声间隔 */
         const val WAKE_BEEP_MS = 90

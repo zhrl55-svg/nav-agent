@@ -46,6 +46,15 @@ object Prefs {
     private const val K_ECHO_GUARD = "echo_guard_ms"
     private const val K_TTS_ENGINE = "tts_engine"
     private const val K_BARGE_IN = "barge_in"
+    private const val K_BARGE_IN_OWNER = "barge_in_owner_voice"
+    private const val K_BARGE_WORDS = "barge_stop_words"
+
+    /**
+     * 播报中停止口令的出厂值。中文短语，直接参与 Vosk 文本匹配，
+     * 不需要拼音、不需要重建模型 —— 这是选 Vosk 做打断判断的核心好处。
+     */
+    private const val DEFAULT_BARGE_WORDS =
+        "先停下,先停一下,停下,停一下,别说了,不要说了,别讲了,别念了,别读了,打断,我选择"
     private const val K_VOICEPRINT = "voiceprint_on"
     private const val K_VOICEPRINT_TH = "voiceprint_threshold"
 private const val K_VOICEPRINT_BARGE = "voiceprint_barge_in"
@@ -402,6 +411,40 @@ private const val K_VOICEPRINT_BARGE_TH = "voiceprint_barge_threshold"
     var bargeIn: Boolean
         get() = sp.getBoolean(K_BARGE_IN, true)
         set(v) = sp.edit().putBoolean(K_BARGE_IN, v).apply()
+
+    /**
+     * 播报中「主人只要开口就打断」，不要求说出任何关键词。
+     *
+     * ★ 2026-11-07：**默认关闭**。
+     *
+     * 这条路是 11-04 为了救「喊了无数遍小猪都没反应」加的：唤醒词在 TTS 混音里
+     * 识别不稳，所以拿声纹当第二条证据 —— 主人的声音连续两次过线就打断。
+     *
+     * 但现在打断规则改成「按关键词」，留着它等于关键词形同虚设：
+     * 用户说任何一句无关的话都会把播报掐掉，而关键词表本身就没有意义了。
+     * 代码保留（真机上一旦关键词召回不够，可以把它打开当兜底），
+     * 但默认不参与判定。
+     */
+    var bargeInOnOwnerVoice: Boolean
+        get() = sp.getBoolean(K_BARGE_IN_OWNER, false)
+        set(v) = sp.edit().putBoolean(K_BARGE_IN_OWNER, v).apply()
+
+    /**
+     * 播报中的停止口令，逗号分隔。
+     *
+     * ★ 2026-11-07 从代码常量搬到这里：词表是"运营参数"，不是逻辑。
+     *   改词不该重新编译，更不该动模型（Sherpa KWS 就是因为词表写死在模型里
+     *   才被停用的）。Vosk 这边是中文短语，加一个词就多认一个词，零成本。
+     */
+    var bargeStopWords: String
+        get() = sp.getString(K_BARGE_WORDS, DEFAULT_BARGE_WORDS).orEmpty()
+            .ifBlank { DEFAULT_BARGE_WORDS }
+        set(v) = sp.edit().putString(K_BARGE_WORDS, v.trim()).apply()
+
+    fun bargeStopWordList(): List<String> =
+        bargeStopWords.split(",", "，", "、", " ")
+            .map { it.trim() }
+            .filter { it.isNotEmpty()}
 
     // ------------------------------------------------------------ 声纹
 

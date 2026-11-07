@@ -196,7 +196,11 @@ class NavApp : Application() {
             ),
             onDelta = { piece -> chatObservers.forEach { it.onAssistantDelta(piece) } },
             onReply = { full -> chatObservers.forEach { it.onAssistantDone(full) } },
-            speak = { text -> voice.speak(text, VoiceGuide.Priority.CHAT) },
+            // 记一行播报原文：判断「模型到底有没有把列表编号念出来」只能看这个
+            speak = { text ->
+                Dbg.log("播报文本：${text.take(50)}")
+                voice.speak(text, VoiceGuide.Priority.CHAT)
+            },
             context = ::navContext,
             // 名字固化在 prompt 里，每轮都从设置取 —— 改名下一句就自称新名字
             assistantName = { Prefs.aiName },
@@ -206,6 +210,11 @@ class NavApp : Application() {
             // 接本地接口时不给 Tavily（本地服务自带检索），prompt 也要跟着改口
             webSearchAvailable = { Prefs.webSearchEnabled() },
             interceptAction = ::interceptNavigation,
+            // 模型开始念「1、2、3，要哪个」→ 打开选择窗口。
+            // 用户这时说「第二个」才能打断播报并当作选择提交（见 VoiceEngine）
+            onChoiceMode = { active, count ->
+                if (active) markChoiceList(count) else clearChoiceMode()
+            },
             memory = memory
         )
 
@@ -402,6 +411,9 @@ class NavApp : Application() {
     fun setPendingPois(keyword: String, pois: List<AmapSdkGeocoder.Poi>) {
         pendingPois = pois
         pendingKeyword = keyword
+        // 候选列表本身就是「让用户在几个里挑一个」，
+        // 说「第二个」应该能直接打断 —— 和模型念编号列表走同一个窗口
+        markChoiceList(pois.size)
         android.os.Handler(android.os.Looper.getMainLooper()).post {
             placeSearchObservers.forEach { it.onPlaceCandidates(keyword, pois) }
         }
@@ -431,15 +443,83 @@ class NavApp : Application() {
         }
     }
 
+    // ------------------------------------------------------------ 打断 / 选择列表
+
+    /**
+     * 选择列表窗口的截止时刻。
+     *
+     * ★ 2026-11-07 加。助手念「1、张掖西站 2、张掖宾馆，要哪个」的时候，
+     *   用户说「第二个」应该能直接打断并生效；平时说「第二个」只是普通一句话。
+     *   这个窗口就是区分这两种情况的开关。
+     *
+     * 进入时机有两个：模型回复里出现编号列表（[ChatEngine.onChoiceMode]）、
+     * 地图上的地点候选列表弹出来（[setPendingPois]）。
+     * 关闭时机：用户说了下一句话（[submit]）、或超时。
+     */
+    @Volatile
+    private var choiceUntilMs = 0L
+
+    /** 列表条数，给日志和界面用 */
+    @Volatile
+    var choiceItemCount = 0
+        private set
+
+    fun markChoiceList(count: Int) {
+        choiceUntilMs = System.currentTimeMillis() + CHOICE_WINDOW_MS
+        choiceItemCount = count
+        Dbg.log("选择列表窗口开启 items=$count")
+    }
+
+    fun clearChoiceMode() {
+        if (choiceUntilMs == 0L) return
+        choiceUntilMs = 0L
+        choiceItemCount = 0
+    }
+
+    fun choiceModeActive(): Boolean = choiceUntilMs > System.currentTimeMillis()
+
+    /**
+     * 用户打断播报。
+     *
+     * 两件事必须一起做，缺一个都会"打不断"：
+     *   1. `voice.bargeInChat()` 停掉正在播的闲聊（导航播报它不会动）；
+     *   2. `chat.muteCurrent()` 让这一轮生成闭嘴 —— 模型还在流式输出，
+     *      只停 TTS 的话下一段增量攒够一句又会念出来。
+     */
+    fun bargeInChat(): Boolean {
+        val interrupted = voice.bargeInChat()
+        chat.muteCurrent()
+        if (interrupted) Dbg.log("用户打断：闲聊播报已停")
+        else Dbg.log("打断未生效（导航播报在播，保持原样）")
+        return interrupted
+    }
+
     /** 语音识别的结果统一从这里进 */
     fun submit(text: String) {
-        Dbg.log("submit chars=${text.length}")
+        val t = text.trim()
+        if (t.isEmpty()) return
+        // ★ 2026-11-07：打断后用云端 ASR 补识别，紧接着 VAD 可能把同一句话
+        //   再切一遍送一次 —— 用户会在界面上看到两条一样的「我选第二个」。
+        //   3 秒内完全相同的句子按重复丢掉。
+        val now = System.currentTimeMillis()
+        if (t == lastSubmitText && now - lastSubmitAtMs < DUP_SUBMIT_MS) {
+            Dbg.log("重复提交忽略：$t")
+            return
+        }
+        lastSubmitText = t
+        lastSubmitAtMs = now
+        Dbg.log("submit chars=${t.length}")
+        // 用户开口了，上一轮的「选择列表」到此结束
+        clearChoiceMode()
         // 先让界面把"用户说了什么"显示出来，再进大脑
-        chatObservers.forEach { it.onUser(text) }
-        if (!chat.send(text)) {
+        chatObservers.forEach { it.onUser(t) }
+        if (!chat.send(t)) {
             Dbg.log("submit 被忽略（上一句还在处理）")
         }
     }
+
+    private var lastSubmitText = ""
+    private var lastSubmitAtMs = 0L
 
     // ------------------------------------------------------------ 导航工具
 
@@ -846,5 +926,16 @@ class NavApp : Application() {
 
         /** 已确认候选的有效期：30 分钟 */
         const val CONFIRMED_TTL_MS = 30 * 60 * 1000L
+
+        /**
+         * 选择列表窗口的有效期。
+         *
+         * 念完列表到用户开口，中间可能隔几十秒（在开车、在犹豫），所以给宽一点；
+         * 用户一旦说话就关掉（[submit]），不会误伤后面的正常对话。
+         */
+        const val CHOICE_WINDOW_MS = 120_000L
+
+        /** 3 秒内完全相同的提交按重复丢掉（打断后 ASR 兜底 + VAD 会重复切同一句） */
+        const val DUP_SUBMIT_MS = 3_000L
     }
 }

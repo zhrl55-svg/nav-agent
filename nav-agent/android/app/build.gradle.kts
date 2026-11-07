@@ -22,8 +22,8 @@ android {
         applicationId = "com.navagent"
         minSdk = 26
         targetSdk = 35
-        versionCode = 8
-        versionName = "0.3.0"
+        versionCode = 19
+        versionName = "0.3.11"
 
         // vosk 的 aar 带 arm64/armv7/x86/x86_64 四套 so，全打进去 APK 涨 40MB。
         // 两台测试机都是 arm64，模拟器用不上，砍掉 x86 两套。

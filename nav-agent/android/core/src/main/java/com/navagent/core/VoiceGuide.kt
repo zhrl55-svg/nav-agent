@@ -57,6 +57,9 @@ class VoiceGuide(
 
     private val appContext = context.applicationContext
 
+    /** 打断后重试 drain 用（[bargeInChat]） */
+    private val main = android.os.Handler(android.os.Looper.getMainLooper())
+
     private var tts: TextToSpeech? = null
     private var ready = false
     private var current: Utterance? = null
@@ -114,6 +117,16 @@ class VoiceGuide(
     /** 当前正在播/刚播完那条的优先级，给 speakWindowListener 判断用 */
     @Volatile
     private var currentPriority: Priority = Priority.CHAT
+
+    /**
+     * 现在在播的是哪一档；没在播就是 null。
+     *
+     * ★ 2026-11-07 加。打断策略要按档位分开：导航播报不能被用户打断，
+     *   闲聊播报可以。宿主（VoiceService）把它注入 VoiceEngine，由引擎判断
+     *   「这次命中的打断词该不该执行」。
+     */
+    val speakingPriority: Priority?
+        get() = if (current != null) currentPriority else null
 
     private fun setSpeaking(speaking: Boolean) {
         if (isSpeaking == speaking) return
@@ -349,13 +362,19 @@ class VoiceGuide(
             currentPriority = next.priority
             setSpeaking(true)
             logger?.invoke("开始播报 id=${next.id} priority=${next.priority} chars=${next.text.length}")
+            // ★ 必须带 id（2026-11-07 真机 bug）：
+            //   以前这里传 null，finishCurrent 会跳过 id 校验 ——
+            //   上一条（比如闲聊）延迟到达的播完回调，会把**当前在播的导航播报**
+            //   的 current 直接清掉，随后 drain 播下一条，
+            //   而 MinimaxTts.play() 开头会 stopInternal()，
+            //   于是导航播报当场被掐断（用户反馈"导航播报也被打断了"）。
             cloud.speak(
                 next.text,
-                onDone = { finishCurrent() },
+                onDone = { finishCurrent(next.id) },
                 onError = { msg ->
                     Log.w(TAG, "云端合成失败：$msg")
                     // 失败也要收尾，否则队列卡死、拾音永远被挡
-                    finishCurrent()
+                    finishCurrent(next.id)
                 }
             )
             return
@@ -417,7 +436,53 @@ class VoiceGuide(
         drain()
     }
 
-    /** 立即静音，清空队列 */
+    /**
+     * 用户主动打断——**只停闲聊，不动导航**。
+     *
+     * ★ 2026-11-07 加。原来的打断入口是 [silence]，它把队列连导航播报一起清掉：
+     *   用户喊一句「小猪」，正在播的「前方 200 米左转」当场没了。开车时这是安全问题。
+     *
+     * 现在的语义：
+     *   - 当前在播导航（[Priority.NAV]）→ 一个字都不停，返回 false，由调用方去延迟执行；
+     *   - 当前在播闲聊/回答 → 停掉，并把队列里待播的闲聊一起扔掉；
+     *   - 队列里还排着的导航播报保留（理论上不会出现：导航入队时本来就会抢占闲聊）。
+     *
+     * @return 是否真的打断了什么
+     */
+    @Synchronized
+    fun bargeInChat(): Boolean {
+        val cur = current
+        if (cur != null && cur.priority == Priority.NAV) {
+            logger?.invoke("打断请求被忽略：正在播导航播报")
+            return false
+        }
+        val had = cur != null || queue.isNotEmpty()
+        queue.removeAll { it.priority != Priority.NAV }
+        // 顺序同 speak()：先清 current，stop() 的回调才会被 finishCurrent 按 id 忽略
+        current = null
+        setSpeaking(false)
+        tts?.stop()
+        cloudTts?.stop()
+        lastSpokeEndMs = System.currentTimeMillis()
+        logger?.invoke("打断闲聊播报 had=$had 剩余队列=${queue.size}")
+        if (queue.isNotEmpty()) {
+            // 有导航播报排在后面：stop() 是异步的，立刻 drain 可能被
+            // `engine.isSpeaking` 挡住，隔几拍再试一次
+            retryDrain(3)
+        }
+        return had
+    }
+
+    /** 打断后重试 drain：引擎刚从 stop() 恢复时 isSpeaking 可能还是 true */
+    private fun retryDrain(attempt: Int) {
+        if (attempt <= 0) return
+        main.postDelayed({
+            drain()
+            if (current == null && queue.isNotEmpty()) retryDrain(attempt - 1)
+        }, DRAIN_RETRY_MS)
+    }
+
+    /** 立即静音，清空队列（含导航播报）。只给睡眠/退出/切引擎用。 */
     fun silence() {
         queue.clear()
         current = null
@@ -442,6 +507,9 @@ class VoiceGuide(
 
         /** 特殊「引擎包名」：走 [cloudTts] 云端合成，不是真的 TTS 引擎 */
         const val CLOUD_ENGINE = "cloud"
+
+        /** 打断后重试 drain 的间隔 */
+        const val DRAIN_RETRY_MS = 250L
 
     }
 }

@@ -103,3 +103,6 @@ nav-agent/$null
 # ---------------------------------------------------------------------------
 nav-agent/tools/deploy.sh
 nav-agent/tools/setup-ssh-server.ps1
+
+# 调试临时产物（日志/截图，nav-agent 根目录下）
+nav-agent/.tmp-*
