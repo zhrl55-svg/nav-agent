@@ -571,6 +571,56 @@ class SettingsActivity : AppCompatActivity() {
                 .show()
         }
 
+        // ---------------------------------------------------------- 实验选项
+        // 2026-11-07：借鉴桌面 D:/AI 语音链路的几处工程细节。凡是会改变
+        // 拾音 / 识别行为的一律默认关，真机验过再决定要不要长期开。
+        section("实验室 · 语音链路")
+        row(
+            "断句灵敏度", "${Prefs.vadSilenceMs} ms",
+            "停顿多久算说完。调小更快但容易抢话，高速噪音大建议调大"
+        ) {
+            choose(
+                "断句灵敏度", listOf(
+                    "600 ms（快，安静环境）" to 600,
+                    "800 ms（默认）" to 800,
+                    "1000 ms（稳）" to 1000,
+                    "1200 ms（不抢话）" to 1200
+                ), Prefs.vadSilenceMs
+            ) { Prefs.vadSilenceMs = it; applied() }
+        }
+        rowSwitch(
+            "上传噪声门", Prefs.noiseGate,
+            "低于阈值的段落渐弱后再送 ASR；不影响 VAD 和声纹（照 D:/AI 的 gate 包络）"
+        ) { Prefs.noiseGate = it; applied() }
+        row(
+            "噪声门阈值", "${Prefs.noiseGateThresholdDb.toInt()} dB",
+            "只在「上传噪声门」开启时生效；数值越小越容易放行"
+        ) {
+            choose(
+                "噪声门阈值", listOf(
+                    "-55 dB（松）" to -55f,
+                    "-45 dB（默认）" to -45f,
+                    "-35 dB（严）" to -35f
+                ), Prefs.noiseGateThresholdDb
+            ) { Prefs.noiseGateThresholdDb = it; applied() }
+        }
+        rowSwitch(
+            "全双工（实验）", Prefs.fullDuplex,
+            "播报中仍可插话。需开启打断检测并已注册声纹；外放自激风险高，默认关"
+        ) { Prefs.fullDuplex = it; applied() }
+        rowSwitch(
+            "断网本地识别兜底", Prefs.asrFallbackVosk,
+            "云端 ASR 失败时用唤醒用的 Vosk 小模型转写；长句准确率有限，先跑双跑对比"
+        ) { Prefs.asrFallbackVosk = it; applied() }
+        rowSwitch(
+            "ASR 双跑对比", Prefs.asrShadow,
+            "本地 Vosk 与云端结果并排写进日志，链路仍走云端（D:/AI 的 shadow 模式）"
+        ) { Prefs.asrShadow = it; applied() }
+        row(
+            "ASR 延迟", app.voiceEngineProvider?.invoke()?.asrStats() ?: "服务未启动",
+            "p50 / p90 / 成功失败次数，用来看连接复用的效果", chevron = false
+        ) {}
+
         section("诊断")
         rowSwitch("文件日志", Prefs.fileLog, "写到 nav.log，关闭能省点 IO") {
             Prefs.fileLog = it; applied()

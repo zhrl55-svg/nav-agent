@@ -270,7 +270,10 @@ class NavApp : Application() {
         Dbg.log(
             "设置生效 chat=${Prefs.chatModel} asr=${Prefs.asrModel} " +
                 "idle=${Prefs.idleTimeoutMs} echo=${Prefs.echoGuardMs} " +
-                "radius=${Prefs.nearbyRadius} log=${Prefs.fileLog}"
+                "radius=${Prefs.nearbyRadius} log=${Prefs.fileLog} " +
+                "vad=${Prefs.vadSilenceMs} gate=${Prefs.noiseGate} " +
+                "duplex=${Prefs.fullDuplex} shadow=${Prefs.asrShadow} " +
+                "fallback=${Prefs.asrFallbackVosk}"
         )
     }
 
@@ -286,20 +289,31 @@ class NavApp : Application() {
      */
     private fun prewarm() {
         Thread {
-            val uri = runCatching { java.net.URI(Prefs.chatBaseUrl()) }.getOrNull()
-                ?: return@Thread
-            val host = uri.host ?: return@Thread
-            val port = when {
-                uri.port > 0 -> uri.port
-                uri.scheme.equals("http", ignoreCase = true) -> 80
-                else -> 443
+            // ★ 2026-11-07：对话和语音可能不在同一个 host（本地 LLM 网关 vs
+            //   MiniMax 云端 ASR），两个都要预热，别只顾着大脑那头。
+            val targets = listOf(Prefs.chatBaseUrl(), Prefs.voiceBaseUrl())
+                .mapNotNull { raw ->
+                    val uri = runCatching { java.net.URI(raw) }.getOrNull()
+                        ?: return@mapNotNull null
+                    val host = uri.host ?: return@mapNotNull null
+                    val port = when {
+                        uri.port > 0 -> uri.port
+                        uri.scheme.equals("http", ignoreCase = true) -> 80
+                        else -> 443
+                    }
+                    host to port
+                }
+                .distinct()
+            for ((host, port) in targets) {
+                val t0 = System.currentTimeMillis()
+                runCatching {
+                    val addr = java.net.InetAddress.getByName(host)
+                    java.net.Socket().use { it.connect(java.net.InetSocketAddress(addr, port), 4000) }
+                    Dbg.log("预热 $host:$port 完成 ${System.currentTimeMillis() - t0}ms")
+                }.onFailure {
+                    Dbg.log("预热 $host:$port 失败 ${it.javaClass.simpleName}: ${it.message}")
+                }
             }
-            val t0 = System.currentTimeMillis()
-            runCatching {
-                val addr = java.net.InetAddress.getByName(host)
-                java.net.Socket().use { it.connect(java.net.InetSocketAddress(addr, port), 4000) }
-                Dbg.log("预热 $host:$port 完成 ${System.currentTimeMillis() - t0}ms")
-            }.onFailure { Dbg.log("预热失败 ${it.javaClass.simpleName}: ${it.message}") }
         }.apply { isDaemon = true; name = "prewarm" }.start()
     }
 

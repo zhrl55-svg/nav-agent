@@ -125,6 +125,17 @@ class VoiceEngine(private val context: Context) {
     @Volatile
     var onSleepCommand: (() -> Unit)? = null
 
+    /**
+     * 云端 ASR 真的失败时由宿主播一句提示（「网络不好，再说一遍」）。
+     *
+     * ★ 2026-11-07，借鉴 D:/AI/app/asr_minimax.py：那边失败会降级本地 whisper，
+     *   最差也有个结果；nav 原来只写一行 Dbg 日志，用户在隧道里喊完一句
+     *   什么反馈都没有，只会觉得「坏了」。降级链路没做完之前，先把反馈补上。
+     *   为 null 时保持旧行为（设置页/单测可以不注入）。
+     */
+    @Volatile
+    var onAsrFailure: (() -> Unit)? = null
+
     private var capture: AudioCapture? = null
     private var wake: com.navagent.core.WakeWord? = null
     /**
@@ -137,6 +148,7 @@ class VoiceEngine(private val context: Context) {
     private val wakeLock = Any()
     private var vad: EnergyVad? = null
     private val asr = MinimaxAsr()
+    private val noiseGate = NoiseGate()
     private val wakeAudio = RecentAudioBuffer(AudioCapture.SAMPLE_RATE * 5 / 2)
     private val huaweiPreprocess = HuaweiAudioPreprocess(context)
     private val sherpaBargeIn = SherpaBargeIn(context)
@@ -156,6 +168,15 @@ class VoiceEngine(private val context: Context) {
     @Volatile private var lastActivityMs = 0L
     @Volatile private var busyRecognizing = false
     @Volatile private var speakingNow = false
+
+    /**
+     * 实验性全双工：一次播报期间最多放行一次「播报重叠句」上传 ASR。
+     * 外放 + 无可靠 AEC 时，TTS 会被 VAD 切成很多句，不封顶会刷爆云端请求。
+     */
+    @Volatile private var fullDuplexTried = false
+
+    /** 失败提示的节流：连续几句都失败时别一直念「网络不好」 */
+    @Volatile private var lastAsrFailNoticeMs = 0L
 
     /**
      * 最近一次「确认正在播报」的时刻。
@@ -222,7 +243,9 @@ class VoiceEngine(private val context: Context) {
             if (vad == null) {
                 val v = EnergyVad(
                     onSpeechStart = { lastActivityMs = System.currentTimeMillis() },
-                    onSegment = { pcm -> onSegment(pcm) }
+                    onSegment = { pcm -> onSegment(pcm) },
+                    // 每句现取：设置页改「断句灵敏度」下一句就生效
+                    minSilenceMs = { Prefs.vadSilenceMs }
                 )
                 vad = v
             }
@@ -369,6 +392,7 @@ class VoiceEngine(private val context: Context) {
             wakeAudio.clear()
             ownerPollFrames = 0
             ownerStreak.set(0)
+            fullDuplexTried = false
             huaweiPreprocess.setActive(true)
             bargeWakeWords = Prefs.wakeWordList()
             bargeStopWords = Prefs.bargeStopWordList()
@@ -423,6 +447,14 @@ class VoiceEngine(private val context: Context) {
             if (hit == null) {
                 // 词表没中，还有第三条腿：声纹。
                 pollOwnerVoice()
+                // ★ 实验性全双工（2026-11-07，默认关）：播报期间继续喂 VAD，
+                //   用户可以直接插话，不必先喊唤醒词。护栏全在 onSegment 里
+                //   —— 声纹、播报重叠、单次限额、播报原文回声，四道都要过。
+                //   依赖「打断检测」开着（上面 !Prefs.bargeIn 会提前 return），
+                //   因为 AEC 不可靠时半双工仍是默认且更安全的选择。
+                if (Prefs.fullDuplex && !busyRecognizing && state == State.LISTENING) {
+                    vad?.feed(frame, len)
+                }
                 return
             }
 
@@ -913,24 +945,94 @@ class VoiceEngine(private val context: Context) {
     private fun onSegment(pcm: ShortArray) {
         if (busyRecognizing) return
         busyRecognizing = true
+        // ★ 必须在采集线程（切句这一刻）捕获，不能等 worker 里再问：
+        //   ASR 是网络请求，worker 跑起来时播报往往已经结束，spokenTextProvider
+        //   也清空了，护栏会全部失效；反过来用「播报结束后 2 秒」这种时间窗
+        //   又会把用户紧接着说的第一句话误判成重叠句丢掉。
+        val cutDuringPlayback = Prefs.fullDuplex && speakingNow
+        val spokenAtCut = spokenTextProvider()
         setState(State.THINKING)
         worker.execute {
             try {
+                // ★ 实验性全双工的护栏（默认关）：播报期间 VAD 切出来的句子
+                //   绝大多数是我们自己的 TTS。四道关都要过才送去识别：
+                //   本轮只试一次 / 必须已注册声纹且不自适应 / 更高阈值 /
+                //   识别结果不能是播报原文。过不了就当没听见。
+                val fromPlayback = cutDuringPlayback
+                if (fromPlayback) {
+                    val gate = voiceprintProvider?.invoke()
+                    val allowed = !fullDuplexTried && Prefs.voiceprint &&
+                        gate != null && gate.enrolled &&
+                        gate.allow(
+                            pcm, AudioCapture.SAMPLE_RATE,
+                            margin = FULL_DUPLEX_MARGIN, adaptAllowed = false
+                        )
+                    fullDuplexTried = true
+                    if (!allowed) {
+                        Dbg.log("全双工：播报重叠句未过护栏，丢弃")
+                        if (state != State.ASLEEP) setState(State.LISTENING)
+                        return@execute
+                    }
+                }
+
                 // ★ 声纹门禁：不是主人说的就当没听见（不识别、不上屏、不进历史）
                 if (!passVoiceprint(pcm)) {
                     if (state != State.ASLEEP) setState(State.LISTENING)
                     return@execute
                 }
-                val text = asr.transcribe(pcm)
+
+                // 噪声门只处理「上传 ASR 的副本」：VAD / 唤醒 / 声纹继续用原始
+                // PCM，免得把噪声底压成 0 之后影响 VAD 的自适应阈值。
+                val uploadPcm = if (Prefs.noiseGate) {
+                    noiseGate.apply(pcm, Prefs.noiseGateThresholdDb)
+                } else {
+                    pcm
+                }
+
+                var text = asr.transcribe(uploadPcm, AudioCapture.SAMPLE_RATE)
+                // null = 云端真的失败；"" = 识别成功但确实没说话。两者反馈不同
+                val cloudFailed = text == null
+
+                // shadow：两条链路并排打日志，链路仍走云端（D:/AI 的
+                // S2S_ASR_MODE=shadow）。云端失败时顺手跑一次本地供兜底判断。
+                val local = if (Prefs.asrShadow || cloudFailed) {
+                    synchronized(wakeLock) { (wake as? VoskWake)?.transcribe(uploadPcm) }
+                } else {
+                    null
+                }
+                if (Prefs.asrShadow) {
+                    Dbg.log("ASR[shadow] cloud=「${text ?: "<失败>"}」 vosk=「${local ?: "<无>"}」")
+                }
+                // 复用已在内存里的 Vosk 小模型做离线兜底，默认关 —— 小模型
+                // 长句容易出碎片，乱转写触发导航是安全问题，真机验过再开。
+                if (cloudFailed && Prefs.asrFallbackVosk && !local.isNullOrBlank()) {
+                    Dbg.log("ASR 云端失败 → vosk 兜底「$local」")
+                    text = local
+                }
+
+                val resolved = text
                 when {
-                    text.isNullOrBlank() -> {
+                    resolved.isNullOrBlank() -> {
                         Dbg.log("ASR 无结果，回到聆听")
                         if (state != State.ASLEEP) setState(State.LISTENING)
+                        // 节流：隧道里连着几句都失败，也只提示一次
+                        if (cloudFailed &&
+                            System.currentTimeMillis() - lastAsrFailNoticeMs > FAIL_NOTICE_INTERVAL_MS
+                        ) {
+                            lastAsrFailNoticeMs = System.currentTimeMillis()
+                            main.post { onAsrFailure?.invoke() }
+                        }
+                    }
+
+                    // 全双工下识别结果和正在播的原文重合 → 是自己念的，别自问自答
+                    fromPlayback && looksLikeBroadcast(resolved, spokenAtCut) -> {
+                        Dbg.log("全双工：识别结果来自播报原文，丢弃「$resolved」")
+                        main.post { setState(State.LISTENING) }
                     }
 
                     // 唤醒词本身又被 ASR 认了一遍，别当成用户的话送去聊天
-                    isWakeOnly(text) -> {
-                        Dbg.log("丢弃纯唤醒词：「$text」")
+                    isWakeOnly(resolved) -> {
+                        Dbg.log("丢弃纯唤醒词：「$resolved」")
                         lastActivityMs = System.currentTimeMillis()
                         main.post { setState(State.LISTENING) }
                     }
@@ -938,8 +1040,8 @@ class VoiceEngine(private val context: Context) {
                     // ★ 睡眠口令本地拦截：不走 LLM，省掉 1~2 秒往返，也不会漏。
                     //   必须放在 isWakeOnly 之后、else 之前 —— 顺序错了「小度你休息吧」
                     //   会被当成纯唤醒词丢掉。
-                    onSleepCommand != null && isSleepCommand(text) -> {
-                        Dbg.log("本地命中睡眠口令：「$text」")
+                    onSleepCommand != null && isSleepCommand(resolved) -> {
+                        Dbg.log("本地命中睡眠口令：「$resolved」")
                         lastActivityMs = System.currentTimeMillis()
                         main.post { onSleepCommand?.invoke() }
                     }
@@ -947,7 +1049,7 @@ class VoiceEngine(private val context: Context) {
                     else -> {
                         lastActivityMs = System.currentTimeMillis()
                         main.post {
-                            listener?.onUtterance(text)
+                            listener?.onUtterance(resolved)
                             setState(State.LISTENING)
                         }
                     }
@@ -956,6 +1058,16 @@ class VoiceEngine(private val context: Context) {
                 busyRecognizing = false
             }
         }
+    }
+
+    /**
+     * 识别出来的整句是不是播报内容的一部分（全双工自激护栏）。
+     * @param spoken 切句那一刻的播报原文，不能用处理时的（那时可能已清空）
+     */
+    private fun looksLikeBroadcast(text: String, spoken: String?): Boolean {
+        val norm = spoken?.filter { it.isLetterOrDigit() } ?: return false
+        val heard = text.filter { it.isLetterOrDigit() }
+        return heard.length >= 4 && norm.contains(heard)
     }
 
     /**
@@ -1126,6 +1238,9 @@ class VoiceEngine(private val context: Context) {
         }
     }
 
+    /** 设置页展示云端 ASR 的延迟分位数（连接复用效果看这个） */
+    fun asrStats(): String = asr.statsText()
+
     fun stateSnapshot(): Pair<State, String> = state to hintFor(state)
 
     private fun hintFor(s: State): String = when (s) {
@@ -1222,6 +1337,12 @@ class VoiceEngine(private val context: Context) {
 
         /** 重叠音频的额外阈值（防止 TTS 回声蹭过线） */
         const val OVERLAP_MARGIN = 0.10f
+
+        /** 实验性全双工：播报重叠句要过的额外声纹阈值，比普通重叠更严 */
+        const val FULL_DUPLEX_MARGIN = 0.15f
+
+        /** ASR 失败提示的最短间隔 */
+        const val FAIL_NOTICE_INTERVAL_MS = 15_000L
 
         /** 同一句命中的去抖间隔（声纹拒绝时窗口里的字还会留一会儿） */
         const val HIT_DEBOUNCE_MS = 1_500L

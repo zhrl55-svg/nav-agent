@@ -86,6 +86,13 @@ class VoiceService : Service() {
             engine.sleepAfterSpeaking(SLEEP_SPEAK_GUARD_MS)
         }
 
+        // 云端 ASR 失败时明确反馈。原来只写 Dbg 日志，用户在隧道里喊完一句
+        // 什么声音都没有，会以为程序坏了。USER 级不会抢占导航播报。
+        engine.onAsrFailure = {
+            val app = application as NavApp
+            app.voice.speak("网络不好，没听清，再说一遍", VoiceGuide.Priority.USER)
+        }
+
         // 识别的结果统一从这里进大脑，Activity 只是观众
         engine.setListener(object : VoiceEngine.Listener {
             override fun onState(state: VoiceEngine.State, hint: String) {

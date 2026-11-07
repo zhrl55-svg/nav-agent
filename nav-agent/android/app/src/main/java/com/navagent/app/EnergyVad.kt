@@ -9,12 +9,20 @@ import kotlin.math.sqrt
  * 人声明显高于底噪）能量法足够，且零依赖、零延迟。先跑通，不够再换。
  *
  * ★ 两个"静默"别搞混（这是最容易写错的地方）：
- *   - 断句阈值 [MIN_SILENCE_MS] 800ms：判断"这句话说完了"，触发识别
+ *   - 断句阈值 [minSilenceMs]（默认 800ms）：判断"这句话说完了"，触发识别
  *   - 会话休眠 5s：判断"没人再说话了"，退出连续会话（在 VoiceEngine 里）
  */
 class EnergyVad(
     private val onSpeechStart: () -> Unit,
-    private val onSegment: (ShortArray) -> Unit
+    private val onSegment: (ShortArray) -> Unit,
+    /**
+     * 断句静默时长（ms），每次切句时现取，设置页改完下一句就生效。
+     *
+     * ★ 2026-11-07 从写死的 800 改成可配。借鉴 D:/AI 的做法：那边把
+     *   MIN_SILENCE_MS 放在启动脚本里，文档专门写了「抢答就调大」。
+     *   车里噪音差异大，安静地库 600ms 够，高速上 1200ms 才不抢话。
+     */
+    private val minSilenceMs: () -> Int = { DEFAULT_SILENCE_MS }
 ) {
 
     /** 自适应噪声底，初始给个保守值 */
@@ -86,7 +94,7 @@ class EnergyVad(
         val silentMs = silentFrames * AudioCapture.FRAME_MS
         val totalMs = segment.size * 1000 / AudioCapture.SAMPLE_RATE
 
-        val shouldCut = silentMs >= MIN_SILENCE_MS || totalMs >= MAX_SEGMENT_MS
+        val shouldCut = silentMs >= minSilenceMs() || totalMs >= MAX_SEGMENT_MS
         if (!shouldCut) return
 
         inSpeech = false
@@ -126,7 +134,8 @@ class EnergyVad(
 
     private companion object {
         const val MIN_RMS = 260.0
-        const val MIN_SILENCE_MS = 800
+        /** 出厂断句时长（Prefs 默认值也是 800，两处别改岔了） */
+        const val DEFAULT_SILENCE_MS = 800
         const val MIN_SPEECH_MS = 300
         const val MAX_SEGMENT_MS = 15_000
         const val PRE_ROLL_FRAMES = 15 // 300ms

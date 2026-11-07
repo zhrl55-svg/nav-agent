@@ -683,6 +683,38 @@ class VoskWake(modelDir: File, private val wakeWords: List<String>) : WakeWord {
         return acc.map { fuzzyPinyin(it) }.distinct()
     }
 
+    /**
+     * 离线兜底转写（实验，2026-11-07）。
+     *
+     * 借鉴 D:/AI/app/asr_minimax.py 的「云端优先、失败降级本地」：隧道 / 欠费 /
+     * 超时时云端 ASR 会返回 null，原来只写一行日志，用户那边一点声音都没有。
+     * 这里复用**已经在内存里的 Vosk 中文小模型**（本来用于唤醒），临时建一个
+     * 独立 Recognizer，把 VAD 切好的整句一次喂完 —— 不引入新模型、不改帧流。
+     *
+     * ★ 准确率有限：小模型自由解码长句容易出碎片。所以默认不走主链路，
+     *   只在云端失败时兜底，或 shadow 模式下并排打日志供真机对比。
+     * ★ 线程：Recognizer 不是线程安全的。调用方必须和 feed / reset 共用同一把
+     *   锁（VoiceEngine 里是 wakeLock），否则 libvosk 内部状态被并发改写会 SIGSEGV。
+     */
+    fun transcribe(pcm: ShortArray): String? {
+        val m = model ?: return null
+        if (!ready || pcm.isEmpty()) return null
+        var r: Recognizer? = null
+        return try {
+            r = Recognizer(m, AudioCapture.SAMPLE_RATE.toFloat())
+            r.acceptWaveForm(pcm, pcm.size)
+            // 整句末尾不一定带静音，result 可能为空，用 partial 兜一层
+            val final = textOf(r.result)
+            val partial = textOf(r.partialResult)
+            final.ifBlank { partial }.trim().takeIf { it.isNotBlank() }
+        } catch (t: Throwable) {
+            Dbg.log("vosk 兜底转写异常 ${t.javaClass.simpleName}: ${t.message}")
+            null
+        } finally {
+            runCatching { r?.close() }
+        }
+    }
+
     override fun reset() {
         runCatching { rec?.reset() }
         framesSinceReset = 0

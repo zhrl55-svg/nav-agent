@@ -57,8 +57,16 @@ object Prefs {
         "先停下,先停一下,停下,停一下,别说了,不要说了,别讲了,别念了,别读了,打断,我选择"
     private const val K_VOICEPRINT = "voiceprint_on"
     private const val K_VOICEPRINT_TH = "voiceprint_threshold"
-private const val K_VOICEPRINT_BARGE = "voiceprint_barge_in"
-private const val K_VOICEPRINT_BARGE_TH = "voiceprint_barge_threshold"
+    private const val K_VOICEPRINT_BARGE = "voiceprint_barge_in"
+    private const val K_VOICEPRINT_BARGE_TH = "voiceprint_barge_threshold"
+
+    /** 实验选项：VAD 断句、噪声门、全双工、ASR 降级对比。全部默认关闭/保守值 */
+    private const val K_VAD_SILENCE = "vad_silence_ms"
+    private const val K_NOISE_GATE = "noise_gate_on"
+    private const val K_NOISE_GATE_DB = "noise_gate_db"
+    private const val K_FULL_DUPLEX = "full_duplex_on"
+    private const val K_ASR_FALLBACK_VOSK = "asr_fallback_vosk"
+    private const val K_ASR_SHADOW = "asr_shadow"
     private const val K_TTS_VOICE = "tts_voice"
     private const val K_TTS_CLOUD_MODEL = "tts_cloud_model"
     private const val K_TTS_RATE = "tts_rate"
@@ -214,6 +222,61 @@ private const val K_VOICEPRINT_BARGE_TH = "voiceprint_barge_threshold"
     var wakeBeep: Boolean
         get() = sp.getBoolean(K_WAKE_BEEP, true)
         set(v) = sp.edit().putBoolean(K_WAKE_BEEP, v).apply()
+
+    // ------------------------------------------------------------ 实验选项
+    //
+    // 2026-11-07，借鉴桌面 D:/AI 语音链路。凡是会改变拾音/识别行为的，
+    // 一律默认关（或保持原来的值），真机验过再决定要不要开。
+
+    /**
+     * VAD 断句：停顿多久算「说完了」。
+     *
+     * 桌面 D:/AI/scripts/start-voice.sh 里 VAD_THRESH / MIN_SILENCE_MS 都是
+     * 外露参数，文档专门写了 1200↔800 的取舍。车里噪音差异大：调小省延迟
+     * 但容易抢话，调大不抢话但每句多等几百毫秒。默认仍是原来的 800。
+     */
+    var vadSilenceMs: Int
+        get() = sp.getInt(K_VAD_SILENCE, 800)
+        set(v) = sp.edit().putInt(K_VAD_SILENCE, v.coerceIn(300, 2000)).apply()
+
+    /**
+     * 上传 ASR 前对整句加噪声门（D:/AI mic-capture.js 的 attack/hold/release
+     * 包络）。只影响上传副本，不动 VAD / 唤醒 / 声纹用的原始 PCM。默认关。
+     */
+    var noiseGate: Boolean
+        get() = sp.getBoolean(K_NOISE_GATE, false)
+        set(v) = sp.edit().putBoolean(K_NOISE_GATE, v).apply()
+
+    /** 噪声门阈值（dBFS）。默认 -45，越小越容易放行 */
+    var noiseGateThresholdDb: Float
+        get() = sp.getFloat(K_NOISE_GATE_DB, -45f)
+        set(v) = sp.edit().putFloat(K_NOISE_GATE_DB, v.coerceIn(-70f, -20f)).apply()
+
+    /**
+     * 实验性全双工：播报期间继续 VAD 切句，用户可以直接插话。
+     *
+     * ★ 默认关。车机外放 + AEC 不可靠时，自己的 TTS 会被切成很多句上传，
+     *   onSegment 里加了声纹 / 单次限额 / 播报原文回声三道护栏，但仍属实验。
+     *   依赖「打断检测」开启，且必须先注册声纹。
+     */
+    var fullDuplex: Boolean
+        get() = sp.getBoolean(K_FULL_DUPLEX, false)
+        set(v) = sp.edit().putBoolean(K_FULL_DUPLEX, v).apply()
+
+    /**
+     * 云端 ASR 失败时用内存里的 Vosk 小模型兜底。
+     *
+     * ★ 默认关：小模型长句容易出碎片，乱转写触发导航是安全问题。
+     *   先开 asrShadow 跑一段看准确率再决定。
+     */
+    var asrFallbackVosk: Boolean
+        get() = sp.getBoolean(K_ASR_FALLBACK_VOSK, false)
+        set(v) = sp.edit().putBoolean(K_ASR_FALLBACK_VOSK, v).apply()
+
+    /** shadow 模式：本地 Vosk 与云端并排打日志，链路仍走云端。默认关 */
+    var asrShadow: Boolean
+        get() = sp.getBoolean(K_ASR_SHADOW, false)
+        set(v) = sp.edit().putBoolean(K_ASR_SHADOW, v).apply()
 
     // ------------------------------------------------------------ 对话
 
