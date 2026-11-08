@@ -49,6 +49,15 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
     /** 导航中的目的地条（「前往 XXX」）。高德内置界面不显示目的地，这是唯一的入口 */
     private lateinit var navDestText: TextView
 
+    /** 目的地条的呼吸动画 */
+    private var destPulse: android.animation.Animator? = null
+
+    /** 上一次显示的目的地，用来判断「是不是新目的地」（只有新的才呼吸） */
+    private var lastDestShown: String? = null
+
+    /** 目的地条背景（mutate 过，才能单独改色不影响别的视图） */
+    private var destBg: android.graphics.drawable.GradientDrawable? = null
+
     /**
      * 高德 SDK 的冗余控件是否已经藏掉（footer 退出按钮 + 当前道路条）。
      * 藏一次就够，但 naviView reInit 之后会重建，那时要重置（见 rebuildNaviViewAfterExit）。
@@ -169,6 +178,47 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
         hudRoad = findViewById(R.id.hud_road)
         hudRemain = findViewById(R.id.hud_remain)
     navDestText = findViewById(R.id.nav_destination)
+    // mutate：背景是 shape 资源，不 mutate 的话改色会波及所有引用它的视图
+    runCatching {
+        destBg = (navDestText.background as? android.graphics.drawable.GradientDrawable)?.mutate() as? android.graphics.drawable.GradientDrawable
+        navDestText.background = destBg
+    }
+    // 点一下看完整地址：条上只能放简称，长地名会被截断。
+    // ★ 2026-11-08 用户要求：弹窗里**名字大、详细地址小两号**，
+    //   用 setMessage 没法分别设字号，改成自己拼一个两行布局。
+    navDestText.setOnClickListener {
+        val detail = nav.currentPlaceShortName
+        if (detail.isNullOrBlank()) return@setOnClickListener
+        val full = nav.currentPlaceDetail.orEmpty()
+        val parts = full.split("\n", limit = 2)
+        val nameText = parts[0].ifBlank { detail }
+        val addrText = parts.getOrNull(1).orEmpty()
+
+        val dp = resources.displayMetrics.density
+        val box = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setPadding((20 * dp).toInt(), (10 * dp).toInt(), (20 * dp).toInt(), (4 * dp).toInt())
+        }
+        box.addView(android.widget.TextView(this).apply {
+            text = nameText
+            textSize = 17f
+            setTextColor(0xFF1A1A17.toInt())
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+        })
+        if (addrText.isNotBlank()) {
+            box.addView(android.widget.TextView(this).apply {
+                text = addrText
+                textSize = 15f   // 比名字小两号
+                setTextColor(0xFF6B6B6B.toInt())
+                setPadding(0, (6 * dp).toInt(), 0, 0)
+            })
+        }
+        android.app.AlertDialog.Builder(this)
+            .setTitle("目的地")
+            .setView(box)
+            .setPositiveButton("知道了", null)
+            .show()
+    }
 
         // TTS 是 Application 级单例，导航播报和聊天回复共用一条队列。
         nav = createNavController()
@@ -1475,6 +1525,86 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
         }
     }
 
+    /**
+     * 目的地条的「呼吸」提示。
+     *
+     * ★ 为什么不是一直呼吸：开车时视野里有个东西不停地明暗闪，是干扰而不是提示。
+     *   所以只在**新目的地出现时**呼吸 3 次（约 3.6 秒）然后常亮 ——
+     *   刚好够吸引一次注意力，不会持续抢视线。
+     *   想让它一直呼吸，把 repeatCount 改成 INFINITE 即可。
+     */
+    private fun pulseDestination() {
+        destPulse?.cancel()
+        val density = resources.displayMetrics.density
+        // ★ 关键：硬件加速下 Paint.setShadowLayer 的模糊半径会被大幅裁剪，
+        //   看起来只是"字周围一圈硬边"。切成软件层后光晕才是真模糊。
+        //   代价是这条小视图每帧用 CPU 重绘，量很小可以接受。
+        navDestText.setLayerType(View.LAYER_TYPE_SOFTWARE, null)
+        // ★ 2026-11-08 用户反馈「不太明显」：只改 alpha 在深色地图上确实看不出来
+        //   —— 整条（含深色底）一起变淡，和地图背景的对比度变化很小。
+        //   现在一次动画同时带三个量，才看得出「呼吸」：
+        //     透明度 1 → 0.25   （幅度从 0.55 拉到 0.75）
+        //     缩放   1 → 1.06   （轻微涨缩，制造起伏感）
+        //     阴影   8dp → 16dp （涨起来时浮更离屏，层次感明显）
+        destPulse = android.animation.ValueAnimator.ofFloat(0f, 1f).apply {
+            // ★ 2026-11-08 用户定的节奏：**一秒切换一次，总共 5 秒**。
+            //   duration=1000 表示走完一趟(亮→暗)是 1 秒，REVERSE 让下一趟
+            //   反向走(暗→亮)，不用三角波手算；repeatCount=4 → 共 5 趟 = 5 秒。
+            duration = 1000L
+            repeatCount = 4
+            repeatMode = android.animation.ValueAnimator.REVERSE
+            interpolator = android.view.animation.AccelerateDecelerateInterpolator()
+            addUpdateListener { a ->
+                val k = a.animatedValue as Float
+                // ★ 只用 alpha 用户反馈看不出来，现在同时改三个视觉量：
+                //   ① 文字发光：Paint.setShadowLayer 画一圈蓝光，k 越大光晕越强
+                //   ② 底色：深蓝黑 → 品牌蓝，颜色变化比明暗更抓眼
+                //   ③ 缩放 + 阴影：制造起伏
+                // ① 文字发光：半径 6→26px，颜色从透明到亮青
+                navDestText.paint.setShadowLayer(
+                    10f + 26f * k, 0f, 0f,
+                    android.graphics.Color.argb((255 * k).toInt(), 120, 220, 255)
+                )
+                // ② 底色：深蓝黑 → 亮青蓝。
+                //    ★ 不能用 (background as GradientDrawable).setColor —— AppCompat
+                //      会把 XML 里的 shape 包一层 DrawableWrapper，强转拿不到
+                //      GradientDrawable（第一次这么写完全没变色）。
+                //      backgroundTintList 是 API21+ 的标准染色通道，不关心底层类型。
+                val c = android.graphics.Color.rgb(
+                    (0x2B + (0x1F - 0x2B) * k).toInt(),
+                    (0x2F + (0x9E - 0x2F) * k).toInt(),
+                    (0x33 + (0xD8 - 0x33) * k).toInt()
+                )
+                navDestText.backgroundTintList = android.content.res.ColorStateList.valueOf(c)
+                val scale = 1f + 0.06f * k
+                navDestText.scaleX = scale
+                navDestText.scaleY = scale
+                navDestText.elevation = (8f + 8f * k) * density
+                navDestText.invalidate()
+            }
+            addListener(object : android.animation.AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: android.animation.Animator) {
+                    // 最后一趟可能停在"最暗"，必须复位，否则条会一直半透明
+                    stopDestinationPulse()
+                }
+            })
+            start()
+        }
+    }
+
+    private fun stopDestinationPulse() {
+        destPulse?.cancel()
+        destPulse = null
+        navDestText.alpha = 1f
+        navDestText.scaleX = 1f
+        navDestText.scaleY = 1f
+        navDestText.elevation = 8f * resources.displayMetrics.density
+        navDestText.paint.setShadowLayer(0f, 0f, 0f, android.graphics.Color.TRANSPARENT)
+        navDestText.setLayerType(View.LAYER_TYPE_HARDWARE, null)
+        navDestText.backgroundTintList = null   // 回到 XML 里定义的 #F02B2F33
+        navDestText.invalidate()
+    }
+
     private fun findViewByIdName(root: View?, name: String): View? {
         if (root !is android.view.ViewGroup) return null
         for (i in 0 until root.childCount) {
@@ -1570,10 +1700,18 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
         // 目的地条：不管用不用高德内置界面都要显示（内置界面本来就没有目的地）
         val destName = nav.currentPlaceShortName
         if (h.navigating && !destName.isNullOrBlank()) {
-            navDestText.text = "前往 $destName"
-            if (navDestText.visibility != View.VISIBLE) navDestText.visibility = View.VISIBLE
+            if (destName != lastDestShown) {
+                lastDestShown = destName
+                navDestText.text = "前往 $destName"
+                navDestText.visibility = View.VISIBLE
+                navDestText.alpha = 1f
+                // 新目的地出现 → 呼吸几次提醒一下，然后常亮
+                pulseDestination()
+            }
         } else if (navDestText.visibility != View.GONE) {
             navDestText.visibility = View.GONE
+            stopDestinationPulse()
+            lastDestShown = null
         }
 
         if (!h.navigating || Prefs.amapBuiltinUi) {

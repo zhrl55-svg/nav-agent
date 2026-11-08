@@ -2,11 +2,14 @@
 <!--
   导航页「前往 XXX」目的地条的底。
 
-  ★ 2026-11-08 第一版是浅灰 #E6F2F2F2，真机看下来问题明显：
-    它紧挨着高德 footer（白底黑字），两块浅色糊成一片，
-    分不清哪是我们的、哪是 SDK 的。加深成深蓝黑后层次才出来。
+  ★ 2026-11-08 迭代记录：
+    第 1 版 #E6F2F2F2 浅灰 —— 与高德 footer（白底黑字）糊成一片，分不清谁是谁。
+    第 2 版 #E62B2F33 深蓝黑 —— 层次出来了，但用户反馈「不够显眼」。
+    第 3 版（当前）在深底上加一圈 20% 白描边 —— 地图上有白楼、水面、高亮路线，
+    纯色块在这些背景上会被"吃掉"，浅色描边能把边缘勾出来。
 -->
 <shape xmlns:android="http://schemas.android.com/apk/res/android">
-    <solid android:color="#E62B2F33" />
-    <corners android:radius="14dp" />
+    <solid android:color="#F02B2F33" />
+    <stroke android:width="1dp" android:color="#59FFFFFF" />
+    <corners android:radius="16dp" />
 </shape>

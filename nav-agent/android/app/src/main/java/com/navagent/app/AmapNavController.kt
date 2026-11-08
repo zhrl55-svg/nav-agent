@@ -992,6 +992,32 @@ class AmapNavController(
      * 一行放不下，还把真正的名字截掉了）。跨城时用户自己也说了城市名，
      * 不缺这一截前缀。
      */
+    /**
+     * 完整地址，格式跟候选列表一致：**名字一行，地址一行**。
+     *
+     * ★ 用户要求「就像列表出来的地名」——候选列表里就是「名字，详细地址」的排法，
+     *   这里保持一致，弹窗里第一行是 POI 名，第二行是「市区 + 街道门牌」。
+     */
+    val currentPlaceDetail: String?
+        get() {
+            val p = pendingPlace ?: return pendingDestination
+            val region = buildString {
+                if (p.city.isNotBlank()) append(p.city)
+                if (p.district.isNotBlank() && p.district != p.city) append(p.district)
+            }
+            // ★ 高德返回的 snippet 往往是**完整地址**（「甘肃省张掖市甘州区张火公路203号」），
+            //   直接再拼一遍市区会变成「张掖市甘州区甘肃省张掖市甘州区…」——
+            //   真机弹窗里就是这个效果。所以先用 contains 判断，地址里已经有城市就不再前缀。
+            val detail = when {
+                p.address.isBlank() -> region
+                p.city.isNotBlank() && !p.address.contains(p.city.removeSuffix("市")) ->
+                    "$region${p.address}"
+                else -> p.address
+            }
+            if (detail.isBlank() || detail.contains(p.formatted)) return p.formatted
+            return "${p.formatted}\n$detail"
+        }
+
     val currentPlaceShortName: String?
         get() = pendingPlace?.formatted?.takeIf { it.isNotBlank() } ?: pendingDestination
 

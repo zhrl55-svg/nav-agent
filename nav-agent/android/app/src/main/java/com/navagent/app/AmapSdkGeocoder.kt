@@ -71,7 +71,13 @@ object AmapSdkGeocoder {
         /** POI 所在城市，如「白银市」 */
         val city: String = "",
         /** POI 所在区县，如「景泰县」 */
-        val district: String = ""
+        val district: String = "",
+        /**
+         * 详细地址（含街道门牌），如「西二环西路 88 号」。
+         * ★ 2026-11-08 加：导航页点目的地条要显示完整地址，
+         *   只靠 city+district+名称 拿不到街道。
+         */
+        val address: String = ""
     )
 
     /** 周边搜索结果。distance 单位米，-1 表示没给。 */
@@ -293,7 +299,8 @@ object AmapSdkGeocoder {
                     // ★ 必须是**城市名**（如「石家庄市」），不是拼好的完整地址 ——
                     //   距离兜底要拿它跟用户说的地名比对（「石家庄火车站」里有没有「石家庄」）
                     city = it.city,
-                    district = it.district
+                    district = it.district,
+                    address = it.address
                 )
             }
             if (point == null) {
@@ -654,7 +661,8 @@ object AmapSdkGeocoder {
         longitude = latLonPoint.longitude,
         formatted = title ?: "",
         city = cityName ?: "",
-        district = adName ?: ""
+        district = adName ?: "",
+        address = snippet ?: ""
     )
 
     private fun GeocodeAddress.toGeoPoint(fallback: String): GeoPoint = GeoPoint(

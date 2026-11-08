@@ -34,7 +34,7 @@ object Prefs {
     /** 唤醒应答：唤醒后用人声说一句，替代嘀声 */
     private const val K_WAKE_ACK = "wake_ack_voice"
 
-    /** 对话后端：cloud / local，见 [LlmRouter] */
+    /** 对话后端：auto / cloud / local，见 [LlmRouter] */
     private const val K_CHAT_ENGINE = "chat_engine"
 
     /**
@@ -198,8 +198,15 @@ object Prefs {
         get() = sp.getBoolean(K_WAKE_ACK, true)
         set(v) = sp.edit().putBoolean(K_WAKE_ACK, v).apply()
 
+    /**
+     * 对话后端：`auto`（默认）/ `cloud` / `local`。
+     *
+     * ★ 2026-11-08 默认从 cloud 改成 auto：导航已经挪到规则层，断网降级
+     *   不再等于「导航不好使」，自动切换的代价小到可以接受。
+     *   想要固定行为就在设置里锁 cloud 或 local。
+     */
     var chatEngine: String
-        get() = sp.getString(K_CHAT_ENGINE, "cloud").orEmpty().ifBlank { "cloud" }
+        get() = sp.getString(K_CHAT_ENGINE, "auto").orEmpty().ifBlank { "auto" }
         set(v) = sp.edit().putString(K_CHAT_ENGINE, v.trim()).apply()
 
     /**

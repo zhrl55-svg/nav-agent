@@ -1,30 +1,39 @@
 package com.navagent.app
 
+import android.content.Context
 import com.navagent.core.ChatMessage
 import com.navagent.core.Llm
 
 /**
- * 对话后端路由：云端 / 本地 两档，设置页可切。
+ * 对话后端路由：云端 / 本地 / 自动 三档。
  *
  * | 档位 | 后端 | 工具 | 适用 |
  * |---|---|---|---|
- * | `cloud` | MiniMax（OpenAI 兼容） | 全部可用 | **默认**，线上行为 |
- * | `local` | MNN-Pocket-0.3B（进程内） | 全部降级 | 没网、只想聊两句 |
+ * | `auto`（默认） | 有网走云端，断网走本地 | 云端全可用 / 本地靠规则 | 日常 |
+ * | `cloud` | 强制 MiniMax | 全部可用 | 排查、需要联网搜索 |
+ * | `local` | 强制进程内 0.3B | 只剩规则导航 | 省流量、纯离线 |
  *
- * ## 为什么不做「自动切换」
- * 想过「有网走云端、没网走本地」，但两者**能力不对等**：本地没有工具，
- * 同一个问题「导航去国贸」云端会真的开始导航，本地只能回一句「好的」。
- * 自动切换会让行为变得不可预测——用户不知道自己这句话到底会不会被执行。
- * 所以做成显式开关，用户自己知道现在是什么模式。
+ * ## auto 为什么现在才敢做
+ * 早先不敢自动切，因为**能力不对等**：切到本地就等于失去工具调用，
+ * 用户会莫名其妙发现「导航不好使了」，却不知道为什么。
  *
- * ## local 档的降级是「静默」的
- * 不会弹窗说「工具不可用」，因为语音场景弹窗没人看。系统提示词里已经写明
- * 「当前是离线本地模式，没有联网和导航工具」，模型会自己用话术带过。
+ * 2026-11-08 把导航挪到规则层之后，本地档照样能「导航去X」「停止导航」
+ * 「继续导航」，降级只影响搜索、天气和闲聊深度 —— 代价小到可以接受。
+ *
+ * ## 切换必须让用户看见
+ * 自动切换的前提是**不静默**：真的换了后端会通知一次，
+ * 设置页也会显示当前实际走的是哪条路。
  */
 class LlmRouter(
+    private val context: Context,
     private val cloud: Llm,
-    private val local: Llm
+    private val local: Llm,
+    /** 自动模式真的换了后端时回调：true=云端，false=本地 */
+    private val onModeChanged: ((Boolean) -> Unit)? = null
 ) : Llm {
+
+    @Volatile
+    private var lastAutoCloud: Boolean? = null
 
     override fun chat(system: String, history: List<ChatMessage>, onDelta: (String) -> Unit): String? {
         val backend = pick()
@@ -40,9 +49,39 @@ class LlmRouter(
     override fun chatText(system: String, history: List<ChatMessage>, onDelta: (String) -> Unit): String? =
         pick().chatText(system, history, onDelta)
 
-    private fun pick(): Llm = if (Prefs.chatEngine == ENGINE_LOCAL) local else cloud
+    private fun pick(): Llm {
+        val mode = Prefs.chatEngine
+        val online = NetworkState.isOnline(context)
+        val useCloud = when (mode) {
+            ENGINE_LOCAL -> false
+            ENGINE_CLOUD -> true
+            else -> online
+        }
+        // 只有 auto 档需要提示切换；手动档是用户自己选的，不用再告诉他
+        if (mode == ENGINE_AUTO) {
+            val changed = lastAutoCloud != null && lastAutoCloud != useCloud
+            if (lastAutoCloud == null) {
+                Dbg.log("对话后端=auto 初始 ${if (useCloud) "云端" else "本地（离线）"} online=$online")
+            }
+            lastAutoCloud = useCloud
+            if (changed) {
+                Dbg.log("对话后端=auto 切换 → ${if (useCloud) "云端" else "本地（离线）"} online=$online")
+                onModeChanged?.invoke(useCloud)
+            }
+        }
+        return if (useCloud) cloud else local
+    }
 
-    private companion object {
+    companion object {
+        const val ENGINE_AUTO = "auto"
+        const val ENGINE_CLOUD = "cloud"
         const val ENGINE_LOCAL = "local"
+
+        /** 给 UI 用的当前实际后端描述 */
+        fun describe(context: Context): String = when (Prefs.chatEngine) {
+            ENGINE_LOCAL -> "本地（0.3B）"
+            ENGINE_CLOUD -> "云端（MiniMax）"
+            else -> if (NetworkState.isOnline(context)) "自动 · 云端" else "自动 · 本地（离线）"
+        }
     }
 }

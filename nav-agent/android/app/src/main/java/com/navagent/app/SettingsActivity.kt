@@ -459,18 +459,22 @@ class SettingsActivity : AppCompatActivity() {
         row(
             "对话后端",
             chatEngineLabel(),
-            "云端=工具全可用｜本地=进程内 0.3B，纯聊天、不能导航和搜索"
+            "自动=有网云端、断网降级本地（导航靠规则，仍可用）｜可手动锁定某一档"
         ) {
             choose(
                 "对话后端", listOf(
+                    "自动（有网云端，断网本地）" to "auto",
                     "云端（MiniMax，工具全可用）" to "cloud",
-                    "本地（0.3B，离线纯聊天）" to "local"
+                    "本地（0.3B，纯离线）" to "local"
                 ), Prefs.chatEngine
             ) {
                 Prefs.chatEngine = it
                 toast(
-                    if (it == "local") "已切本地：模型首次加载约 2 秒，导航/搜索/天气工具不可用"
-                    else "已切云端：工具恢复可用"
+                    when (it) {
+                        "local" -> "已锁本地：模型首次加载约 2 秒，只能聊天和规则导航"
+                        "cloud" -> "已锁云端：始终走 MiniMax，断网会失败"
+                        else -> "已切自动：有网用云端，断网自动降级本地"
+                    }
                 )
                 applied()
             }
@@ -1380,9 +1384,8 @@ class SettingsActivity : AppCompatActivity() {
      * 显示**实际连上的**引擎，不是设置里选的那个。
      * 引擎没装或者构造失败会回退系统默认，选的和用的可能不是一回事。
      */
-    /** 对话后端那一行右侧显示的文字 */
-    private fun chatEngineLabel(): String =
-        if (Prefs.chatEngine == "local") "本地（0.3B）" else "云端（MiniMax）"
+    /** 对话后端那一行右侧显示的文字：auto 档要显示**当前实际**走的是哪条 */
+    private fun chatEngineLabel(): String = LlmRouter.describe(this)
 
     /** 本地模型状态：文件在不在、有没有加载成功 */
     private fun localLlmLabel(): String {

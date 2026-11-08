@@ -684,10 +684,18 @@ class VoiceEngine(private val context: Context) {
         // 只有「打断播报」这条路径才强制声纹。
         // 待命唤醒保持宽松：万一模板过期或没注册，主人至少还能把机器叫醒，
         // 不至于整台设备变成砖。
-        val gate = if (interruptedSpeech && Prefs.voiceprintBargeIn) {
-            voiceprintProvider?.invoke()
-        } else {
-            null
+        // ★ 2026-11-08 用户反馈「唤醒好像没有声纹验证」—— 确实没有。
+        //   原来只有「打断播报」这条路径强制声纹，待命唤醒故意放得很宽松
+        //   （怕声纹模板异常把设备锁死）。代价是旁人喊一声「果果」也会唤醒、
+        //   还会听到应答，虽然接着下的命令会被识别阶段的声纹拦住。
+        //
+        //   现在改成：开着「只认我的声音」且声纹已注册时，待命唤醒同样要验证。
+        //   没注册/模型没就绪时仍然放行 —— 宁可让旁人喊醒一次，
+        //   也不能让主人喊不醒。
+        val gate = when {
+            interruptedSpeech && Prefs.voiceprintBargeIn -> voiceprintProvider?.invoke()
+            !interruptedSpeech && Prefs.voiceprint -> voiceprintProvider?.invoke()
+            else -> null
         }
         val voiceprintUsable = gate != null && gate.enrolled
         if (!voiceprintUsable) {
@@ -706,15 +714,27 @@ class VoiceEngine(private val context: Context) {
         // 真机日志里 0.24s / 0.48s 的 TTS 误候选就是因此打断了播报。
         // 唤醒打断必须等到足够长的声纹证据；不足时宁可继续播报。
         if (pcm.size < AudioCapture.SAMPLE_RATE * 3 / 5) {
-            Dbg.log(
-                "$source 唤醒候选音频仅 ${"%.2f".format(pcm.size.toDouble() / AudioCapture.SAMPLE_RATE)}s，" +
-                    "不足 0.60s，暂不打断"
-            )
+            val secs = "%.2f".format(pcm.size.toDouble() / AudioCapture.SAMPLE_RATE)
+            if (interruptedSpeech) {
+                // 打断：证据不足就不动手，避免被 TTS 的短误候选骗到
+                Dbg.log("$source 唤醒候选音频仅 ${secs}s，不足 0.60s，暂不打断")
+                return
+            }
+            // 唤醒：缓冲短说明刚清理过，不能因为验证不了就让主人喊不醒
+            Dbg.log("$source 音频仅 ${secs}s，不足以验证声纹，按放行处理")
+            handleWakeDetected(interruptedSpeech, hit)
             return
         }
 
         wakeConfirmPending = true
-        val threshold = Prefs.voiceprintBargeThreshold
+        // 两个阈值分开取，因为它们要挡的东西不一样：
+        //   打断 → voiceprintBargeThreshold：要和 TTS 回声抢，宁松勿严
+        //   唤醒 → voiceprintThreshold：待命时没有回声干扰，按常规匹配标准来
+        val threshold = if (interruptedSpeech) {
+            Prefs.voiceprintBargeThreshold
+        } else {
+            Prefs.voiceprintThreshold
+        }
         worker.execute {
             try {
                 val evidence = strongestOwnerWindow(gate, pcm)

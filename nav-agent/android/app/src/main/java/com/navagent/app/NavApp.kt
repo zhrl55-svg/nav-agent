@@ -179,6 +179,7 @@ class NavApp : Application() {
             //   local = 进程内 MNN 0.3B（纯聊天，无 Function Calling）。
             //   本地模型走同一个进程，不依赖 MNN Chat 那套 HTTP 服务。
             llm = LlmRouter(
+                context = this,
                 cloud = OpenAiLlm(
                     tools = listOf(
                     navTool,
@@ -199,7 +200,18 @@ class NavApp : Application() {
                     WebExtractTool(this) { Prefs.tavilyKey }
                     )
                 ),
-                local = MnnLlm(MnnLocalLlm.get(this))
+                local = MnnLlm(MnnLocalLlm.get(this)),
+                // 自动档换后端必须让用户知道，不能静默降级
+                onModeChanged = { cloudMode ->
+                    android.os.Handler(android.os.Looper.getMainLooper()).post {
+                        android.widget.Toast.makeText(
+                            this,
+                            if (cloudMode) "网络已恢复，切回云端模型"
+                            else "已断网，切到本地模型（导航仍可用）",
+                            android.widget.Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                }
             ),
             onDelta = { piece -> chatObservers.forEach { it.onAssistantDelta(piece) } },
             onReply = { full -> chatObservers.forEach { it.onAssistantDone(full) } },
@@ -1068,9 +1080,15 @@ class NavApp : Application() {
         android.os.Handler(android.os.Looper.getMainLooper()).post {
             navStoppedObservers.forEach { it.onNavigationStopped() }
         }
-        // 故意不清 destination —— 底部按钮会变成「开始导航」，点一下能接着走，
-        // 不用再让用户说一遍地名
-        return "导航已停止。目的地还记着，之后说继续或者点「开始导航」就能接着走"
+        // 故意不清 destination —— 说「继续导航」能直接回到这里，
+        // 不用再让用户说一遍地名。
+        //
+        // ★ 2026-11-08 用户反馈：这句播报「点...」后面少字，听不完整。
+        //   原因是文案里带了「」直角引号 —— 中文 TTS 遇到它对处理不一致，
+        //   有的引擎直接吞掉并夹一个怪停顿。
+        //   同时「点『开始导航』」这个按钮名也不准（footer 退出后没这个按钮），
+        //   干脆只留语音说法 —— 这本来就是个语音助手，用嘴说最自然。
+        return "导航已停止，目的地还记着，说继续导航就能接着走"
     }
 
     /**
