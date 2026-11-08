@@ -167,6 +167,83 @@ object ModelStore {
     }
 
     /** 已就绪的模型目录；没有返回 null */
+    // ---------------------------------------------------------------- 端侧识别（SenseVoice）
+    //
+    // ★ 2026-11-08：模型不进 APK（239MB 会把包体翻倍），改为首次运行下载。
+    //   下载失败不影响可用性 —— AsrRouter 会自动降级云端，只是没收益。
+
+    private const val ASR_DIR = "asr-sensevoice"
+    private const val ASR_MODEL = "model.int8.onnx"
+    private const val ASR_TOKENS = "tokens.txt"
+    private const val ASR_BASE =
+        "https://hf-mirror.com/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/resolve/main"
+
+    /** 模型文件最小体积。下到一半断网的残file靠它识别出来，避免拿坏模型去 init（会 native abort） */
+    private const val ASR_MODEL_MIN_BYTES = 200_000_000L
+    private const val ASR_TOKENS_MIN_BYTES = 200_000L
+
+    fun localAsrDir(filesDir: File): File = File(filesDir, "models/$ASR_DIR")
+
+    fun localAsrReady(filesDir: File): Boolean {
+        val d = localAsrDir(filesDir)
+        return File(d, ASR_MODEL).length() > ASR_MODEL_MIN_BYTES &&
+            File(d, ASR_TOKENS).length() > ASR_TOKENS_MIN_BYTES
+    }
+
+    /**
+     * 确保端侧识别模型存在。阻塞调用，必须放后台线程。
+     * @return 是否就绪
+     */
+    fun ensureLocalAsr(
+        filesDir: File,
+        externalDir: File? = null,
+        onProgress: (String) -> Unit = {}
+    ): Boolean {
+        if (localAsrReady(filesDir)) return true
+        val dir = localAsrDir(filesDir)
+        dir.mkdirs()
+
+        // ① 先看外部私有目录（Android/data/com.navagent/files/...）有没有人放好的模型。
+        //    ★ 这是手动导入的主路径：用户用数据线连着电脑、或者用文件管理器，
+        //      只能碰到这个目录，碰不到 filesDir。放这里 App 自动搬进来。
+        if (externalDir != null) {
+            val src = File(externalDir, "models/$ASR_DIR")
+            if (localAsrReady(src)) {
+                onProgress("发现外部目录里的模型，正在导入…")
+                listOf(ASR_MODEL, ASR_TOKENS).forEach { name ->
+                    runCatching {
+                        File(src, name).copyTo(File(dir, name), overwrite = true)
+                    }.onFailure { Dbg.log("导入 $name 失败：${it.message}") }
+                }
+                if (localAsrReady(filesDir)) {
+                    onProgress("端侧识别模型导入完成")
+                    return true
+                }
+                onProgress("导入失败（文件不完整）")
+            }
+        }
+
+        val model = File(dir, ASR_MODEL)
+        if (model.length() <= ASR_MODEL_MIN_BYTES) {
+            onProgress("正在下载端侧识别模型（约 239MB，仅首次）…")
+            if (!download("$ASR_BASE/$ASR_MODEL", model, onProgress)) {
+                Dbg.log("端侧识别模型下载失败")
+                return false
+            }
+        }
+        val tokens = File(dir, ASR_TOKENS)
+        if (tokens.length() <= ASR_TOKENS_MIN_BYTES) {
+            onProgress("正在下载词表…")
+            if (!download("$ASR_BASE/$ASR_TOKENS", tokens, onProgress)) {
+                Dbg.log("端侧识别词表下载失败")
+                return false
+            }
+        }
+        val ok = localAsrReady(filesDir)
+        onProgress(if (ok) "端侧识别模型就绪" else "端侧识别模型校验失败")
+        return ok
+    }
+
     fun voskDir(filesDir: File): File? {
         val d = File(filesDir, "models/$DIR_NAME")
         return if (isValid(d)) d else null

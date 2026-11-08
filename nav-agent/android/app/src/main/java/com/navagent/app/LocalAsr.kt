@@ -60,9 +60,42 @@ class LocalAsr(private val context: Context) : Asr {
     /** 模型目录。有 int8 就用 int8，没就退回 fp32 命名 */
     private fun modelDir(): File = File(context.filesDir, "models/asr-sensevoice")
 
+    @Volatile private var downloading = false
+
+    /** 首次运行下载模型。只启动一次，失败不重试（下次冷启动会再来）。 */
+    private fun startModelDownloadOnce() {
+        if (downloading) return
+        downloading = true
+        Thread {
+            val ok = runCatching {
+                ModelStore.ensureLocalAsr(context.filesDir, context.getExternalFilesDir(null)) { msg -> Dbg.log("本地ASR: $msg") }
+            }.getOrDefault(false)
+            downloading = false
+            if (ok) {
+                // 装好了清掉失败标记，下一次识别就能用上
+                initFailed = false
+                initTried = false
+                Dbg.log("本地ASR: 模型已就绪，下次识别生效")
+            } else {
+                Dbg.log("本地ASR: 模型下载失败，继续走云端")
+            }
+        }.apply { name = "asr-download"; isDaemon = true; start() }
+    }
+
+    /**
+     * 选模型文件。
+     *
+     * ★ 2026-11-08：支持「模型可选」——除了约定名 model.int8.onnx，
+     *   目录里放任何 sherpa-onnx 兼容的 .onnx（SenseVoice 其它精度、
+     *   paraformer、whisper 小模型…）都能被用上，不用改代码。
+     *   排序取第一个，名字里带 int8 的优先（体积小、手机上更快）。
+     */
     private fun modelFile(dir: File): File {
-        val int8 = File(dir, "model.int8.onnx")
-        return if (int8.exists()) int8 else File(dir, "model.onnx")
+        File(dir, "model.int8.onnx").takeIf { it.exists() }?.let { return it }
+        val onnx = dir.listFiles { f -> f.isFile && f.name.endsWith(".onnx", ignoreCase = true) }
+            ?.sortedBy { if (it.name.contains("int8")) 0 else 1 }
+            ?.firstOrNull()
+        return onnx ?: File(dir, "model.onnx")
     }
 
     /**
@@ -82,6 +115,16 @@ class LocalAsr(private val context: Context) : Asr {
             if (!model.exists() || !tokens.exists()) {
                 initFailed = true
                 Dbg.log("本地ASR: 模型缺失 ${model.absolutePath}（tokens.exists=${tokens.exists()}）")
+                // ★ 2026-11-08：模型不进 APK，首次运行自动下载（239MB）。
+                //   下载期间本次识别走云端（AsrRouter 的降级路径），装好下次生效。
+                startModelDownloadOnce()
+                return false
+            }
+            // 有文件但体积不对（下到一半断了）也要重下，否则 native 加载会 abort
+            if (!ModelStore.localAsrReady(context.filesDir)) {
+                initFailed = true
+                Dbg.log("本地ASR: 模型体积不对，判为残缺，重新下载")
+                startModelDownloadOnce()
                 return false
             }
 

@@ -247,6 +247,17 @@ class SettingsActivity : AppCompatActivity() {
             }
         }
 
+        // ★ 2026-11-08：模型不进 APK（239MB），也没有可靠的国内下载源
+        //   （hf-mirror 已把 resolve 请求 308 回 huggingface.co，国内 SSL 直接断）。
+        //   所以给一个状态 + 手动放置指引，App 启动时会自动从外部目录导入。
+        row(
+            "端侧识别模型",
+            if (ModelStore.localAsrReady(filesDir)) "已就绪" else "未安装（识别走云端）",
+            "点开看怎么手动放模型。没装不影响使用，只是拿不到端侧的收益"
+        ) {
+            showLocalModelHelp()
+        }
+
         row(
             "断句灵敏度", "${Prefs.vadSilenceMs} ms",
             "停顿多久算说完。调小更快但容易抢话，高速噪音大建议调大"
@@ -1384,6 +1395,33 @@ class SettingsActivity : AppCompatActivity() {
      * 显示**实际连上的**引擎，不是设置里选的那个。
      * 引擎没装或者构造失败会回退系统默认，选的和用的可能不是一回事。
      */
+    /** 本地模型的手动放置指引（自动下载源不可靠，改人工导入） */
+    private fun showLocalModelHelp() {
+        val asrOk = ModelStore.localAsrReady(filesDir)
+        val mnnOk = MnnLocalLlm.get(this).modelPresent()
+        val msg = buildString {
+            append("【端侧识别 SenseVoice】")
+            append(if (asrOk) "　已就绪 ✓" else "　未安装")
+            append("\n需要 2 个文件（约 239MB）：model.int8.onnx、tokens.txt\n")
+            append("放到：Android/data/com.navagent/files/models/asr-sensevoice/\n\n")
+            append("【本地对话 MNN 0.3B】")
+            append(if (mnnOk) "　已就绪 ✓" else "　未安装")
+            append("\n需要 5 个文件（约 166MB）：llm.mnn、llm.mnn.weight、\n")
+            append("tokenizer.mtok、config.json、llm_config.json\n")
+            append("放到：Android/data/com.navagent/files/models/mnn-llm/\n\n")
+            append("放好后重启 App，会自动从外部目录搬进私有目录。\n")
+            append("用数据线连电脑或用文件管理器都能放进上面这两个路径。\n\n")
+            append("下载源：huggingface.co/csukuangfj/\n")
+            append("sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17\n")
+            append("（国内可能需代理；MNN 那套可从 MNN Chat 下载后拷出）")
+        }
+        AlertDialog.Builder(this)
+            .setTitle("本地模型放置说明")
+            .setMessage(msg)
+            .setPositiveButton("知道了", null)
+            .show()
+    }
+
     /** 对话后端那一行右侧显示的文字：auto 档要显示**当前实际**走的是哪条 */
     private fun chatEngineLabel(): String = LlmRouter.describe(this)
 
