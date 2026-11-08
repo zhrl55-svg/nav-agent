@@ -514,3 +514,173 @@ NAVI=$(ls ~/.gradle/caches/modules-2/files-2.1/com.amap.api/navi-3dmap/*/*/navi-
 "$JAVAP" -classpath "$NAVI" -constants com.amap.api.navi.enums.PathPlanningStrategy
 "$JAVAP" -classpath "$NAVI" com.amap.api.navi.AMapNaviListener
 ```
+
+## 端侧语音识别（2026-11-08）
+
+原来的识别只有云端一条路（MiniMax `asr-1.0`），隧道/地库里必哑。现在加了端侧，
+用**同一个** `com.navagent.core.Asr` 接口，三档可切：
+
+| 档位 | 返回什么 | 端侧做什么 | 用途 |
+|---|---|---|---|
+| `cloud` | 云端结果 | 不加载 | 默认，回滚用 |
+| `local` | 端侧优先，失败降级云端 | 参与决策 | 正式切主链路 |
+| `shadow` | **云端结果** | 后台跑，只记差异 | 灰度收数据 |
+
+设置页 → 应用设置 → 语音 → 「识别引擎」。默认 cloud，新装机和回滚都是旧行为。
+
+### 涉及文件
+
+- `LocalAsr.kt`（新）—— sherpa-onnx `OfflineRecognizer` + SenseVoice-Small int8
+- `AsrRouter.kt`（新）—— 三档路由 + 影子对比日志
+- `Prefs.asrEngine`（新）—— `asr_engine`，默认 `cloud`
+- `VoiceEngine.asr` —— 由 `MinimaxAsr()` 换成 `AsrRouter(context)`
+
+### 模型放哪
+
+`filesDir/models/asr-sensevoice/`，两个文件：
+
+```
+model.int8.onnx   239MB
+tokens.txt        309KB
+```
+
+**没有打包进 APK**（会让包体从 115MB 涨到 345MB）。当前是手动 adb push 进去的，
+`ModelStore` 还没接入下载逻辑——后续要补一个首次启动下载。
+
+### ★ 一个必须记住的坑
+
+`OfflineRecognizer(assetManager = ..., config = ...)` 的 **assetManager 必须传 null**，
+模型文件在 filesDir 时必须这样。传 `context.assets` 会让 sherpa 走 AssetManager
+读文件，和绝对路径对不上，然后：
+
+```
+W sherpa-onnx: You are using an absolute path '...tokens.txt', but assetManager is NOT set to null.
+F sherpa-onnx: Read binary file: Load '...tokens.txt' failed
+```
+
+`F` 是 native abort，**Kotlin 的 try/catch 抓不到**，进程直接静默消失，
+logcat 里连 FATAL EXCEPTION 都没有，只有 `appDiedLocked ... reason=null`。
+2026-11-08 在 P40 上踩过一次，排查了半小时。
+
+### 实测（华为 P40 / 麒麟 990）
+
+- 模型加载 **2666ms**（在 `asr-warmup` 线程，不阻塞启动）
+- 与 Sherpa KWS、vosk 唤醒、声纹并存正常
+- 真机听音识别待验（需要人说话）
+
+## 本地大模型库集成（2026-11-08）
+
+MNN-LLM 直接跑在导航 App 进程内，不经过 HTTP、不依赖别的 App。
+今天实测 MNN Chat 的 API 有两个死穴（后台不监听、队列卡死后要重启），
+库集成把这两个问题从根上消掉了。
+
+### 涉及文件
+
+- `com/alibaba/mnnllm/android/llm/LlmSession.kt`（新）—— 最小 JNI 桥，180 行
+- `com/alibaba/mnnllm/android/llm/GenerateProgressListener.kt`（新）—— 回调接口
+- `MnnLocalLlm.kt`（新）—— 加载/生成封装，带自检
+- `app/src/main/jniLibs/arm64-v8a/` —— `libmnnllmapp.so` + `libMNN.so`（9MB）
+
+**不用写一行 C++。** 官方 MnnLlmChat 的 LlmSession.kt 有 472 行、牵出十几个类；
+但 JNI 只认「包名+类名+方法名+参数表」，所以声明同样名字的 native 方法，
+就能直接复用官方编译好的 `libmnnllmapp.so`。
+
+### ★ 包名和类名不能改
+
+JNI 符号是 `Java_com_alibaba_mnnllm_android_llm_LlmSession_initNative`，
+所以必须放在 `com.alibaba.mnnllm.android.llm` 包里、类名必须是 `LlmSession`。
+
+### 模型
+
+`filesDir/models/mnn-llm/`，5 个文件（直接拷 MNN Chat 下载的那份，不用转换）：
+
+```
+config.json        502B    运行参数
+llm_config.json    3.2KB   结构 + jinja 模板
+llm.mnn            931KB   计算图
+llm.mnn.weight     164MB   int4 权重
+tokenizer.mtok     1.6MB   词表
+```
+
+### 踩过的四个坑（按排查顺序）
+
+1. **configPath 必须是 `config.json` 的文件路径，不是模型目录**
+   传目录会报 `Module load failed for config: <dir>`。native 拿它去 readText，
+   再从路径反推模型目录。
+
+2. **文本从 `onProgress` 累积，不是从返回的 map 取**
+   map 里只有 `prefill_time / decode_len / decode_time` 这些指标，没有正文。
+   官方 `GenerateResultProcessor` 也是累积 progress。
+
+3. **回调返回值语义是「要不要停」，不是「要不要继续」**（最坑的一个）
+   `onProgress` 返回 `true` = 中止。按直觉写成 `true` 的后果：
+   每轮只生成 1 个 token（`decode_len=1`，输出停在「我」），
+   而且日志看上去一切正常，很难联想到是这个。
+
+4. **`max_new_tokens` 要写进 init 的配置 JSON**
+   模型自带 config.json 没这个字段，用 `JSONObject(...).put("max_new_tokens", 256)`。
+   （这条和第 3 条是同一次改的，未单独验证其必要性，但加上无害。）
+
+### 实测（华为 P40 / 麒麟 990）
+
+```
+加载       1852ms
+首字       161ms
+prefill    207 t/s   (33 token / 159ms)
+decode     78 t/s    (59 token / 753ms)
+整句耗时   950ms
+```
+
+和 MNN Chat 那条路的 58–77 t/s 持平。**冷启动第一次只有 22 t/s**，
+因为同时在加载 ASR/KWS/声纹三套模型抢 CPU；稳态就是 78 t/s。
+
+### 当前状态
+
+只做到「能加载、能生成、日志可验证」（`mnn_llm_selftest=true` 触发自检）。
+**还没接进对话链路**——ChatEngine 现在仍然走 OpenAI 兼容的 HTTP。
+下一步要做的：把 `MnnLocalLlm.generate()` 接到 ChatEngine 的 LLM 接口上，
+替代 `OpenAiLlm`，并且注意它不支持 Function Calling（导航工具会退化成纯聊天）。
+
+## 对话后端两档路由（2026-11-08）
+
+`cloud`（默认）走 MiniMax，工具全可用；`local` 走进程内 MNN-0.3B，纯聊天。
+设置页 → 对话大脑 → 「对话后端」。
+
+### 涉及文件
+
+- `LlmRouter.kt`（新）—— 按 `Prefs.chatEngine` 分发，实现 `core.Llm`
+- `MnnLlm.kt`（新）—— 把 `MnnLocalLlm` 适配成 `Llm`，自己拼 Qwen 模板
+- `NavApp.kt` —— `llm = LlmRouter(cloud = OpenAiLlm(...), local = MnnLlm(...))`
+- `MnnLocalLlm` —— 改成进程内单例（`MnnLocalLlm.get(ctx)`），避免加载两遍
+
+### 为什么不做「有网走云端、没网走本地」的自动切换
+
+两者能力不对等：同一个「导航去国贸」，云端会真的开始导航，本地只能回一句
+「好的」。自动切换会让用户不知道自己这句话到底会不会被执行。做成显式开关，
+用户自己知道当前是什么模式。
+
+### ★ 本地模式的系统提示词必须砍
+
+云端那份 system prompt 有几千字（工具协议、搜索规则、候选确认流程），
+本地一条都用不上，但每一条都要 prefill。实测：
+
+| system 字数 | prompt_len | 首字延迟 |
+|---|---|---|
+| 700 字 | 462 token | **3.5 秒** |
+| 260 字 | 221 token | **1.4 秒** |
+
+3.5 秒的首字延迟，用户会以为死机。所以 `MnnLlm` 只截取开头 260 字
+（人设 + 当前时间 + 「回答要简短」），并在末尾追加一句「当前是离线本地模式，
+没有联网和导航工具」。历史也只带最近 1 轮。
+
+### 实测（P40，端到端走 ChatEngine）
+
+```
+对话后端=local 1597ms 结果=13字
+  本地LLM 生成 1597ms（首字 1373ms）
+  prefill 221 token / 1367ms = 161 t/s
+  decode    9 token /  215ms =  42 t/s
+  →「已确认路线，交通信息更新中」
+```
+
+冷启动第一句约 2.1 秒（模型加载 1.8 秒 + 首字 1.9 秒），之后稳定在 1.4–1.6 秒。

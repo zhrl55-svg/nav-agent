@@ -61,6 +61,9 @@ class VoiceGuide(
     /** 打断后重试 drain 用（[bargeInChat]） */
     private val main = android.os.Handler(android.os.Looper.getMainLooper())
 
+    /** drain 遇到引擎还在收尾时的重试计数（见 drain() 里的注释） */
+    private var drainRetries = 0
+
     private var tts: TextToSpeech? = null
     private var ready = false
     private var current: Utterance? = null
@@ -424,7 +427,30 @@ class VoiceGuide(
         }
 
         val engine = tts ?: return
-        if (engine.isSpeaking) return
+        if (engine.isSpeaking) {
+            // ★ 2026-11-08 真机 bug：导航播报入队后**卡了 90 秒**才播出来。
+            //
+            //   路径是这样的：speak(NAV) 先把 current 清掉、调 tts.stop()，
+            //   紧接着 drain()。但 stop() 是异步的，此刻 engine.isSpeaking
+            //   仍然是 true → 这里直接 return，之后**没有任何重试**。
+            //   于是队列一直压着，直到下一个完全无关的事件（用户下次唤醒）
+            //   才顺带把 drain 又叫了一次，导航提示才响。
+            //
+            //   打断路径早就用 retryDrain() 兜过这个坑，speak(NAV) 这条漏了。
+            //   这里补上有限次自旋：12 × 250ms = 3 秒，够 stop 收尾，也不会死循环。
+            if (drainRetries < DRAIN_RETRY_TIMES) {
+                drainRetries++
+                logger?.invoke(
+                    "播报引擎还在收尾，${DRAIN_RETRY_MS}ms 后重试（$drainRetries/$DRAIN_RETRY_TIMES）"
+                )
+                main.postDelayed({ drain() }, DRAIN_RETRY_MS)
+            } else {
+                logger?.invoke("等待播报引擎超时，本条播报放弃")
+                drainRetries = 0
+            }
+            return
+        }
+        drainRetries = 0
         val next = queue.poll() ?: return
         current = next
         currentPriority = next.priority
@@ -559,6 +585,9 @@ class VoiceGuide(
 
         /** 打断后重试 drain 的间隔 */
         const val DRAIN_RETRY_MS = 250L
+
+        /** drain 撞上引擎还在收尾时，最多自旋几次（12 × 250ms ≈ 3 秒） */
+        const val DRAIN_RETRY_TIMES = 12
 
         /** 打断后的硬静音时长：等 MediaPlayer 真正 stop + 混响衰减 */
         const val HARD_MUTE_MS = 300L

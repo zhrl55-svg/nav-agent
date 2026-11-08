@@ -9,6 +9,7 @@ import com.navagent.core.BargeHit
 import com.navagent.core.BargeIn
 import com.navagent.core.BargeKind
 import com.navagent.core.BargeMode
+import com.navagent.core.VoiceGuide
 import java.io.File
 import java.util.concurrent.Executors
 
@@ -157,7 +158,14 @@ class VoiceEngine(private val context: Context) {
      */
     private val wakeLock = Any()
     private var vad: EnergyVad? = null
-    private val asr = MinimaxAsr()
+    /**
+     * 识别引擎路由。云端（MiniMax）/ 端侧（sherpa-onnx + SenseVoice）/ 影子三档，
+     * 档位在设置页切，默认 cloud 保持旧行为。详见 [AsrRouter]。
+     */
+    private val asr = AsrRouter(context)
+
+    /** 进程内本地大模型（MNN-LLM 库集成）。单例，和 ChatEngine 共用同一份模型 */
+    private val mnnLlm = MnnLocalLlm.get(context)
     private val noiseGate = NoiseGate()
     private val wakeAudio = RecentAudioBuffer(AudioCapture.SAMPLE_RATE * 5 / 2)
     private val huaweiPreprocess = HuaweiAudioPreprocess(context)
@@ -214,6 +222,26 @@ class VoiceEngine(private val context: Context) {
     private val ownerStreak = java.util.concurrent.atomic.AtomicInteger(0)
     private var asleepFrames = 0L
 
+    // ------------------------------------------------------------ 唤醒引擎对照实验
+    //
+    // 2026-11-08：SenseVoice 接进识别后，有人会问「vosk 还需要吗」。
+    // 事实是每帧音频同时喂给 vosk 和 Sherpa KWS 两套模型，功能重叠。
+    // 这里加一个开关和计数，用真机数据回答，而不是靠猜。
+
+    /** 只跑 KWS，不加载 vosk */
+    private fun kwsOnly(): Boolean = Prefs.wakeEngine == "kws-only"
+
+    /**
+     * KWS 是否需要常开。
+     *
+     * ★ 注意：kws-only 模式下 KWS 承担唤醒，跟「打断」开关无关，必须强制开。
+     *   否则用户把「播报中可打断」关掉，就彻底叫不醒了 —— 这是个静默的坑。
+     */
+    private fun kwsActive(): Boolean = Prefs.bargeIn || kwsOnly()
+
+    private var kwsWakeHits = 0
+    private var voskWakeHits = 0
+
     /**
      * 导航播报期间命中的打断词，等播完再执行（用户选择的方案 1）。
      *
@@ -256,8 +284,11 @@ class VoiceEngine(private val context: Context) {
 
         worker.execute {
             ensureWake()
+            // 临时自检：设置里打开 mnn_llm_selftest 时跑一句，验证库集成链路通不通。
+            // 验证通过后删掉这段，改成正常的对话后端。
+            if (Prefs.mnnLlmSelfTest) mnnLlm.selfTest()
             // 播报中的关键词词表：唤醒词 + 停止口令 + 序号词，全部来自设置
-            if (Prefs.bargeIn) sherpaBargeIn.load(bargeKeywordList())
+            if (kwsActive()) sherpaBargeIn.load(bargeKeywordList())
             ready = true
 
             if (vad == null) {
@@ -295,14 +326,24 @@ class VoiceEngine(private val context: Context) {
             shutdownWake()
             ensureWake()
             // 唤醒词变了，KWS 词表也要跟着重建（否则又是"改了没生效"）
-            if (Prefs.bargeIn) sherpaBargeIn.load(bargeKeywordList())
-            notify(if (wakeReady()) "唤醒词已更新：${Prefs.wakeWords}" else "唤醒模型加载失败")
+            if (kwsActive()) sherpaBargeIn.load(bargeKeywordList())
+            notify(
+                when {
+                    kwsOnly() -> "唤醒词已更新（仅 KWS）：${Prefs.wakeWords}"
+                    wakeReady() -> "唤醒词已更新：${Prefs.wakeWords}"
+                    else -> "唤醒模型加载失败"
+                }
+            )
         }
     }
 
     /** 模型就在本地就加载，不在就下一个。阻塞，只在 worker 线程调用 */
     private fun ensureWake() {
         if (wakeReady()) return
+        // ★ kws-only：完全不加载 vosk（44MB 模型 + 一路持续解码）。
+        //   唤醒交给 Sherpa KWS —— 它的关键词表里本来就有唤醒词。
+        //   注意 wakeReady() 会一直是 false，心跳日志里能看到，这是预期行为。
+        if (kwsOnly()) return
         // 模型放外部私有目录：adb 能直接 push 进去，省得每次重装都重新下 44MB
         val modelRoot = context.getExternalFilesDir(null) ?: context.filesDir
         val dir = ModelStore.voskDir(modelRoot)
@@ -451,12 +492,16 @@ class VoiceEngine(private val context: Context) {
             //   （「足了啊与其了的啊的的 事了呢」），长文本播报中一句都匹配不上。
             //   Sherpa 把解码约束在关键词路径上，同样条件下能命中。
             //   词表由 KwsKeywords 现场转拼音，改设置即生效，不再是写死的「小猪」。
-            val sherpaLabel = if (Prefs.bargeIn) sherpaBargeIn.feed(frame, len) else null
+            val sherpaLabel = if (kwsActive()) sherpaBargeIn.feed(frame, len) else null
             val sherpaHit = sherpaLabel?.let {
                 BargeIn.match(it, matchMode, bargeWakeWords, bargeStopWords)
             }
-            val wakeFed = feedWake(frame, len, strict = true)
-            val heard = wakeHeardText()
+            // ★ kws-only：vosk 不再吃音频，唤醒完全靠上面那条关键词路径。
+            //   注意 feedWake 有副作用（维护解码状态），跳过时后续 wakeHeardText()
+            //   也要一起跳过，否则会读到上一轮的残留文本造成误判。
+            val voskOn = !kwsOnly()
+            val wakeFed = if (voskOn) feedWake(frame, len, strict = true) else false
+            val heard = if (voskOn) wakeHeardText() else ""
             val textHit = BargeIn.match(heard, matchMode, bargeWakeWords, bargeStopWords)
             val hit = sherpaHit ?: textHit ?: if (wakeFed) {
                 BargeHit(BargeKind.WAKE, "", wakeMatchText().orEmpty(), 0)
@@ -501,7 +546,17 @@ class VoiceEngine(private val context: Context) {
             //   任意一样命中就打断（或关系）。
             //   以前关键词还要再过一次声纹确认（与关系），那是"召回杀手"：
             //   主人喊了关键词，声纹因为混音打分偏低就被否掉，等于没喊。
-            Dbg.log("$source 命中「${hit.matched}」kind=${hit.kind} mode=$mode，打断")
+            // 累计命中来源。跑一周就能回答「vosk 到底还需不需要」：
+            // 如果 kws 一路涨、vosk 始终是 0，那 vosk 就是纯成本。
+            when {
+                sherpaHit != null -> kwsWakeHits++
+                textHit != null -> voskWakeHits++
+            }
+            val standbySec = asleepFrames * AudioCapture.FRAME_MS / 1000
+            Dbg.log(
+                "$source 命中「${hit.matched}」kind=${hit.kind} mode=$mode，打断" +
+                    "｜累计 kws=$kwsWakeHits vosk=$voskWakeHits 待命=${standbySec}s"
+            )
             handleWakeDetected(interruptedSpeech = true, hit = hit)
             return
         }
@@ -539,9 +594,38 @@ class VoiceEngine(private val context: Context) {
                 // 没它说明采集线程已经死了。
                 asleepFrames++
                 if (asleepFrames % HEARTBEAT_FRAMES == 0L) {
-                    Dbg.log("ASLEEP 心跳 ${asleepFrames * AudioCapture.FRAME_MS / 1000}s wakeReady=${wakeReady()}")
+                    // 带上引擎档位：kws-only 下 wakeReady 恒为 false（没加载 vosk），
+                    // 不标出来的话，下次排查会以为唤醒器坏了。
+                    Dbg.log(
+                        "ASLEEP 心跳 ${asleepFrames * AudioCapture.FRAME_MS / 1000}s " +
+                            "engine=${Prefs.wakeEngine} wakeReady=${wakeReady()}"
+                    )
                 }
-                if (feedWake(frame, len)) {
+                // ★ 2026-11-08 修复（真机事故）：kws-only 下待命必须自己喂 KWS。
+                //
+                //   原来 KWS 只在「播报中」那条分支里喂 —— 它是为打断服务的。
+                //   待命唤醒一直由 vosk 负责。把 vosk 关掉之后，**待命时没有任何
+                //   模型在听**，表现就是「喊破嗓子也叫不醒」，而且没有任何报错。
+                //
+                //   教训：切换任何一路检测前，先确认目标状态下真的有人在听。
+                var kwsWake = false
+                if (kwsOnly()) {
+                    sherpaBargeIn.feed(frame, len)?.let { label ->
+                        // 待命只认唤醒词：停止口令/序号在这里没有意义，传空词表
+                        val h = BargeIn.match(
+                            label, BargeMode.CHAT, Prefs.wakeWordList(), emptyList()
+                        )
+                        if (h != null && h.kind == BargeKind.WAKE) {
+                            kwsWake = true
+                            kwsWakeHits++
+                            Dbg.log(
+                                "待命 KWS 命中「${h.matched}」raw=$label｜累计 kws=$kwsWakeHits"
+                            )
+                        }
+                    }
+                }
+                val voskFed = if (kwsOnly()) false else feedWake(frame, len)
+                if (kwsWake || voskFed) {
                     Dbg.log("待命中唤醒候选，等待声纹确认")
                     requestWakeOwnerConfirmation("待命中", interruptedSpeech = false)
                 }
@@ -909,7 +993,11 @@ class VoiceEngine(private val context: Context) {
             // 导航播报期间攒下的打断等到播完才执行，那时模型可能刚好又开始念下一句，
             // 这时候还是要静音，否则用户刚喊完又被塞一句进来。
             val interrupted = onBargeIn?.invoke() == true
-            beep()
+            // ★ 2026-11-08 用户要求：**打断时不要应答语**。
+            //   用户喊「果果」是为了让它闭嘴，再回一句「嗨」等于又插一句，
+            //   而且会重新占用播报通道（半双工），把紧接着的指令挡在门外。
+            //   打断场景只嘀一声，表示「听到了，已经停了」。
+            if (interrupted || interruptedSpeech || indexHit != null) beep() else wakeAck()
             setState(State.LISTENING)
             // ★ 打断之后马上要听用户接下来的话，不能被「播报结束回声保护期」挡住。
             //   打断时 lastSpokeEndMs 刚被刷新，正常会锁 1.5 秒 —— 用户紧跟着说的
@@ -1275,6 +1363,33 @@ class VoiceEngine(private val context: Context) {
      *   比加长单声更容易从环境噪音里分辨出来，又不至于像 D:/AI 那样
      *   播一句「我在呢」—— 车里正在导航，TTS 会打断播报。
      */
+    /**
+     * 唤醒应答：「嗨，我在呢」。
+     *
+     * ★ 2026-11-08 用户要求：把唤醒后的提示音换成人声。
+     *   必须延迟再播 —— 用户经常连着说「果果 导航去西站」，
+     *   唤醒瞬间就播报的话，后半句会被半双工挡在门外（播报期间不拾音），
+     *   表现就是「唤醒词之后那句指令老是丢」。
+     *   所以等 700ms：这期间如果已经进了识别（busyRecognizing），就不吭声。
+     */
+    private fun wakeAck() {
+        if (!Prefs.wakeAckVoice) {
+            beep()
+            return
+        }
+        main.postDelayed({
+            if (state != State.LISTENING || busyRecognizing) return@postDelayed
+            if (isSpeakingProvider() || navSpeakingProvider()) return@postDelayed
+            val ok = runCatching {
+                val v = (context.applicationContext as? NavApp)?.voice ?: return@runCatching false
+                v.speak(WAKE_ACK_TEXT, VoiceGuide.Priority.USER)
+                true
+            }.getOrDefault(false)
+            // TTS 起不来就退回嘀声，别让唤醒没反馈
+            if (!ok) beep()
+        }, WAKE_ACK_DELAY_MS)
+    }
+
     private fun beep() {
         if (!Prefs.wakeBeep) return
         runCatching {
@@ -1287,6 +1402,9 @@ class VoiceEngine(private val context: Context) {
 
     /** 设置页展示云端 ASR 的延迟分位数（连接复用效果看这个） */
     fun asrStats(): String = asr.statsText()
+
+    /** 端侧识别模型是否加载成功。设置页「识别引擎」那一行用它显示状态 */
+    val localAsrReady: Boolean get() = asr.localReady
 
     fun stateSnapshot(): Pair<State, String> = state to hintFor(state)
 
@@ -1401,6 +1519,16 @@ class VoiceEngine(private val context: Context) {
 
         /** 唤醒提示音：单声时长 / 两声间隔 */
         const val WAKE_BEEP_MS = 90
+
+        /** 唤醒应答的台词。改这句只影响「嘀声被替换掉」的那条反馈 */
+        const val WAKE_ACK_TEXT = "嗨"
+
+        /**
+         * 唤醒后等多久再应答。
+         * 太短会盖住用户紧接着说的指令（半双工，播报期间不拾音）；
+         * 太长又显得反应迟钝。700ms 是实测比较稳的折中。
+         */
+        const val WAKE_ACK_DELAY_MS = 700L
         const val WAKE_BEEP_GAP_MS = 140L
 
         /**

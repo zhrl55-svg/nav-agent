@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  导航页「前往 XXX」目的地条的底。
+
+  ★ 2026-11-08 第一版是浅灰 #E6F2F2F2，真机看下来问题明显：
+    它紧挨着高德 footer（白底黑字），两块浅色糊成一片，
+    分不清哪是我们的、哪是 SDK 的。加深成深蓝黑后层次才出来。
+-->
+<shape xmlns:android="http://schemas.android.com/apk/res/android">
+    <solid android:color="#E62B2F33" />
+    <corners android:radius="14dp" />
+</shape>

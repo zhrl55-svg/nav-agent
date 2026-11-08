@@ -1,5 +1,6 @@
 package com.navagent.app
 
+import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
 import android.graphics.Color
@@ -85,8 +86,10 @@ class MapSettingsActivity : AppCompatActivity() {
 
         section("地图跟随")
         rowSwitch(
-            "自动锁车", Prefs.navAutoLock,
-            "车标固定在屏幕中心，地图跟着车走。关掉后地图不动，只在手动操作时移动"
+            // 高德 SDK 里这个选项叫 isAutoLockCar（自动锁车），但对用户来说
+            // 它的效果就是「车标钉在屏幕中央、地图跟着走」，按效果命名更好懂
+            "车标位置居中", Prefs.navAutoLock,
+            "开启后车标固定在屏幕中央，地图跟着车走。关掉则地图不动，只在手动拖动时移动"
         ) {
             Prefs.navAutoLock = it
             applied()
@@ -153,6 +156,18 @@ class MapSettingsActivity : AppCompatActivity() {
         ) {
             Prefs.amapBuiltinUi = it
             applied()
+        }
+
+        // ★ 2026-11-08：导航历史管理放在这里（地图与导航设置），不占全局设置。
+        //   短按改名、长按弹「编辑 / 删除」。
+        //   为什么用 ListView 而不是 AlertDialog.setItems：setItems 只支持点击，
+        //   没法区分长按，而"长按删除"是这里的主要操作。
+        row(
+            "导航历史",
+            "${Prefs.navigationHistory().size} 条",
+            "短按改名，长按删除。「继续导航」没有当次记录时用第一条兜底"
+        ) {
+            showNavigationHistory()
         }
 
         section("声音")
@@ -340,6 +355,140 @@ class MapSettingsActivity : AppCompatActivity() {
     }
 
     private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+
+    // ------------------------------------------------------------ 导航历史
+    //
+    // ★ 2026-11-08 两个真机问题在这里修掉：
+    //   ① 删除后列表不刷新 —— 原来每次操作都重新读 Prefs，但当前弹窗的
+    //      ListView 还拿着旧数组，必须关掉重开才看得到。现在改成内存列表 +
+    //      notifyDataSetChanged，删完当场消失。
+    //   ② 文字看不清 —— 系统 AlertDialog 是**浅色底**，之前却写了浅色字。
+
+    private fun showNavigationHistory() {
+        val items = Prefs.navigationHistory().toMutableList()
+        if (items.isEmpty()) {
+            toast("还没有导航记录")
+            return
+        }
+        val d = resources.displayMetrics.density
+        val padH = (16 * d).toInt()
+        val padV = (14 * d).toInt()
+
+        val list = android.widget.ListView(this).apply {
+            dividerHeight = 0
+            // 深色面板 + 浅色字：系统 dialog 底色是浅的，内容区自己给底色才看得清
+            setBackgroundColor(0xFF1C1C19.toInt())
+        }
+        val adapter = object : android.widget.ArrayAdapter<String>(
+            this, android.R.layout.simple_list_item_1, items
+        ) {
+            override fun getView(
+                position: Int,
+                convertView: android.view.View?,
+                parent: android.view.ViewGroup
+            ): android.view.View {
+                val v = super.getView(position, convertView, parent)
+                (v as android.widget.TextView).apply {
+                    setTextColor(0xFFEDEDE6.toInt())
+                    textSize = 16f
+                    setPadding(padH, padV, padH, padV)
+                }
+                return v
+            }
+        }
+        list.adapter = adapter
+
+        var dialog: AlertDialog? = null
+        fun refreshTitle() {
+            dialog?.setTitle("导航历史（${items.size} 条）")
+        }
+
+        dialog = AlertDialog.Builder(this)
+            .setTitle("导航历史（${items.size} 条）")
+            .setView(list)
+            .setNeutralButton("清空") { _, _ ->
+                AlertDialog.Builder(this)
+                    .setTitle("清空导航历史")
+                    .setMessage("会删掉全部 ${items.size} 条记录。继续？")
+                    .setPositiveButton("清空") { _, _ ->
+                        Prefs.clearNavigationHistory()
+                        items.clear()
+                        adapter.notifyDataSetChanged()
+                        refreshTitle()
+                        render()
+                        toast("导航历史已清空")
+                    }
+                    .setNegativeButton("取消", null)
+                    .show()
+            }
+            .setNegativeButton("关闭", null)
+            .create()
+
+        // 短按：直接改名，一步到位
+        list.setOnItemClickListener { _, _, which, _ ->
+            val item = items[which]
+            renameHistory(item) { newName ->
+                items[which] = newName
+                adapter.notifyDataSetChanged()
+                render()
+            }
+        }
+        // 长按：弹菜单（编辑 / 删除）
+        list.setOnItemLongClickListener { _, _, which, _ ->
+            val item = items[which]
+            AlertDialog.Builder(this)
+                .setTitle(item)
+                .setPositiveButton("编辑名字") { _, _ ->
+                    renameHistory(item) { newName ->
+                        items[which] = newName
+                        adapter.notifyDataSetChanged()
+                        render()
+                    }
+                }
+                .setNeutralButton("删除") { _, _ ->
+                    Prefs.removeNavigationHistory(item)
+                    items.removeAt(which)
+                    adapter.notifyDataSetChanged()
+                    refreshTitle()
+                    render()
+                    toast("已删除「$item」")
+                    // 删空了就关掉，别留一个空列表让人对着看
+                    if (items.isEmpty()) dialog?.dismiss()
+                }
+                .setNegativeButton("取消", null)
+                .show()
+            true
+        }
+        dialog.show()
+    }
+
+    private fun renameHistory(item: String, onDone: (String) -> Unit) {
+        val input = android.widget.EditText(this).apply {
+            setText(item)
+            setSelection(item.length)
+            setTextColor(0xFF1A1A17.toInt())
+            setBackgroundColor(0xFFF2F2F2.toInt())
+            val d = resources.displayMetrics.density
+            setPadding((12 * d).toInt(), (10 * d).toInt(), (12 * d).toInt(), (10 * d).toInt())
+        }
+        AlertDialog.Builder(this)
+            .setTitle("编辑地名")
+            .setView(input)
+            .setPositiveButton("保存") { _, _ ->
+                val v = input.text.toString().trim()
+                when {
+                    v.isEmpty() -> toast("名字不能为空")
+                    v == item -> toast("没有改动")
+                    else -> {
+                        Prefs.renameNavigationHistory(item, v)
+                        onDone(v)
+                        toast("已改为「$v」")
+                    }
+                }
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
 
     private fun roundBg(color: Int, radiusDp: Float) = GradientDrawable().apply {
         setColor(color)

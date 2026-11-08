@@ -25,6 +25,26 @@ object Prefs {
 
     private const val K_ASR_MODEL = "asr_model"
 
+    /** 识别引擎：cloud / local / shadow，见 [AsrRouter]。默认 cloud，保持旧行为 */
+    private const val K_ASR_ENGINE = "asr_engine"
+
+    /** 本地大模型自检开关。只在验证库集成时开，生产别开 */
+    private const val K_MNN_SELFTEST = "mnn_llm_selftest"
+
+    /** 唤醒应答：唤醒后用人声说一句，替代嘀声 */
+    private const val K_WAKE_ACK = "wake_ack_voice"
+
+    /** 对话后端：cloud / local，见 [LlmRouter] */
+    private const val K_CHAT_ENGINE = "chat_engine"
+
+    /**
+     * 唤醒引擎：`both`（vosk + Sherpa KWS 双跑，默认）/ `kws-only`（只跑 KWS）。
+     *
+     * 目的是量化「vosk 到底还需不需要」：kws-only 跑两天，看唤醒率有没有掉。
+     * 掉了说明 vosk 的模糊匹配有用，留着；没掉就砍掉，省 44MB 内存和一路持续解码。
+     */
+    private const val K_WAKE_ENGINE = "wake_engine"
+
     /** 语音服务（识别/合成）的 Key 与地址。存储名保留 minimax_*，老版本的设置不会丢 */
     private const val K_API_KEY = "minimax_api_key"
     private const val K_API_BASE = "minimax_api_base"
@@ -155,6 +175,42 @@ object Prefs {
         set(v) = sp.edit().putString(K_ASR_MODEL, v.trim()).apply()
 
     /**
+     * 识别引擎档位：`cloud` / `local` / `shadow`。
+     *
+     * 默认 cloud —— 新装机和回滚都是旧行为，端侧出任何问题都不会影响线上。
+     * 灰度顺序：cloud → shadow（跑一周收数据）→ local。
+     */
+    var asrEngine: String
+        get() = sp.getString(K_ASR_ENGINE, "cloud").orEmpty().ifBlank { "cloud" }
+        set(v) = sp.edit().putString(K_ASR_ENGINE, v.trim()).apply()
+
+    /** 本地大模型自检：打开后每次启动语音服务会跑一句「介绍你自己」并写日志 */
+    var mnnLlmSelfTest: Boolean
+        get() = sp.getBoolean(K_MNN_SELFTEST, false)
+        set(v) = sp.edit().putBoolean(K_MNN_SELFTEST, v).apply()
+
+    /**
+     * 对话后端：`cloud`（MiniMax，工具全可用）/ `local`（进程内 0.3B，纯聊天）。
+     * 默认 cloud —— 新装机和回滚都是旧行为。
+     */
+    /** 唤醒应答：true=说「嗨，我在呢」，false=只嘀一声 */
+    var wakeAckVoice: Boolean
+        get() = sp.getBoolean(K_WAKE_ACK, true)
+        set(v) = sp.edit().putBoolean(K_WAKE_ACK, v).apply()
+
+    var chatEngine: String
+        get() = sp.getString(K_CHAT_ENGINE, "cloud").orEmpty().ifBlank { "cloud" }
+        set(v) = sp.edit().putString(K_CHAT_ENGINE, v.trim()).apply()
+
+    /**
+     * 唤醒引擎：`both`（默认，vosk + KWS 双跑）/ `kws-only`（只跑 KWS）。
+     * kws-only 下 vosk 完全不加载，唤醒全靠 Sherpa 关键词图。
+     */
+    var wakeEngine: String
+        get() = sp.getString(K_WAKE_ENGINE, "both").orEmpty().ifBlank { "both" }
+        set(v) = sp.edit().putString(K_WAKE_ENGINE, v.trim()).apply()
+
+    /**
      * 唤醒词变体，逗号分隔。
      *
      * ★ 改这个必须调 [VoiceEngine.reloadWake]，vosk 的匹配规则在构造时固化。
@@ -198,7 +254,31 @@ object Prefs {
         sp.edit().putString(K_NAV_HISTORY, updated.joinToString("\n")).apply()
     }
 
-    private const val MAX_NAV_HISTORY = 20
+    /** 删除一条导航历史。用于设置页里踢掉写错/不想留的地名 */
+    fun removeNavigationHistory(item: String) {
+        val updated = navigationHistory().filterNot { it == item }
+        sp.edit().putString(K_NAV_HISTORY, updated.joinToString("\n")).apply()
+    }
+
+    /**
+     * 重命名一条历史。
+     *
+     * ★ 改名后如果和已有条目重名，只保留改名这条（去重），避免历史里出现两个一样的。
+     */
+    fun renameNavigationHistory(old: String, new: String) {
+        val value = new.trim()
+        if (value.isEmpty() || value == old) return
+        val updated = navigationHistory().map { if (it == old) value else it }
+            .distinctBy { it.lowercase() }
+        sp.edit().putString(K_NAV_HISTORY, updated.joinToString("\n")).apply()
+    }
+
+    fun clearNavigationHistory() {
+        sp.edit().remove(K_NAV_HISTORY).apply()
+    }
+
+    /** 导航历史上限。2026-11-08 从 20 提到 50：常去的地址攒得快 */
+    private const val MAX_NAV_HISTORY = 50
 
     /**
      * 界面提示用的主唤醒词 —— 取最短的那个。

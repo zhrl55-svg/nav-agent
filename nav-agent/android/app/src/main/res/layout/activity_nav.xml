@@ -306,6 +306,37 @@
         纯语音界面没有消息列表，听错了用户无从发现。
         跟在语音按钮右侧，喊完话余光就能扫到，2 秒后自动消失。
     -->
+    <!--
+      导航中的目的地条。
+
+      ★ 2026-11-08 用户反馈：「导航页没有一个地方显示目的地」。
+        高德内置界面底部只有 距离 / 时间 / 限速 / 到达时间，全程看不到在往哪开。
+
+      ★ 为什么放在这个位置（占掉 SDK「当前道路」条的地方）：
+        那块显示「非机动车道」，而转向卡片里同一句已经有了，属于重复信息；
+        目的地名字反而是全程缺失的。所以让路名条让位（代码里一并隐藏）。
+    -->
+    <TextView
+        android:id="@+id/nav_destination"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|center_horizontal"
+        android:layout_marginBottom="76dp"
+        android:layout_marginStart="16dp"
+        android:layout_marginEnd="16dp"
+        android:background="@drawable/bg_dest_chip"
+        android:elevation="6dp"
+        android:ellipsize="end"
+        android:maxWidth="320dp"
+        android:maxLines="1"
+        android:paddingStart="14dp"
+        android:paddingTop="6dp"
+        android:paddingEnd="14dp"
+        android:paddingBottom="6dp"
+        android:textColor="#FFFFFF"
+        android:textSize="13sp"
+        android:visibility="gone" />
+
     <LinearLayout
         android:id="@+id/side_left"
         android:layout_width="wrap_content"

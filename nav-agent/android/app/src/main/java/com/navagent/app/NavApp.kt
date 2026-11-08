@@ -159,6 +159,7 @@ class NavApp : Application() {
             navigateTo = ::toolNavigate,
             navigateToPoi = ::toolNavigateToPoi,
             stop = ::toolStop,
+            resume = ::toolResume,
             openMap = ::toolOpenMap,
             lastNearbyName = { freshNearby()?.name },
             sleep = ::toolSleep,
@@ -174,8 +175,12 @@ class NavApp : Application() {
         chat = ChatEngine(
             // 模型原生 Function Calling 优先；明确的出发指令另有本地兜底，
             // 避免不支持工具调用的本地模型只说「好的」却不执行。
-            llm = OpenAiLlm(
-                tools = listOf(
+            // ★ 2026-11-08：两档路由。cloud = MiniMax（工具全可用，默认）；
+            //   local = 进程内 MNN 0.3B（纯聊天，无 Function Calling）。
+            //   本地模型走同一个进程，不依赖 MNN Chat 那套 HTTP 服务。
+            llm = LlmRouter(
+                cloud = OpenAiLlm(
+                    tools = listOf(
                     navTool,
                     WeatherTool { nav?.currentCity },
                     NearbyTool(
@@ -192,7 +197,9 @@ class NavApp : Application() {
                     WebSearchTool { Prefs.tavilyKey },
                     // 需要 Context：WebView 兜底要在本机浏览器内核里渲染页面
                     WebExtractTool(this) { Prefs.tavilyKey }
-                )
+                    )
+                ),
+                local = MnnLlm(MnnLocalLlm.get(this))
             ),
             onDelta = { piece -> chatObservers.forEach { it.onAssistantDelta(piece) } },
             onReply = { full -> chatObservers.forEach { it.onAssistantDone(full) } },
@@ -502,8 +509,21 @@ class NavApp : Application() {
     fun bargeInChat(): Boolean {
         val interrupted = voice.bargeInChat()
         chat.muteCurrent()
-        if (interrupted) Dbg.log("用户打断：闲聊播报已停")
-        else Dbg.log("打断未生效（导航播报在播，保持原样）")
+        if (interrupted) {
+            Dbg.log("用户打断：闲聊播报已停")
+        } else {
+            // ★ 2026-11-08：原来这里一律写「导航播报在播」。
+            //   实测误导过一次 —— 导航播报卡在队列里根本没播出来，
+            //   日志却说「导航在播」，把真正的问题藏了 90 秒。
+            //   返回 false 有两种情况：正在播导航，或者压根没在播任何东西。
+            Dbg.log(
+                if (voice.speakingPriority == VoiceGuide.Priority.NAV) {
+                    "打断未生效（导航播报在播，保持原样）"
+                } else {
+                    "打断未生效（当前没有可打断的播报）"
+                }
+            )
+        }
         return interrupted
     }
 
@@ -542,14 +562,92 @@ class NavApp : Application() {
      */
     private fun interceptNavigation(text: String, history: List<com.navagent.core.ChatMessage>): String? {
         val normalized = text.trim().lowercase()
+
+        // ★ 2026-11-08：停止/结束导航也走规则。
+        //   原来只有模型能调 action=stop，本地档没有工具能力 ——
+        //   说「停止导航」只会得到一句聊天话术，导航照走。这是安全口子，必须堵。
+        //   放在最前面：停止的优先级高于一切导航意图。
+        if (Regex("(停止|结束|退出|取消|关闭|不用|不要|别).{0,4}导航|不导航了|别导航了")
+                .containsMatchIn(normalized)
+        ) {
+            val r = navigationTool?.executeDetailed(
+                org.json.JSONObject().put("action", "stop").toString()
+            )
+            if (r != null) {
+                Dbg.log("停止导航（规则命中）status=${r.status}")
+                return r.userText ?: r.text
+            }
+        }
+
+        // ★ 2026-11-08：继续/恢复导航。
+        //   ★ 只能救「暂停但路线还在」，stop 之后会如实说已结束（见 toolResume）。
+        if (Regex("(继续|恢复|接着)(导航|走|开|行驶)").containsMatchIn(normalized)) {
+            val r = navigationTool?.executeDetailed(
+                org.json.JSONObject().put("action", "resume").toString()
+            )
+            if (r != null) {
+                Dbg.log("继续导航（规则命中）status=${r.status}")
+                return r.userText ?: r.text
+            }
+        }
+
+        // ★ 2026-11-08：离线模式的候选选择。
+        //   云端由模型列候选、用户回答后模型再调一次 navigate 收尾；
+        //   本地 0.3B 不会做这两件事，所以这里自己解析「第2个 / 最后一个」并直接导航。
+        //   只在 chat_engine=local 时启用，云端仍走模型，避免两套逻辑打架。
+        if (Prefs.chatEngine == "local") {
+            // ① 候选续选：用户把地名又说了一遍（「去张掖西站」）也当成确认。
+            //    ★ 2026-11-08 实测踩到：上一步列了 5 个候选，用户重复说了一遍地名，
+            //      但这里只认「第2个」和数字，认不出地名 → 交给 0.3B → 它把地名复读一遍，
+            //      什么都不发生（用户原话：「为什么地址出来了但是导航不出来」）。
+            if (pendingPois.isNotEmpty()) {
+                val poi = matchCandidateByName(normalized)
+                if (poi != null) {
+                    val r = navigationTool?.executeDetailed(
+                        org.json.JSONObject()
+                            .put("action", "navigate")
+                            .put("destination", poi.name)
+                            .put("confirmed", true)
+                            .toString()
+                    )
+                    if (r != null) {
+                        Dbg.log("离线候选复述命中 → ${poi.name} status=${r.status}")
+                        return r.userText ?: r.text
+                    }
+                }
+            }
+            // ② 序号选择
+            val idx = pickCandidateIndex(normalized)
+            if (idx != null) {
+                val poi = pendingPois.getOrNull(idx)
+                if (poi != null) {
+                    val r = navigationTool?.executeDetailed(
+                        org.json.JSONObject()
+                            .put("action", "navigate")
+                            .put("destination", poi.name)
+                            .put("confirmed", true)
+                            .toString()
+                    )
+                    if (r != null) {
+                        Dbg.log("离线候选选择 #${idx + 1} → ${poi.name} status=${r.status}")
+                        return r.userText ?: r.text
+                    }
+                }
+            }
+        }
+
         val affirmative = normalized.trimEnd('。', '！', '？', '!', '?', '.', ' ')
             .removeSuffix("啊").removeSuffix("吧")
             .let { it in setOf("去", "好", "好啊", "可以", "行", "走", "走吧", "就去", "去吧") }
         val priorAssistant = history.dropLast(1)
             .lastOrNull { it.role == com.navagent.core.ChatMessage.Role.ASSISTANT }?.text.orEmpty()
         val askedToGo = priorAssistant.contains(Regex("(要不要|是否|想不想|去不去|要去).{0,30}(吗|么|？|\\?)"))
-        val explicit = Regex("(导航(过去|到|去)|带我(去|到)|开(到|过去)|前往|去一下|就去)")
-            .containsMatchIn(normalized) && !Regex("(不要|别|不用|先不|不想|停止|取消).{0,6}(导航|去|前往)")
+        // 「去张掖西站」这种最自然的说法以前不认（只认「导航去/带我/前往」），
+        // 结果交给模型，模型复读一遍地名就完事了。这里补上裸动词开头的形式。
+        val bareGo = Regex("^(去|到|回)\\s*.{2,}").containsMatchIn(normalized) &&
+            !Regex("(哪|什么|怎么|为什么|吗|？|\\?)").containsMatchIn(normalized)
+        val explicit = (Regex("(导航(过去|到|去)|带我(去|到)|开(到|过去)|前往|去一下|就去)")
+            .containsMatchIn(normalized) || bareGo) && !Regex("(不要|别|不用|先不|不想|停止|取消).{0,6}(导航|去|前往)")
             .containsMatchIn(normalized)
         if (!explicit && !(affirmative && askedToGo)) return null
 
@@ -569,17 +667,44 @@ class NavApp : Application() {
             .put("destination", destination)
             .toString()
         val result = navigationTool?.executeDetailed(args) ?: return null
-        // ★ ★ 关键（2026-11-04）：工具返回「搜到 N 个候选」时**不能**在这里接管。
-        //   那是**中间态**，不是导航结果 —— 接管了就等于跳过用户确认，
-        //   模型根本没机会问「是哪个」，用户看到的就是直接导航去了（用户反馈）。
+        // ★ 工具返回「搜到 N 个候选」时是**中间态**，不是导航结果。
         //
-        //   这里返回 null，让流程继续走模型：
-        //     候选已经展示在地图的搜索框/列表里了（用户看得见），
-        //     候选也存进了 pendingPois，navContext() 会把它们列进 system prompt，
-        //     模型据此列 1、2、3 问用户。
+        //   云端（2026-11-04 起的约定）：这里必须返回 null 让位给模型 ——
+        //   候选展示在地图列表里、也存进了 pendingPois，navContext() 会把它们
+        //   列进 system prompt，由模型问「是哪个」。直接接管等于跳过确认，
+        //   用户会莫名其妙被导航到同名但不对的地方（用户反馈过）。
+        //
+        //   本地（2026-11-08）：0.3B 没有工具能力，让位只会得到一句「好的」，
+        //   什么都不发生。所以本地分支自己收尾。
         if (result.status == NavigationToolResult.Status.CANDIDATES) {
-            Dbg.log("导航兜底让位给模型（搜到候选，等用户确认）")
-            return null
+            // 云端：让位给模型 —— 由它把候选列成 1、2、3 问用户，用户回答后模型再调 navigate。
+            if (Prefs.chatEngine != "local") {
+                Dbg.log("导航兜底让位给模型（搜到候选，等用户确认）")
+                return null
+            }
+            // ★ 本地（2026-11-08）：0.3B 既不会列候选、也不会二次调工具。
+            //   如果还按云端那样 return null，用户只会听到一句「好的」，什么都不发生。
+            //   所以这里自己收尾：只有一个就直接走，多个就报编号让用户回「第几个」。
+            val pois = pendingPois
+            when {
+                pois.isEmpty() -> return null
+                pois.size == 1 -> {
+                    val only = pois.first()
+                    val r = navigationTool?.executeDetailed(
+                        org.json.JSONObject()
+                            .put("action", "navigate")
+                            .put("destination", only.name)
+                            .put("confirmed", true)
+                            .toString()
+                    )
+                    Dbg.log("离线候选仅 1 个，直接导航 ${only.name} status=${r?.status}")
+                    return r?.userText ?: r?.text ?: "好，正在导航。"
+                }
+                else -> {
+                    Dbg.log("离线候选 ${pois.size} 个，本地自己列清单")
+                    return describeCandidates(pois)
+                }
+            }
         }
         Dbg.log(
             "导航兜底已执行 destinationChars=${destination.length} " +
@@ -593,6 +718,79 @@ class NavApp : Application() {
             NavigationToolResult.Status.NEEDS_CLARIFICATION -> result.userText
             else -> null
         }
+    }
+
+    /**
+     * 用户把候选地名又说了一遍，就当成「选这个」。
+     *
+     * 为什么要这一步：语音场景里用户的自然反应是重复地名（「张掖西站」），
+     * 而不是说「第二个」。只认序号会让用户卡在原地。
+     *
+     * 匹配规则保守一点：要求互相包含且长度够，避免「去」这种单字误命中。
+     */
+    private fun matchCandidateByName(text: String): AmapSdkGeocoder.Poi? {
+        // 去掉前面的动词和虚词，只留地名部分
+        val clean = text
+            .replace(Regex("^(导航|带我|开|前往|再去|就去|那就|就|去|到|回)\\s*"), "")
+            .trimEnd('。', '！', '？', '!', '?', '.', '，', ',', ' ')
+        if (clean.length < 2) return null
+        return pendingPois.firstOrNull { p ->
+            val n = p.name
+            n == clean ||
+                (clean.length >= 2 && n.contains(clean)) ||
+                (n.length >= 2 && clean.contains(n)) ||
+                // 「西站」对「张掖西站」：候选名包含用户说的片段，取最短的那个
+                (clean.length >= 2 && n.endsWith(clean))
+        }
+    }
+
+    /**
+     * 解析「第2个 / 第二个 / 最后一个 / 2」。
+     *
+     * 只在离线模式下用：云端是模型自己理解「第二个」指的是哪个，
+     * 本地模型连候选列表都看不懂，必须靠这个把序号翻译成下标。
+     * 返回 null 表示这句话不是在选候选。
+     */
+    private fun pickCandidateIndex(text: String): Int? {
+        if (pendingPois.isEmpty()) return null
+        val t = text.trim()
+        if (t.isEmpty()) return null
+        // 「最后一个」「最后那个」
+        if (Regex("^(就)?(最后|末尾|后面那个)").containsMatchIn(t)) return pendingPois.size - 1
+        // 「第2个」「第二个」「第 3 个」
+        Regex("第\\s*([0-9一二三四五六七八九十]+)\\s*个?").find(t)?.let { m ->
+            chineseNumber(m.groupValues[1])?.let { return it - 1 }
+        }
+        // 「就要2」「选2个」这种带动词的仍然认。
+        Regex("(?:就要|选|要)\\s*([0-9]{1,2})\\s*个?").find(t)?.let { return it.groupValues[1].toInt() - 1 }
+        // ★ 2026-11-08 已删除「光说一个数字」的匹配。
+        //   原因（用户反馈）：语音播报里念到「2」被麦克风收回来后，
+        //   会被当成"选第 2 个"，导航直接跑去错的地方。
+        //   纯数字没有上下文，无法区分"选候选"和"播报回声"，收益远小于风险。
+        return null
+    }
+
+    private fun chineseNumber(s: String): Int? {
+        if (s.length == 1) {
+            if (s == "十") return 10
+            val idx = "一二三四五六七八九".indexOf(s)
+            if (idx >= 0) return idx + 1
+        }
+        return s.toIntOrNull()
+    }
+
+    /** 离线模式下自己念候选清单。名字必须完整念出来，用户靠它选。 */
+    private fun describeCandidates(pois: List<AmapSdkGeocoder.Poi>): String = buildString {
+        append("找到 ").append(pois.size).append(" 个地方：")
+        pois.take(5).forEachIndexed { i, p ->
+            if (i > 0) append("；")
+            append(i + 1).append("、").append(p.name)
+            // 地址只在跟名字不一样时补一句，避免「张掖西站，张掖西站」这种重复
+            if (p.address.isNotBlank() && !p.address.contains(p.name)) {
+                append("，").append(p.address.take(14))
+            }
+        }
+        append("。说第几个就去哪个。")
     }
 
     private fun destinationMentionedBeforeQuestion(text: String): String? {
@@ -791,6 +989,73 @@ class NavApp : Application() {
             } else {
                 "好，正在导航。"
             }
+        )
+    }
+
+    /**
+     * 继续导航（语音「继续导航」「接着走」）。
+     *
+     * ★ 2026-11-08：三种状态必须分开回答，不能一律说「好，继续导航」：
+     *   ① 根本没在导航（stop 过了）→ 路线已清，resume 救不回来，必须如实说结束
+     *   ② 在导航且没暂停 → 如实说「一直在走」，别假装做了个动作
+     *   ③ 在导航且暂停 → 真的 resume
+     *
+     *   ②③ 的区别很重要：用户说「继续」时如果导航一直在跑，
+     *   回一句「好，继续导航」会让他以为刚才停过，反而分心去检查。
+     */
+    private fun toolResume(): NavigationToolResult {
+        val controller = nav
+            ?: return NavigationToolResult(
+                "导航引擎还没准备好", NavigationToolResult.Status.FAILED
+            )
+        if (controller.isNavigating) {
+            // ① 还在跑：暂停过就 resume，没暂停就如实说
+            if (!controller.paused) {
+                return NavigationToolResult(
+                    text = "导航一直在进行中，不需要恢复",
+                    status = NavigationToolResult.Status.STARTED,
+                    userText = "导航没停过，继续往前开就行"
+                )
+            }
+            controller.resumeNavigation()
+            Dbg.log("继续导航：已恢复")
+            return NavigationToolResult(
+                text = "已恢复导航",
+                status = NavigationToolResult.Status.STARTED,
+                userText = "好，继续导航"
+            )
+        }
+        // ② 已经停止（真停，路线清了）—— 但目的地还记着，直接重新算路过去。
+        //    ★ 2026-11-08 用户要求：目的地已保存，不该让用户再说一遍地点。
+        //    这是「停止」和「暂停」的唯一区别：暂停能接上原路线，停止只能重新算。
+        //
+        //    取值两级：控制器里的本次记录 → Prefs 导航历史第一条。
+        //    ★ 历史这条能成立的前提是 rememberDestination() 每次把最新插到最前，
+        //      所以第一条＝最近一次导航过的目的地（用户实测确认过）。
+        val fromController = controller.lastStoppedDestination
+        val last = if (!fromController.isNullOrBlank()) {
+            fromController
+        } else {
+            Prefs.navigationHistory().firstOrNull()
+        }
+        Dbg.log(
+            "继续导航：isNavigating=false 控制器=${fromController ?: "null"} " +
+                "历史首条=${Prefs.navigationHistory().firstOrNull() ?: "null"}"
+        )
+        if (!last.isNullOrBlank()) {
+            Dbg.log("继续导航：按上次目的地重新算路 → $last")
+            controller.navigateTo(last)
+            return NavigationToolResult(
+                text = "已按上次的目的地「$last」重新规划路线",
+                status = NavigationToolResult.Status.STARTED,
+                userText = "好，继续去$last"
+            )
+        }
+        // ③ 连目的地都没有（从没导航过）→ 只能问
+        return NavigationToolResult(
+            text = "没有可以恢复的导航：既没在导航，也没有上次的目的地",
+            status = NavigationToolResult.Status.NEEDS_CLARIFICATION,
+            userText = "还没有导航记录，要去哪？"
         )
     }
 

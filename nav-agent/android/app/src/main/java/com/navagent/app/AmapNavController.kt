@@ -191,6 +191,18 @@ class AmapNavController(
     private var pendingDestination: String? = null
 
     /**
+     * 上一次导航的目的地，**停止后也保留**。
+     *
+     * ★ 2026-11-08：用户说「停止导航」是真停（路线清除），但目的地要记着 ——
+     *   紧接着说「继续导航」时可以直接重新算路过去，不用再问一遍去哪。
+     *   这是「真停止」和「暂停」的区别：暂停能 resumeNavi 接上，
+     *   停止只能重新算路，但目的地不用用户重复。
+     */
+    @Volatile
+    var lastStoppedDestination: String? = null
+        private set
+
+    /**
      * 上一次解析出来的地点（带城市/区县）。
      *
      * 为什么留着：播报时要把「白银市景泰县的金星家园」整句念出来。
@@ -336,6 +348,7 @@ class AmapNavController(
             return
         }
         pendingDestination = destination
+        lastStoppedDestination = destination
         pendingPlace = null
         // 新的一次导航 → 解除「停止中」标志
         stopRequested = false
@@ -388,6 +401,7 @@ class AmapNavController(
             return
         }
         pendingDestination = name
+        lastStoppedDestination = name
         // 新的一次导航 → 解除「停止中」标志
         stopRequested = false
         cancelPendingRoute = false
@@ -494,25 +508,45 @@ class AmapNavController(
             //     「景泰县条山路金星家园」→ 结果在白银市**景泰县**
             //     只说「白银」比对的话就漏了（用户没提白银，提的是景泰县）。
             //   结果地址里拼了「甘肃省白银市景泰县…」，拿地名里的每个地名片段去比对。
-            val placeWords = listOf(
-                point.city,
-                point.district,
-                point.city.removeSuffix("市"),
-                point.district.removeSuffix("县").removeSuffix("区")
-            ).filter { it.isNotBlank() }
+            // ★ 2026-11-08：还要从 formatted 里抽省市区。
+            //   实测（真机日志）：「景泰收费站」命中「甘肃省白银市景泰县」，
+            //   但 cityName 返回的是**张掖市**（带城市偏置搜索的查询城市），
+            //   于是日志自相矛盾地写成「命中了张掖市的甘肃省白银市景泰县」，
+            //   而且用户明明说了「景泰县」还被判成"没提到该城市"而拒绝。
+            //   formatted 里的地址是全的，用它兜一层。
+            val fromAddress = Regex("([\\u4e00-\\u9fff]{2,8}?(?:省|市|县|区|旗))")
+                .findAll("${point.formatted} ")
+                .map { it.groupValues[1] }
+                .toList()
+            val placeWords = (
+                listOf(
+                    point.city,
+                    point.district,
+                    point.city.removeSuffix("市"),
+                    point.district.removeSuffix("县").removeSuffix("区")
+                ) + fromAddress + fromAddress.map {
+                    it.removeSuffix("省").removeSuffix("市").removeSuffix("县").removeSuffix("区")
+                }
+            ).filter { it.isNotBlank() }.distinct()
             val userMentioned = placeWords.any { w -> w.length >= 2 && dest.contains(w) }
+
+            // 播报里要用真实所在地，不能用 city 字段（那是偏置城市）
+            val realPlace = fromAddress
+                .filter { it.endsWith("市") || it.endsWith("县") || it.endsWith("区") }
+                .joinToString("")
+                .ifBlank { "${point.city}${point.district}" }
 
             if (!userMentioned) {
                 val km = (distM / 1000).toInt()
                 Dbg.log(
-                    "★ 拒绝解析结果：「$dest」命中了 ${point.city}${point.district} 的「${point.formatted}」" +
+                    "★ 拒绝解析结果：「$dest」命中了 $realPlace 的「${point.formatted}」" +
                         "（${km}公里），但用户没提到这个城市/区县"
                 )
                 pendingPlace = null
                 failCurrentAttempt("目的地可能不在当前城市")
-                onState("「$dest」搜到了${km}公里外${point.city}的同名地方，可能不对")
+                onState("「$dest」搜到了${km}公里外$realPlace 的同名地方，可能不对")
                 voice.speak(
-                    "$dest 搜到了${km}公里外${point.city}的同名地方，可能不是你要的，" +
+                    "$dest 搜到了${km}公里外$realPlace 的同名地方，可能不是你要的，" +
                         "说清楚点在哪个城市，我再搜一次",
                     VoiceGuide.Priority.USER
                 )
@@ -812,6 +846,9 @@ class AmapNavController(
         failCurrentAttempt("导航已停止")
         runCatching { navi?.stopNavi() }
         navigating = false
+        paused = false
+        // 目的地留着：停止后说「继续导航」要能回到这里（见 toolResume）
+        lastStoppedDestination = pendingDestination ?: lastStoppedDestination
         pendingDestination = null
         remainLights = 0
         stepRemainMeters = 0
@@ -835,6 +872,7 @@ class AmapNavController(
     fun pauseNavigation() {
         if (!navigating) return
         runCatching { navi?.pauseNavi() }
+        paused = true
         Dbg.log("导航已暂停（路线保留）")
     }
 
@@ -842,8 +880,20 @@ class AmapNavController(
     fun resumeNavigation() {
         if (!navigating) return
         runCatching { navi?.resumeNavi() }
+        paused = false
         Dbg.log("导航已恢复")
     }
+
+    /**
+     * 是否处于「暂停但路线还在」的状态。
+     *
+     * ★ 2026-11-08：语音说「继续导航」只对这个状态有效。
+     *   stop() 之后路线已经清掉，resume 无从恢复 —— 那种情况必须如实告诉用户
+     *   「刚才的导航结束了」，不能假装接上，否则用户以为还在原路线上开。
+     */
+    @Volatile
+    var paused: Boolean = false
+        private set
 
     override val isNavigating: Boolean
         get() = navigating
@@ -933,6 +983,17 @@ class AmapNavController(
      */
     val currentPlaceName: String?
         get() = pendingPlace?.let { describePlace(it) } ?: pendingDestination
+
+    /**
+     * 目的地**简称**（只取 POI 名字，不带「张掖市甘州区」这种前缀）。
+     *
+     * 导航页那条「前往 XXX」用它：全称在本地导航时前缀纯属噪音
+     * （实测显示成「前往 张掖市甘州区甘肃省地矿局水文地质工程地…」，
+     * 一行放不下，还把真正的名字截掉了）。跨城时用户自己也说了城市名，
+     * 不缺这一截前缀。
+     */
+    val currentPlaceShortName: String?
+        get() = pendingPlace?.formatted?.takeIf { it.isNotBlank() } ?: pendingDestination
 
     /** 释放：正常退出 Activity 时调用 */
     fun release() {

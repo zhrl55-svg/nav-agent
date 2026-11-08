@@ -113,7 +113,7 @@ class SettingsActivity : AppCompatActivity() {
         // ★ 2026-11-02 收拢：以前「唤醒词」在「语音识别」栏、「AI 名字 / 唤醒词跟随名字」
         //   在「对话大脑」栏，改一个唤醒相关的东西要跨两个分区找。
         //   凡是跟"叫醒它"和"会话什么时候结束"有关的，全放这一栏。
-        section("唤醒与会话")
+        section("唤醒")
 
         row(
             "唤醒词", wakeSummary(),
@@ -131,7 +131,13 @@ class SettingsActivity : AppCompatActivity() {
             }
         }
 
-        rowSwitch("唤醒提示音", Prefs.wakeBeep, "命中唤醒词时「嘀」一声") {
+        rowSwitch(
+            "唤醒应答",
+            Prefs.wakeAckVoice,
+            "唤醒后说一句「嗨，我在呢」。你有紧接着的指令时它不会出声，不会盖住你说话"
+        ) { Prefs.wakeAckVoice = it; applied() }
+
+        rowSwitch("唤醒提示音", Prefs.wakeBeep, "「唤醒应答」关掉、或 TTS 起不来时，退回「嘀」一声") {
             Prefs.wakeBeep = it; applied()
         }
 
@@ -170,7 +176,92 @@ class SettingsActivity : AppCompatActivity() {
             render()
         }
 
-        section("声纹")
+        // 唤醒模型的状态与重下按钮放回「唤醒」区末尾。
+        // 原来它们在很后面的「语音模型」独立分区，跟前文的唤醒词隔了七八屏。
+        row("唤醒模型", modelStatus(), null, chevron = false) {}
+        row("重新下载模型", "", "删掉现有的，重新下 44MB。网络不好时别点") {
+            if (downloading) { toast("正在下载中…"); return@row }
+            AlertDialog.Builder(this)
+                .setTitle("重新下载语音模型")
+                .setMessage("会删除现有模型并重新下载约 44MB。继续？")
+                .setPositiveButton("开始下载") { _, _ -> redownloadModel() }
+                .setNegativeButton("取消", null)
+                .show()
+        }
+
+        // ★ 2026-11-08：唤醒引擎对照实验。
+        //   每帧音频现在同时喂 vosk 和 Sherpa KWS，两者功能重叠。
+        //   跑几天 kws-only，看日志里「累计 kws=X vosk=Y」和唤醒手感，
+        //   就能判断 vosk 那 44MB 和一路解码要不要留。
+        row(
+            "唤醒引擎",
+            if (Prefs.wakeEngine == "kws-only") "仅 KWS（实验）" else "vosk + KWS（默认）",
+            "仅 KWS 时不加载 vosk（省 44MB 内存和一路解码）；带口音的唤醒词命中率可能下降"
+        ) {
+            choose(
+                "唤醒引擎", listOf(
+                    "vosk + KWS（默认，双保险）" to "both",
+                    "仅 KWS（省内存，实验）" to "kws-only"
+                ), Prefs.wakeEngine
+            ) {
+                Prefs.wakeEngine = it
+                // 唤醒器要重建：kws-only 不加载 vosk，切回来时得重新加载
+                VoiceService.reloadWake(this)
+                toast(
+                    if (it == "kws-only") "已切仅 KWS：vosk 不再加载，1 秒后生效"
+                    else "已切回双引擎，vosk 正在加载"
+                )
+                render()
+            }
+        }
+
+        // ---------------------------------------------------------- 听：识别
+        //
+        // ★ 2026-11-08 重组：识别引擎原来藏在「语音服务 · MiniMax」里，而它其实
+        //   有端侧/云端/影子三档，根本不是 MiniMax 专属，放在那里最容易让人误以为
+        //   「识别只有云端」。「断句灵敏度」原来在「实验室」里，但它是听感的核心参数，
+        //   不是实验选项。两个都收进这一栏，和声纹一起构成「听」。
+        section("听：识别")
+
+        row(
+            "识别引擎",
+            asrEngineLabel(),
+            "端侧=离线识别，隧道地库也能用｜云端=现状｜影子=用云端结果，本地后台跑只记日志"
+        ) {
+            choose(
+                "识别引擎", listOf(
+                    "端侧优先（本地 → 云端降级）" to "local",
+                    "云端（MiniMax）" to "cloud",
+                    "影子对比（不改行为，只记日志）" to "shadow"
+                ), Prefs.asrEngine
+            ) {
+                Prefs.asrEngine = it
+                toast(
+                    when (it) {
+                        "local" -> "已切端侧；模型缺失时会自动降级云端"
+                        "shadow" -> "影子模式：行为不变，对比结果写进日志"
+                        else -> "已切回云端"
+                    }
+                )
+                applied()
+            }
+        }
+
+        row(
+            "断句灵敏度", "${Prefs.vadSilenceMs} ms",
+            "停顿多久算说完。调小更快但容易抢话，高速噪音大建议调大"
+        ) {
+            choose(
+                "断句灵敏度", listOf(
+                    "600 ms（快，安静环境）" to 600,
+                    "800 ms（默认）" to 800,
+                    "1000 ms（稳）" to 1000,
+                    "1200 ms（不抢话）" to 1200
+                ), Prefs.vadSilenceMs
+            ) { Prefs.vadSilenceMs = it; applied() }
+        }
+
+        section("听：声纹")
         rowSwitch(
             "只认我的声音", Prefs.voiceprint,
             "第一句有效语音自动注册；之后别人说话当没听见"
@@ -222,16 +313,11 @@ class SettingsActivity : AppCompatActivity() {
             ) { Prefs.voiceprintThreshold = it; applied() }
         }
 
-        // ---------------------------------------------------------- 语音服务
-        //
-        // ★ 语音（识别/合成）目前只有 MiniMax，和「对话大脑」是两套独立的配置。
-        //   以前它们共用一个地址和一个 Key，于是"把对话接到本地模型"必然会把
-        //   语音识别一起打坏。现在分开：这一栏改坏了只影响听和说，不影响思考。
-        section("语音服务 · MiniMax")
+        section("听：云端识别（备用）")
 
         row(
             "语音 API Key", voiceKeyLabel(),
-            "识别和合成共用。Key 只保存在本机设置中，清空后会停用云端语音"
+            "云端识别和云端播报共用这个 Key。只保存在本机，清空后云端语音全部停用"
         ) {
             editText("语音 API Key", Prefs.voiceKeyRaw, "sk-...", masked = true) {
                 Prefs.voiceKeyRaw = it
@@ -255,13 +341,7 @@ class SettingsActivity : AppCompatActivity() {
             editText("识别模型", Prefs.asrModel, "asr-1.0") { Prefs.asrModel = it; applied() }
         }
 
-        row("合成模型", Prefs.ttsCloudModel, "云端播报用的模型，只对「MiniMax 云端」引擎生效") {
-            editText("合成模型", Prefs.ttsCloudModel, "speech-02-hd") {
-                Prefs.ttsCloudModel = it; applied()
-            }
-        }
-
-        section("语音播报")
+        section("说：播报")
         row(
             "导航播报",
             Prefs.navVoiceModeLabel(),
@@ -304,6 +384,12 @@ class SettingsActivity : AppCompatActivity() {
                 // TTS 初始化是异步的，等一会儿再刷一次，让这里显示真实连上的引擎
                 // （引擎起不来会自动回退，回退结果只有 onInit 之后才知道）
                 container.postDelayed({ if (!isFinishing) render() }, 1500)
+            }
+        }
+
+        row("合成模型", Prefs.ttsCloudModel, "云端播报用的模型，只对「MiniMax 云端」引擎生效") {
+            editText("合成模型", Prefs.ttsCloudModel, "speech-02-hd") {
+                Prefs.ttsCloudModel = it; applied()
             }
         }
 
@@ -368,88 +454,124 @@ class SettingsActivity : AppCompatActivity() {
         //   地址和 Key 跟上面「语音服务」完全独立，改这边不会影响听和说。
         section("对话大脑")
 
-        row("服务商", providerLabel(), "换一家会同时改接口地址和模型名，之后可以再手动改") {
-            choose(
-                "对话大脑服务商", listOf(
-                    "Minis 本地网关（默认）" to Prefs.PROVIDER_MINIS,
-                    "MiniMax 云端" to Prefs.PROVIDER_MINIMAX,
-                    "OpenAI 兼容（自填地址）" to Prefs.PROVIDER_OPENAI,
-                    "其他本地 / 局域网服务" to Prefs.PROVIDER_LOCAL
-                ), Prefs.chatProvider
-            ) { applyProvider(it) }
-        }
-
+        // ★ 2026-11-08：两档后端。cloud 走下面的服务商/地址；local 用进程内的
+        //   MNN 0.3B（模型在 filesDir/models/mnn-llm，缺文件会自动落回 cloud）。
         row(
-            "接口地址", chatBaseLabel(),
-            "OpenAI 兼容格式。Minis 默认使用 http://127.0.0.1:8802/v1"
+            "对话后端",
+            chatEngineLabel(),
+            "云端=工具全可用｜本地=进程内 0.3B，纯聊天、不能导航和搜索"
         ) {
-            editText("接口地址", Prefs.chatBaseRaw, "http://127.0.0.1:8802/v1") {
-                Prefs.chatBaseRaw = it
-                applied()
+            choose(
+                "对话后端", listOf(
+                    "云端（MiniMax，工具全可用）" to "cloud",
+                    "本地（0.3B，离线纯聊天）" to "local"
+                ), Prefs.chatEngine
+            ) {
+                Prefs.chatEngine = it
                 toast(
-                    when {
-                        it.isBlank() -> "已恢复当前服务商的默认地址"
-                        !it.startsWith("http") -> "地址要以 http:// 或 https:// 开头"
-                        else -> "接口地址已保存"
-                    }
+                    if (it == "local") "已切本地：模型首次加载约 2 秒，导航/搜索/天气工具不可用"
+                    else "已切云端：工具恢复可用"
                 )
-            }
-        }
-
-        row("API Key", chatKeyLabel(), "本地模型一般不用填；清空就不发送 Key") {
-            editText("对话大脑 API Key", Prefs.chatKeyRaw, "sk-...（本地可留空）", masked = true) {
-                Prefs.chatKeyRaw = it
                 applied()
-                toast(if (it.isBlank()) "已清空，请求不再带 Key" else "Key 已保存")
             }
         }
 
-        row("对话模型", Prefs.chatModel, "填服务端实际的模型名，写错会 404") {
-            val custom = {
-                editText("对话模型", Prefs.chatModel, "服务端里的模型名") {
-                    Prefs.chatModel = it; applied()
+        // ★ 2026-11-08：选了本地之后，下面这一整块云端配置（服务商/地址/Key/模型/
+        //   连接测试/工具调用）全部不显示。理由：这些东西对本地后端一条都不生效，
+        //   摆在界面上只会让人以为「改了会有效果」，反而更难懂。
+        //   想改云端配置就先把后端切回云端，切回去它们就都在。
+        if (Prefs.chatEngine == "local") {
+            row(
+                "本地模型",
+                localLlmLabel(),
+                "进程内 0.3B，不联网、不经过任何服务。不支持工具调用，" +
+                    "导航 / 搜索 / 天气在这里是聊不出来的",
+                chevron = false
+            ) {}
+        } else {
+            row("服务商", providerLabel(), "换一家会同时改接口地址和模型名，之后可以再手动改") {
+                choose(
+                    "对话大脑服务商", listOf(
+                        "Minis 本地网关（默认）" to Prefs.PROVIDER_MINIS,
+                        "MiniMax 云端" to Prefs.PROVIDER_MINIMAX,
+                        "OpenAI 兼容（自填地址）" to Prefs.PROVIDER_OPENAI,
+                        "其他本地 / 局域网服务" to Prefs.PROVIDER_LOCAL
+                    ), Prefs.chatProvider
+                ) { applyProvider(it) }
+            }
+
+            row(
+                "接口地址", chatBaseLabel(),
+                "OpenAI 兼容格式。Minis 默认使用 http://127.0.0.1:8802/v1"
+            ) {
+                editText("接口地址", Prefs.chatBaseRaw, "http://127.0.0.1:8802/v1") {
+                    Prefs.chatBaseRaw = it
+                    applied()
+                    toast(
+                        when {
+                            it.isBlank() -> "已恢复当前服务商的默认地址"
+                            !it.startsWith("http") -> "地址要以 http:// 或 https:// 开头"
+                            else -> "接口地址已保存"
+                        }
+                    )
                 }
-                Unit
             }
-            when (Prefs.chatProvider) {
-                // 本地跑什么模型只有用户自己知道，直接让他填，别拿预设误导
-                Prefs.PROVIDER_LOCAL -> custom()
-                else -> choose(
-                    "对话模型",
-                    when (Prefs.chatProvider) {
-                        Prefs.PROVIDER_MINIS -> MINIS_MODELS
-                        Prefs.PROVIDER_OPENAI -> OPENAI_MODELS
-                        else -> MINIMAX_MODELS
-                    },
-                    Prefs.chatModel
-                ) { pick -> if (pick.isEmpty()) custom() else { Prefs.chatModel = pick; applied() } }
-            }
-        }
 
-        // 接本地模型最容易踩的三个坑（地址、端口、模型名）表现完全一样：说了没反应。
-        // 日志要连 adb 才看得到，车里没这个条件，所以给一个能当场出结论的按钮。
-        row("连接测试", "测一下", "发一句最短的话，验证地址、模型名和 Key") {
-            toast("正在测试…")
-            Thread {
-                val result = ChatProbe.run()
-                runOnUiThread {
-                    if (isFinishing) return@runOnUiThread
-                    AlertDialog.Builder(this)
-                        .setTitle("对话大脑连通性")
-                        .setMessage(result)
-                        .setPositiveButton("知道了", null)
-                        .show()
+            row("API Key", chatKeyLabel(), "本地模型一般不用填；清空就不发送 Key") {
+                editText("对话大脑 API Key", Prefs.chatKeyRaw, "sk-...（本地可留空）", masked = true) {
+                    Prefs.chatKeyRaw = it
+                    applied()
+                    toast(if (it.isBlank()) "已清空，请求不再带 Key" else "Key 已保存")
                 }
-            }.apply { isDaemon = true; name = "chat-probe" }.start()
-        }
+            }
 
-        rowSwitch(
-            "工具调用", Prefs.toolsEnabled,
-            "导航、搜索、天气都靠它。本地小模型不会 Function Calling 时关掉，退化成纯聊天"
-        ) {
-            Prefs.toolsEnabled = it
-            applied()
-            if (!it) toast("已关闭：只能聊天，导航和搜索都用不了")
+            row("对话模型", Prefs.chatModel, "填服务端实际的模型名，写错会 404") {
+                val custom = {
+                    editText("对话模型", Prefs.chatModel, "服务端里的模型名") {
+                        Prefs.chatModel = it; applied()
+                    }
+                    Unit
+                }
+                when (Prefs.chatProvider) {
+                    // 本地跑什么模型只有用户自己知道，直接让他填，别拿预设误导
+                    Prefs.PROVIDER_LOCAL -> custom()
+                    else -> choose(
+                        "对话模型",
+                        when (Prefs.chatProvider) {
+                            Prefs.PROVIDER_MINIS -> MINIS_MODELS
+                            Prefs.PROVIDER_OPENAI -> OPENAI_MODELS
+                            else -> MINIMAX_MODELS
+                        },
+                        Prefs.chatModel
+                    ) { pick -> if (pick.isEmpty()) custom() else { Prefs.chatModel = pick; applied() } }
+                }
+            }
+
+            // 接本地模型最容易踩的三个坑（地址、端口、模型名）表现完全一样：说了没反应。
+            // 日志要连 adb 才看得到，车里没这个条件，所以给一个能当场出结论的按钮。
+            row("连接测试", "测一下", "发一句最短的话，验证地址、模型名和 Key") {
+                toast("正在测试…")
+                Thread {
+                    val result = ChatProbe.run()
+                    runOnUiThread {
+                        if (isFinishing) return@runOnUiThread
+                        AlertDialog.Builder(this)
+                            .setTitle("对话大脑连通性")
+                            .setMessage(result)
+                            .setPositiveButton("知道了", null)
+                            .show()
+                    }
+                }.apply { isDaemon = true; name = "chat-probe" }.start()
+            }
+
+            rowSwitch(
+                "工具调用", Prefs.toolsEnabled,
+                "导航、搜索、天气都靠它。关掉会退化成纯聊天"
+            ) {
+                Prefs.toolsEnabled = it
+                applied()
+                if (!it) toast("已关闭：只能聊天，导航和搜索都用不了")
+            }
         }
 
         row("回复长度", humanTokens(Prefs.maxTokens), "单条回复最多多少 token") {
@@ -532,6 +654,16 @@ class SettingsActivity : AppCompatActivity() {
 
         section("联网搜索")
 
+        // ★ 2026-11-08：本地后端下整块搜索配置无意义——0.3B 没有工具调用，
+        //   给它 Tavily 也用不上。跟「对话大脑」的云端配置一样，按档位隐藏。
+        if (Prefs.chatEngine == "local") {
+            row(
+                "联网搜索", "本地模式不可用",
+                "本地 0.3B 没有工具调用能力，搜不了网。对话后端切回云端即可用",
+                chevron = false
+            ) {}
+        } else {
+
         // ★ 2026-11-02：接本地接口时不再塞 Tavily。
         //   本地那套服务（127.0.0.1:8802）自带完整检索，模型在服务端就查完了；
         //   再给它一个 web_search 等于让它二选一，而 Tavily 那份又慢又碎。
@@ -562,36 +694,13 @@ class SettingsActivity : AppCompatActivity() {
             toast("已清除自定义搜索 Key")
             render()
         }
-
-        section("语音模型")
-        row("唤醒模型", modelStatus(), null, chevron = false) {}
-        row("重新下载模型", "", "删掉现有的，重新下 44MB。网络不好时别点") {
-            if (downloading) { toast("正在下载中…"); return@row }
-            AlertDialog.Builder(this)
-                .setTitle("重新下载语音模型")
-                .setMessage("会删除现有模型并重新下载约 44MB。继续？")
-                .setPositiveButton("开始下载") { _, _ -> redownloadModel() }
-                .setNegativeButton("取消", null)
-                .show()
         }
 
         // ---------------------------------------------------------- 实验选项
         // 2026-11-07：借鉴桌面 D:/AI 语音链路的几处工程细节。凡是会改变
         // 拾音 / 识别行为的一律默认关，真机验过再决定要不要长期开。
-        section("实验室 · 语音链路")
-        row(
-            "断句灵敏度", "${Prefs.vadSilenceMs} ms",
-            "停顿多久算说完。调小更快但容易抢话，高速噪音大建议调大"
-        ) {
-            choose(
-                "断句灵敏度", listOf(
-                    "600 ms（快，安静环境）" to 600,
-                    "800 ms（默认）" to 800,
-                    "1000 ms（稳）" to 1000,
-                    "1200 ms（不抢话）" to 1200
-                ), Prefs.vadSilenceMs
-            ) { Prefs.vadSilenceMs = it; applied() }
-        }
+        // 2026-11-08：断句灵敏度已移到「听：识别」——它是常规参数，不是实验项。
+        section("高级：语音链路")
         rowSwitch(
             "上传噪声门", Prefs.noiseGate,
             "低于阈值的段落渐弱后再送 ASR；不影响 VAD 和声纹（照 D:/AI 的 gate 包络）"
@@ -1271,6 +1380,31 @@ class SettingsActivity : AppCompatActivity() {
      * 显示**实际连上的**引擎，不是设置里选的那个。
      * 引擎没装或者构造失败会回退系统默认，选的和用的可能不是一回事。
      */
+    /** 对话后端那一行右侧显示的文字 */
+    private fun chatEngineLabel(): String =
+        if (Prefs.chatEngine == "local") "本地（0.3B）" else "云端（MiniMax）"
+
+    /** 本地模型状态：文件在不在、有没有加载成功 */
+    private fun localLlmLabel(): String {
+        // 状态从 MnnLocalLlm 单例读，不用碰 VoiceEngine
+        val m = MnnLocalLlm.get(this)
+        return when {
+            m.ready -> "已就绪（${m.lastLoadMs}ms 加载）"
+            m.modelPresent() -> "模型已装，尚未加载"
+            else -> "缺模型文件"
+        }
+    }
+
+    /** 识别引擎那一行右侧显示的文字。带就绪状态，不用翻日志也知道模型有没有加载成功 */
+    private fun asrEngineLabel(): String {
+        val ready = app.voiceEngineProvider?.invoke()?.localAsrReady == true
+        return when (Prefs.asrEngine) {
+            "local" -> if (ready) "端侧（已就绪）" else "端侧（模型未就绪）"
+            "shadow" -> "影子对比"
+            else -> "云端（MiniMax）"
+        }
+    }
+
     private fun engineLabel(): String {
         val actual = app.voice.activeEngine
         val name = when (actual) {

@@ -45,6 +45,15 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
     private lateinit var hudStep: TextView
     private lateinit var hudRoad: TextView
     private lateinit var hudRemain: TextView
+
+    /** 导航中的目的地条（「前往 XXX」）。高德内置界面不显示目的地，这是唯一的入口 */
+    private lateinit var navDestText: TextView
+
+    /**
+     * 高德 SDK 的冗余控件是否已经藏掉（footer 退出按钮 + 当前道路条）。
+     * 藏一次就够，但 naviView reInit 之后会重建，那时要重置（见 rebuildNaviViewAfterExit）。
+     */
+    @Volatile private var sdkFooterExitHidden = false
     private lateinit var nav: AmapNavController
 
     private var mapStarted = false
@@ -159,6 +168,7 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
         hudStep = findViewById(R.id.hud_step)
         hudRoad = findViewById(R.id.hud_road)
         hudRemain = findViewById(R.id.hud_remain)
+    navDestText = findViewById(R.id.nav_destination)
 
         // TTS 是 Application 级单例，导航播报和聊天回复共用一条队列。
         nav = createNavController()
@@ -749,6 +759,7 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
                 resetNavigationEngineAfterExit()
                 Dbg.log("退出导航 → reInit 同一个 AMapNaviView")
                 naviView.reInit(null)
+                sdkFooterExitHidden = false
                 applyNaviViewOptionsAfterReInit()
                 bindNaviViewRuntime(routeRequested = false)
                 naviView.onResume()
@@ -1432,6 +1443,38 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
     private var gpsHideWarned = false
 
     /** 递归按 view 的 id 名字查找（id 资源名不是 view 类名时才用得上） */
+    /**
+     * 隐藏高德底部 footer 里的「退出」按钮。
+     *
+     * ★ 2026-11-08 真机问题：底部条被挤变形，「18:14到达」的 bounds 直接被压成
+     *   [0,0][0,0]（宽度归零，完全看不见）。原因是 footer 里塞了五个元素：
+     *   退出(63dp) + 剩余距离 + 剩余时间 + 限速 + 到达时间，窄屏排不开。
+     *
+     *   这五个里只有「退出」是多余的 —— 我们左上角已有退出（退出整个 App），
+     *   SDK 这个只退导航、App 还在后台听麦克风，语义容易混。
+     *   隐掉它，剩下四个立刻宽松。
+     */
+    private fun hideSdkFooterExit() {
+        if (sdkFooterExitHidden) return
+        runCatching {
+            var hidden = false
+            // ① footer 里的退出按钮：跟我们左上角那个重复，还占 63dp
+            findViewByIdName(naviView, "exit_navigation_portrait")?.let {
+                it.visibility = View.GONE
+                hidden = true
+            }
+            // ② 当前道路条：让位给「前往 XXX」。路名在转向卡片里已经有了，重复
+            findViewByIdName(naviView, "navi_sdk_lbs_road_name_container_container")?.let {
+                it.visibility = View.GONE
+                hidden = true
+            }
+            if (hidden) {
+                sdkFooterExitHidden = true
+                Dbg.log("已隐藏 SDK 冗余控件（footer 退出按钮 / 当前道路条）")
+            }
+        }
+    }
+
     private fun findViewByIdName(root: View?, name: String): View? {
         if (root !is android.view.ViewGroup) return null
         for (i in 0 until root.childCount) {
@@ -1517,11 +1560,22 @@ class NavActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi, NavApp.P
         if (h.navigating) {
             setNaviHudVisible(true)
             applyTrafficLightView(true)
+            // flag 短路，每帧调用几乎没有代价
+            hideSdkFooterExit()
         } else {
             applyTrafficLightView(false)
         }
         // 用高德内置界面时，顶部转向信息由高德画，我们的 HUD 卡片要让位，
         // 否则两套转向提示叠在一起。
+        // 目的地条：不管用不用高德内置界面都要显示（内置界面本来就没有目的地）
+        val destName = nav.currentPlaceShortName
+        if (h.navigating && !destName.isNullOrBlank()) {
+            navDestText.text = "前往 $destName"
+            if (navDestText.visibility != View.VISIBLE) navDestText.visibility = View.VISIBLE
+        } else if (navDestText.visibility != View.GONE) {
+            navDestText.visibility = View.GONE
+        }
+
         if (!h.navigating || Prefs.amapBuiltinUi) {
             hud.visibility = View.GONE
             return

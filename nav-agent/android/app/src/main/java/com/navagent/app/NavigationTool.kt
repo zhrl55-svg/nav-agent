@@ -60,6 +60,18 @@ class NavigationTool(
     /** 导航到**已确认的候选 POI**（用它的精确坐标，不重新解析地名） */
     private val navigateToPoi: (AmapSdkGeocoder.Poi) -> NavigationToolResult = { navigateTo(it.name) },
     private val stop: () -> String,
+    /**
+     * 继续导航。**只对「暂停但路线还在」的状态有效**。
+     *
+     * ★ 2026-11-08：stop 之后路线已经清掉，resume 恢复不了。
+     *   所以这个回调必须自己判断状态，return NEEDS_CLARIFICATION 不能假装成功。
+     */
+    private val resume: () -> NavigationToolResult = {
+        NavigationToolResult(
+            "当前没有暂停中的导航",
+            NavigationToolResult.Status.NEEDS_CLARIFICATION
+        )
+    },
     private val openMap: () -> String,
     /** 模型没给目的地时，用上一次周边搜索的结果兜底 */
     private val lastNearbyName: () -> String?,
@@ -96,6 +108,9 @@ class NavigationTool(
     override val description =
         "导航控制。用户要去某个地方、改去别处、停止导航、只打开地图时调用。\n" +
             "用户说「去X」「导航到X」「带我去X」「改去X」「回刚才那个地方」「就去这家」都算 navigate。\n" +
+            "用户说「继续导航」「接着走」「还是去刚才那个地方」时调用 action=resume。\n" +
+            "★ 即使用户刚才说过「停止导航」（真停，路线已清），目的地仍然记着 —— " +
+            "resume 会按原来的目的地重新算路，**不需要再问用户去哪**。\n" +
             "用户说「你休息吧」「你先休息吧」「不要打扰我」「你先不要打扰我」「安静点」这类要你闭嘴的，调用 action=sleep。\n" +
             "★ 用户只说了一个地名时，本工具会先搜索出候选并返回给你，**这时不会导航**；" +
             "你要用 1、2、3 把候选列出来问用户「是哪个」。" +
@@ -104,7 +119,7 @@ class NavigationTool(
 
     override fun parametersJson(): String = """
         {"type":"object","properties":{
-          "action":{"type":"string","enum":["navigate","stop","open_map","sleep"],"description":"navigate=导航去某地；stop=停止/结束导航；open_map=只打开地图不算路；sleep=用户要求你别打扰，进入休眠"},
+          "action":{"type":"string","enum":["navigate","stop","resume","open_map","sleep"],"description":"navigate=导航去某地；stop=停止/结束导航；resume=继续/恢复刚才暂停的导航；open_map=只打开地图不算路；sleep=用户要求你别打扰，进入休眠"},
           "destination":{"type":"string","description":"目的地地名。action=navigate 时必填。照用户原话写，**保留省市县这类行政区划**（如「景泰县条山路金星家园」），不要自己简化"},
           "confirmed":{"type":"boolean","description":"**只有用户已经明确选了某个候选之后**才传 true。第一次提到某个地名时不要传（默认 false），工具会返回候选让你问用户。传 true 表示用户已经确认，直接导航"}
         },"required":["action"]}
@@ -269,6 +284,7 @@ class NavigationTool(
                 }
             }
 
+            "resume" -> resume()
             "stop" -> NavigationToolResult(
                 stop(),
                 NavigationToolResult.Status.STOPPED
