@@ -64,15 +64,24 @@ class VoiceService : Service() {
             (application as NavApp).choiceModeActive()
         }
         engine.isSpeakingProvider = {
-            (application as NavApp).voice.isSpeaking
+            val voice = (application as NavApp).voice
+            // ★ 打断后的硬静音窗口也算出声：这 300ms 里播放器还在异步停，
+            //   按「正在播报」处理才能不喂 VAD、并保持华为 ASR_AEC 开启。
+            voice.isSpeaking || voice.inHardMuteWindow()
         }
         // 播报原文：用来识别「唤醒词是我们自己播出来的」，避免播报自己打断自己。
         engine.spokenTextProvider = {
             (application as NavApp).voice.currentText
         }
+        // ASR 结果里认「自己的播报回声」：读最近播过的文本，含已播完的。
+        // 不能用 spokenTextProvider（current 播完就清空了）。
+        engine.recentSpokenProvider = {
+            (application as NavApp).voice.recentSpokenText()
+        }
         engine.isEchoGuardActiveProvider = {
             val voice = (application as NavApp).voice
-            !voice.isSpeaking && voice.inEchoWindow(Prefs.echoGuardMs)
+            // 总开关关掉后，播报一结束就立刻恢复拾音（可以紧跟插话）
+            Prefs.echoGuardEnabled && !voice.isSpeaking && voice.inEchoWindow(Prefs.echoGuardMs)
         }
 
         // 睡眠口令本地命中：不经过 LLM，直接播一句「好」再休眠。
@@ -90,7 +99,7 @@ class VoiceService : Service() {
         // 什么声音都没有，会以为程序坏了。USER 级不会抢占导航播报。
         engine.onAsrFailure = {
             val app = application as NavApp
-            app.voice.speak("网络不好，没听清，再说一遍", VoiceGuide.Priority.USER)
+            app.voice.speak("网络不太好，请稍后再试一次", VoiceGuide.Priority.USER)
         }
 
         // 识别的结果统一从这里进大脑，Activity 只是观众

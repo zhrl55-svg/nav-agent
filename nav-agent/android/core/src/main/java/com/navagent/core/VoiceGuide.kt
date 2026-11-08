@@ -4,6 +4,7 @@ import android.content.Context
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.util.Log
+import java.util.ArrayDeque
 import java.util.Locale
 import java.util.concurrent.PriorityBlockingQueue
 
@@ -148,6 +149,20 @@ class VoiceGuide(
     var lastSpokeEndMs: Long = 0L
         private set
 
+    /**
+     * 打断后的「硬静音窗口」截止时刻。
+     *
+     * ★ 2026-11-07 修自激循环：bargeInChat() 同步把 isSpeaking 置 false，
+     *   但云端 TTS 的 stop()/MediaPlayer.release() 是异步 post 到主线程的。
+     *   这中间 VAD 已经开始喂帧，会把还没停干净的 TTS 尾巴整段录进去。
+     *   宿主把 [inHardMuteWindow] 并入 isSpeakingProvider，窗口内继续按
+     *   「正在播报」处理：不喂 VAD、保持 AEC，等播放器真正落地再恢复拾音。
+     */
+    @Volatile
+    private var hardMuteUntilMs: Long = 0L
+
+    fun inHardMuteWindow(): Boolean = System.currentTimeMillis() < hardMuteUntilMs
+
     /** 播报结束后 [ms] 毫秒内都算回声区，这段时间不该拾音 */
     fun inEchoWindow(ms: Long = 600L): Boolean =
         System.currentTimeMillis() - lastSpokeEndMs < ms
@@ -161,6 +176,34 @@ class VoiceGuide(
      */
     val currentText: String?
         get() = current?.text
+
+    /**
+     * 最近播报过的文本（**含已播完的**），用来在 ASR 结果里认出
+     * 「把自己的播报回声听成用户说话」。
+     *
+     * ★ 不能复用 [currentText]：bargeInChat() 和正常播完都会把 current 置 null，
+     *   而回声恰恰是在播完之后才被 VAD 切出来送识别的，那时原文已经没了
+     *   （真机日志：播完 2 秒切出 10.34s 音频，ASR 结果就是刚播的那两句）。
+     */
+    private val recentSpoken = ArrayDeque<Pair<Long, String>>()
+
+    @Synchronized
+    private fun rememberSpoken(text: String) {
+        if (text.isBlank()) return
+        recentSpoken.addLast(System.currentTimeMillis() to text)
+        while (recentSpoken.size > 6) recentSpoken.removeFirst()
+    }
+
+    /** 最近 [windowMs] 毫秒内播过的文本拼起来；没有就 null */
+    @Synchronized
+    fun recentSpokenText(windowMs: Long = 8_000L): String? {
+        val now = System.currentTimeMillis()
+        while (recentSpoken.isNotEmpty() && now - recentSpoken.first().first > windowMs) {
+            recentSpoken.removeFirst()
+        }
+        if (recentSpoken.isEmpty()) return null
+        return recentSpoken.joinToString("") { it.second }.takeIf { it.isNotBlank() }
+    }
 
     /**
      * 语速。由宿主在启动时注入（core 不认识 SharedPreferences）。
@@ -413,6 +456,8 @@ class VoiceGuide(
     @Synchronized
     fun speak(text: String, priority: Priority = Priority.CHAT) {
         if (!ready) return
+        // 真有新播报要开始了，硬静音让位给 isSpeaking（否则会双重遮挡）
+        hardMuteUntilMs = 0L
         if (priority == Priority.NAV) {
             queue.removeAll { it.priority == Priority.CHAT }
             // 导航播报可以打断用户闲聊，但**不能打断另一条导航播报**。
@@ -429,6 +474,7 @@ class VoiceGuide(
         }
         val order = ++seq
         queue.offer(Utterance("u$order", text, priority, order))
+        rememberSpoken(text)
         logger?.invoke(
             "播报入队 id=u$order priority=$priority chars=${text.length} " +
                 "current=${current?.id ?: "-"} 队列=${queue.size}"
@@ -458,13 +504,16 @@ class VoiceGuide(
         }
         val had = cur != null || queue.isNotEmpty()
         queue.removeAll { it.priority != Priority.NAV }
+        // ★ 先立硬静音窗口，再置 isSpeaking=false。宿主把 inHardMuteWindow()
+        //   并进 isSpeakingProvider，所以这 300ms 内麦克风不会被放开。
+        hardMuteUntilMs = System.currentTimeMillis() + HARD_MUTE_MS
         // 顺序同 speak()：先清 current，stop() 的回调才会被 finishCurrent 按 id 忽略
         current = null
         setSpeaking(false)
         tts?.stop()
         cloudTts?.stop()
         lastSpokeEndMs = System.currentTimeMillis()
-        logger?.invoke("打断闲聊播报 had=$had 剩余队列=${queue.size}")
+        logger?.invoke("打断闲聊播报 had=$had 剩余队列=${queue.size} 硬静音=${HARD_MUTE_MS}ms")
         if (queue.isNotEmpty()) {
             // 有导航播报排在后面：stop() 是异步的，立刻 drain 可能被
             // `engine.isSpeaking` 挡住，隔几拍再试一次
@@ -510,6 +559,9 @@ class VoiceGuide(
 
         /** 打断后重试 drain 的间隔 */
         const val DRAIN_RETRY_MS = 250L
+
+        /** 打断后的硬静音时长：等 MediaPlayer 真正 stop + 混响衰减 */
+        const val HARD_MUTE_MS = 300L
 
     }
 }

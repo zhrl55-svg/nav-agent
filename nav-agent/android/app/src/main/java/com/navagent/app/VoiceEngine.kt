@@ -84,6 +84,16 @@ class VoiceEngine(private val context: Context) {
     var spokenTextProvider: () -> String? = { null }
 
     /**
+     * 最近播报过的文本（含已播完的），由宿主注入 `voice.recentSpokenText()`。
+     *
+     * ★ 和 [spokenTextProvider] 分开：后者读的是「当前正在播的那句」，
+     *   播完 / 打断就变 null；而回声往往在播完之后才被 VAD 切出来，
+     *   必须用带时间窗的历史文本才能认出来。
+     */
+    @Volatile
+    var recentSpokenProvider: () -> String? = { null }
+
+    /**
      * 打断播报时回调。宿主注入 `app.bargeInChat()`（停闲聊 + 让本轮生成静音）。
      *
      * @return 真的停掉了东西才返回 true。导航播报在播时返回 false ——
@@ -126,11 +136,11 @@ class VoiceEngine(private val context: Context) {
     var onSleepCommand: (() -> Unit)? = null
 
     /**
-     * 云端 ASR 真的失败时由宿主播一句提示（「网络不好，再说一遍」）。
+     * 云端 ASR 真的失败时由宿主播一句提示（「网络不太好，请稍后再试一次」）。
      *
-     * ★ 2026-11-07，借鉴 D:/AI/app/asr_minimax.py：那边失败会降级本地 whisper，
-     *   最差也有个结果；nav 原来只写一行 Dbg 日志，用户在隧道里喊完一句
-     *   什么反馈都没有，只会觉得「坏了」。降级链路没做完之前，先把反馈补上。
+     * ★ 2026-11-07：原来只写一行 Dbg 日志，用户在隧道里喊完一句什么反馈
+     *   都没有，只会觉得「坏了」。本地 Vosk 兜底真机实测准确率不够
+     *   （「导航去水勘院」被转成「去 是 可以」），已整个删掉，只保留明确提示。
      *   为 null 时保持旧行为（设置页/单测可以不注入）。
      */
     @Volatile
@@ -174,6 +184,16 @@ class VoiceEngine(private val context: Context) {
      * 外放 + 无可靠 AEC 时，TTS 会被 VAD 切成很多句，不封顶会刷爆云端请求。
      */
     @Volatile private var fullDuplexTried = false
+
+    /**
+     * 当前 VAD 段里是否混进过「播报期间」的帧。
+     *
+     * ★ 2026-11-07 22:50：全双工会在播报期间额外喂 VAD，一整段 TTS 被攒成
+     *   一句，但**切句往往发生在播报结束后**（真机日志：播完 2 秒切出 10.34s），
+     *   只看切句瞬间的 speakingNow 会把它当正常用户语音放行。用这个标志
+     *   记录「这段的出身」，切句时一并交给护栏。
+     */
+    @Volatile private var vadSawPlayback = false
 
     /** 失败提示的节流：连续几句都失败时别一直念「网络不好」 */
     @Volatile private var lastAsrFailNoticeMs = 0L
@@ -305,7 +325,7 @@ class VoiceEngine(private val context: Context) {
         capture?.stop()
         capture = null
         sherpaBargeIn.close()
-        vad?.reset()
+        resetVad()
         shutdownWake()
         huaweiPreprocess.setActive(false)
         ready = false
@@ -320,11 +340,11 @@ class VoiceEngine(private val context: Context) {
         beep()
         setState(State.LISTENING)
         resetWake()
-        vad?.reset()
+        resetVad()
     }
 
     fun sleep() {
-        vad?.reset()
+        resetVad()
         resetWake()
         setState(State.ASLEEP)
     }
@@ -453,6 +473,7 @@ class VoiceEngine(private val context: Context) {
                 //   依赖「打断检测」开着（上面 !Prefs.bargeIn 会提前 return），
                 //   因为 AEC 不可靠时半双工仍是默认且更安全的选择。
                 if (Prefs.fullDuplex && !busyRecognizing && state == State.LISTENING) {
+                    vadSawPlayback = true
                     vad?.feed(frame, len)
                 }
                 return
@@ -490,7 +511,18 @@ class VoiceEngine(private val context: Context) {
             sherpaBargeIn.reset()
             ownerPollFrames = 0
             ownerStreak.set(0)
-            huaweiPreprocess.setActive(false)
+            // ★ 打断后 skipEchoGuard 还开着，麦克风马上要恢复拾音。此刻关掉
+            //   华为 ASR_AEC 等于把 TTS 残响原样收进去，延后到放行窗口结束再关。
+            //   回调里再查一次状态：期间若又开始播报就别关。
+            if (skipEchoGuard) {
+                main.postDelayed({
+                    if (!isSpeakingProvider() && !skipEchoGuard) {
+                        huaweiPreprocess.setActive(false)
+                    }
+                }, ECHO_SKIP_MS + 100L)
+            } else {
+                huaweiPreprocess.setActive(false)
+            }
             resetWake()
             // 导航播报期间用户喊的打断词，现在播完了，立刻执行
             runDeferredBarge()
@@ -866,7 +898,7 @@ class VoiceEngine(private val context: Context) {
         if (wakeInterruptPending) return
         wakeInterruptPending = true
         lastActivityMs = System.currentTimeMillis()
-        vad?.reset()
+        resetVad()
 
         // 序号命中时把规范化说法直接提交：用户说的就是这句，
         // 让他等列表念完再说一遍等于这个功能没做。
@@ -883,6 +915,7 @@ class VoiceEngine(private val context: Context) {
             //   打断时 lastSpokeEndMs 刚被刷新，正常会锁 1.5 秒 —— 用户紧跟着说的
             //   半句话会被整段吞掉（这是之前「打断后第一句老丢」的原因之一）。
             skipEchoGuard = true
+            Dbg.log("打断：硬静音窗口结束前不放拾音，回声放行 ${ECHO_SKIP_MS}ms 后恢复")
             main.postDelayed({ skipEchoGuard = false }, ECHO_SKIP_MS)
             when {
                 indexHit != null -> {
@@ -942,6 +975,12 @@ class VoiceEngine(private val context: Context) {
         return false
     }
 
+    /** 重置 VAD 时一并清掉「这段混进过播报帧」的标记，别让它串到下一句 */
+    private fun resetVad() {
+        vad?.reset()
+        vadSawPlayback = false
+    }
+
     private fun onSegment(pcm: ShortArray) {
         if (busyRecognizing) return
         busyRecognizing = true
@@ -950,6 +989,9 @@ class VoiceEngine(private val context: Context) {
         //   也清空了，护栏会全部失效；反过来用「播报结束后 2 秒」这种时间窗
         //   又会把用户紧接着说的第一句话误判成重叠句丢掉。
         val cutDuringPlayback = Prefs.fullDuplex && speakingNow
+        // 这段 VAD 音频里有没有混进播报期间的帧（切句可能晚于播报结束）
+        val sawPlayback = vadSawPlayback
+        vadSawPlayback = false
         val spokenAtCut = spokenTextProvider()
         setState(State.THINKING)
         worker.execute {
@@ -958,7 +1000,7 @@ class VoiceEngine(private val context: Context) {
                 //   绝大多数是我们自己的 TTS。四道关都要过才送去识别：
                 //   本轮只试一次 / 必须已注册声纹且不自适应 / 更高阈值 /
                 //   识别结果不能是播报原文。过不了就当没听见。
-                val fromPlayback = cutDuringPlayback
+                val fromPlayback = cutDuringPlayback || sawPlayback
                 if (fromPlayback) {
                     val gate = voiceprintProvider?.invoke()
                     val allowed = !fullDuplexTried && Prefs.voiceprint &&
@@ -989,30 +1031,11 @@ class VoiceEngine(private val context: Context) {
                     pcm
                 }
 
-                var text = asr.transcribe(uploadPcm, AudioCapture.SAMPLE_RATE)
+                val text = asr.transcribe(uploadPcm, AudioCapture.SAMPLE_RATE)
                 // null = 云端真的失败；"" = 识别成功但确实没说话。两者反馈不同
                 val cloudFailed = text == null
-
-                // shadow：两条链路并排打日志，链路仍走云端（D:/AI 的
-                // S2S_ASR_MODE=shadow）。云端失败时顺手跑一次本地供兜底判断。
-                val local = if (Prefs.asrShadow || cloudFailed) {
-                    synchronized(wakeLock) { (wake as? VoskWake)?.transcribe(uploadPcm) }
-                } else {
-                    null
-                }
-                if (Prefs.asrShadow) {
-                    Dbg.log("ASR[shadow] cloud=「${text ?: "<失败>"}」 vosk=「${local ?: "<无>"}」")
-                }
-                // 复用已在内存里的 Vosk 小模型做离线兜底，默认关 —— 小模型
-                // 长句容易出碎片，乱转写触发导航是安全问题，真机验过再开。
-                if (cloudFailed && Prefs.asrFallbackVosk && !local.isNullOrBlank()) {
-                    Dbg.log("ASR 云端失败 → vosk 兜底「$local」")
-                    text = local
-                }
-
-                val resolved = text
                 when {
-                    resolved.isNullOrBlank() -> {
+                    text.isNullOrBlank() -> {
                         Dbg.log("ASR 无结果，回到聆听")
                         if (state != State.ASLEEP) setState(State.LISTENING)
                         // 节流：隧道里连着几句都失败，也只提示一次
@@ -1024,15 +1047,23 @@ class VoiceEngine(private val context: Context) {
                         }
                     }
 
+                    // ★ 通用回声护栏：不管是不是全双工、也不管切句时还在不在播，
+                    //   只要识别结果和最近播过的文本重合，就是自己的声音被收了回去。
+                    //   真机日志：播完 2 秒切出 10.34s 音频，ASR 逐字复述刚播的两句。
+                    looksLikeEcho(text, recentSpokenProvider()) -> {
+                        Dbg.log("丢弃播报回声：「$text」")
+                        main.post { setState(State.LISTENING) }
+                    }
+
                     // 全双工下识别结果和正在播的原文重合 → 是自己念的，别自问自答
-                    fromPlayback && looksLikeBroadcast(resolved, spokenAtCut) -> {
-                        Dbg.log("全双工：识别结果来自播报原文，丢弃「$resolved」")
+                    fromPlayback && looksLikeBroadcast(text, spokenAtCut) -> {
+                        Dbg.log("全双工：识别结果来自播报原文，丢弃「$text」")
                         main.post { setState(State.LISTENING) }
                     }
 
                     // 唤醒词本身又被 ASR 认了一遍，别当成用户的话送去聊天
-                    isWakeOnly(resolved) -> {
-                        Dbg.log("丢弃纯唤醒词：「$resolved」")
+                    isWakeOnly(text) -> {
+                        Dbg.log("丢弃纯唤醒词：「$text」")
                         lastActivityMs = System.currentTimeMillis()
                         main.post { setState(State.LISTENING) }
                     }
@@ -1040,8 +1071,8 @@ class VoiceEngine(private val context: Context) {
                     // ★ 睡眠口令本地拦截：不走 LLM，省掉 1~2 秒往返，也不会漏。
                     //   必须放在 isWakeOnly 之后、else 之前 —— 顺序错了「小度你休息吧」
                     //   会被当成纯唤醒词丢掉。
-                    onSleepCommand != null && isSleepCommand(resolved) -> {
-                        Dbg.log("本地命中睡眠口令：「$resolved」")
+                    onSleepCommand != null && isSleepCommand(text) -> {
+                        Dbg.log("本地命中睡眠口令：「$text」")
                         lastActivityMs = System.currentTimeMillis()
                         main.post { onSleepCommand?.invoke() }
                     }
@@ -1049,7 +1080,7 @@ class VoiceEngine(private val context: Context) {
                     else -> {
                         lastActivityMs = System.currentTimeMillis()
                         main.post {
-                            listener?.onUtterance(resolved)
+                            listener?.onUtterance(text)
                             setState(State.LISTENING)
                         }
                     }
@@ -1068,6 +1099,22 @@ class VoiceEngine(private val context: Context) {
         val norm = spoken?.filter { it.isLetterOrDigit() } ?: return false
         val heard = text.filter { it.isLetterOrDigit() }
         return heard.length >= 4 && norm.contains(heard)
+    }
+
+    /**
+     * 通用回声判断：识别文本里任意连续 6 字命中最近播过的文本，就算回声。
+     *
+     * 用「6 字窗口」而不是整句包含，是因为 ASR 对 TTS 回声会有个别错字
+     * （「您说」→「你说」、「山丹」→「三单」），整句比对一错就漏；
+     * 但连续 6 字完全相同，基本不可能是用户自己刚好复述出来的。
+     * 短句（「好」「对」「继续」）长度不够 6，直接放行，不会误伤。
+     */
+    private fun looksLikeEcho(heard: String, recent: String?): Boolean {
+        if (recent.isNullOrBlank()) return false
+        val h = heard.filter { it.isLetterOrDigit() }
+        val r = recent.filter { it.isLetterOrDigit() }
+        if (h.length < 6) return false
+        return h.windowed(6).any { r.contains(it) }
     }
 
     /**
@@ -1177,7 +1224,7 @@ class VoiceEngine(private val context: Context) {
             skipEchoGuard = false
             wakeAudio.clear()
             resetWake()
-            vad?.reset()
+            resetVad()
         } else {
             asleepFrames = 0
         }
@@ -1309,9 +1356,14 @@ class VoiceEngine(private val context: Context) {
          *
          * 打断的一瞬间 TTS 刚停，`lastSpokeEndMs` 被刷新，正常会锁住拾音
          * [Prefs.echoGuardMs]（默认 1.5s）—— 用户紧跟着说的那句话就整段丢了。
-         * 这里放开 2 秒：比默认保护期长一点，之后自动恢复，不会永久失效。
+         *
+         * ★ 2026-11-07 从 2 秒缩到 800ms：2 秒无保护拾音太长，足以把还在响的
+         *   TTS 尾巴整段录进去，再经 ASR → LLM → TTS 形成自激（用户反馈
+         *   「打断后只停一下、又把录音里 AI 的回音播了一遍」）。
+         *   现在前 300ms 由 VoiceGuide 硬静音挡住，剩下约 500ms 只用来接住
+         *   用户紧接着说的第一句，之后回声保护恢复。
          */
-        const val ECHO_SKIP_MS = 2_000L
+        const val ECHO_SKIP_MS = 800L
 
         /**
          * 导航播报期间攒下的打断，最多认这么久。

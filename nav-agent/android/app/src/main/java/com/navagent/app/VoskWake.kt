@@ -110,56 +110,19 @@ class VoskWake(modelDir: File, private val wakeWords: List<String>) : WakeWord {
     }
 
     /**
-     * 同音兜底。
+     * 同音匹配统一走拼音，不再维护手写同音字表。
      *
-     * 实测 vosk 中文小模型对生造词很不友好，「小高」很容易被听成
-     * 「晓高/笑高/小搞/萧高」。Android 上没有 pypinyin，桌面那套
-     * 「转拼音再比」走不通，所以这里直接枚举常见同音字。
+     * ★ 2026-11-07 晚删掉 HOMOPHONES / buildFuzzy()：那是一张按字手写的
+     *   「小晓笑校…」「度渡肚杜…」小表，唤醒词换成「果果」后表里查不到，
+     *   正则整个返回 null，日志里就是 `唤醒同音兜底正则=null`。
      *
-     * 代价是误唤醒率略升（"效果"也含"效"…不含小，安全；
-     * 但"校高"这种会误命中），车内场景可以接受 —— 误唤醒只是多说一句"在"，
-     * 比喊十遍不理人强。
+     *   而 [expectedPinyin] 用 Android ICU Transliterator **运行时查任意汉字读音**，
+     *   本来就自适应；同音字（「晓高」「小朱」）的拼音和唤醒词完全相同，
+     *   在 [match] / [strictMatch] 的拼音路径里已经能命中，那张表是冗余的一层。
      *
-     * ★ 2026-11-01 修：这段原来是写死的「小X高」，唤醒词换成「小度」之后
-     *   这层兜底**整个失效**（条件不成立直接返回 null）。
-     *   实测「小多」还能靠拼音匹配兜住，但「晓度」「小杜」「小渡」这种
-     *   中间夹字或首字不同音的会漏。现在按当前唤醒词动态生成同音字表。
+     * 现在待命唤醒四层：精确汉字 → 拼音有界近似 → 词首丢失 → 任意片段；
+     * 播报期间严格模式两层：精确汉字 → 完整拼音一致。
      */
-    private val fuzzy: Regex? = buildFuzzy(wakeWords)
-
-    /**
-     * 按唤醒词生成同音兜底正则。
-     *
-     * 两条路径：
-     *  1. **逐字精确**：唤醒词里每个字都在 [HOMOPHONES] 表里，就生成
-     *     `[小晓笑校…][猪朱珠竹…][佩配培赔…][奇其琪骑…]` —— 每个位置只认同音字，
-     *     误唤醒率最低。四字唤醒词（「小猪佩奇」）走这条。
-     *  2. **首尾兜底**：有字没收录，退化成「首字同音组 + 中间任意 + 尾字同音组」。
-     *     宽是宽了点（「小什么奇」都算），但总比完全没兜底强。
-     *
-     * ★ 为什么要两条：原来只认「小X高」两字结构，唤醒词换成「小度」时这层直接
-     *   返回 null（条件不成立），换成「小猪佩奇」更是完全没覆盖 —— 实测日志里
-     *   每次启动都是 `唤醒同音兜底正则=null`。
-     */
-    private fun buildFuzzy(words: List<String>): Regex? {
-        val head = HOMOPHONES['小'] ?: "小"
-        val parts = words.mapNotNull { w ->
-            val chars = w.toList()
-            when {
-                chars.size < 2 -> null
-                // ① 逐字都有同音组：最精确
-                chars.all { HOMOPHONES.containsKey(it) } ->
-                    chars.joinToString("") { "[${HOMOPHONES[it]}]" }
-                // ② 有字没收录：首尾兜底，中间允许 0~n 个字
-                else -> {
-                    val tail = HOMOPHONES[chars.last()] ?: return@mapNotNull null
-                    "[$head].{0,${chars.size - 1}}[$tail]"
-                }
-            }
-        }.distinct()
-        return if (parts.isEmpty()) null else Regex(parts.joinToString("|"))
-    }
-
     init {
         try {
             LibVosk.setLogLevel(LogLevel.WARNINGS)
@@ -177,11 +140,10 @@ class VoskWake(modelDir: File, private val wakeWords: List<String>) : WakeWord {
             Dbg.log("vosk 加载失败 ${t.javaClass.simpleName}: ${t.message}")
             ready = false
         }
-        // ★ 诊断日志放在 try 外面，且只打 fuzzy。
-        //   踩过：在 init 块里插值 $expectedPinyin，触发 by lazy 的构造期前向引用，
-        //   抛 NullPointerException 被上面的 catch 抓住 → ready 被打成 false，
+        // ★ 诊断日志放在 try 外面。别在这里插值 expectedPinyin（by lazy）——
+        //   构造期前向引用会抛 NPE 被上面的 catch 抓住 → ready 被打成 false，
         //   唤醒直接失效（日志里能看到「唤醒就绪」紧跟一行「加载失败 NPE」）。
-        runCatching { Dbg.log("唤醒同音兜底正则=$fuzzy") }
+        runCatching { Dbg.log("唤醒匹配策略=ICU 拼音（无手写同音字表）words=$wakeWords") }
     }
 
     /**
@@ -396,8 +358,9 @@ class VoskWake(modelDir: File, private val wakeWords: List<String>) : WakeWord {
             return true
         }
 
-        // ③ 老的同音兜底，只对「小X高」有意义
-        return fuzzy?.containsMatchIn(norm) ?: false
+        // 手写同音字表已删除。同音词的拼音与唤醒词完全相同，
+        // 上面的拼音近似 / 词首丢失 / 片段三层已经覆盖，这里不再补一层正则。
+        return false
     }
 
     /**
@@ -423,10 +386,8 @@ class VoskWake(modelDir: File, private val wakeWords: List<String>) : WakeWord {
             return true
         }
 
-        if (fuzzy?.containsMatchIn(norm) == true) {
-            Dbg.log("严格模式完整同音词命中：「$tail」")
-            return true
-        }
+        // 同音词（「小朱」「晓猪」）的拼音与唤醒词一致，上面 pinyinHit 已覆盖；
+        // 手写同音字表已删除，严格模式保持「宁可不打断，不可误打断」。
         return false
     }
 
@@ -683,38 +644,6 @@ class VoskWake(modelDir: File, private val wakeWords: List<String>) : WakeWord {
         return acc.map { fuzzyPinyin(it) }.distinct()
     }
 
-    /**
-     * 离线兜底转写（实验，2026-11-07）。
-     *
-     * 借鉴 D:/AI/app/asr_minimax.py 的「云端优先、失败降级本地」：隧道 / 欠费 /
-     * 超时时云端 ASR 会返回 null，原来只写一行日志，用户那边一点声音都没有。
-     * 这里复用**已经在内存里的 Vosk 中文小模型**（本来用于唤醒），临时建一个
-     * 独立 Recognizer，把 VAD 切好的整句一次喂完 —— 不引入新模型、不改帧流。
-     *
-     * ★ 准确率有限：小模型自由解码长句容易出碎片。所以默认不走主链路，
-     *   只在云端失败时兜底，或 shadow 模式下并排打日志供真机对比。
-     * ★ 线程：Recognizer 不是线程安全的。调用方必须和 feed / reset 共用同一把
-     *   锁（VoiceEngine 里是 wakeLock），否则 libvosk 内部状态被并发改写会 SIGSEGV。
-     */
-    fun transcribe(pcm: ShortArray): String? {
-        val m = model ?: return null
-        if (!ready || pcm.isEmpty()) return null
-        var r: Recognizer? = null
-        return try {
-            r = Recognizer(m, AudioCapture.SAMPLE_RATE.toFloat())
-            r.acceptWaveForm(pcm, pcm.size)
-            // 整句末尾不一定带静音，result 可能为空，用 partial 兜一层
-            val final = textOf(r.result)
-            val partial = textOf(r.partialResult)
-            final.ifBlank { partial }.trim().takeIf { it.isNotBlank() }
-        } catch (t: Throwable) {
-            Dbg.log("vosk 兜底转写异常 ${t.javaClass.simpleName}: ${t.message}")
-            null
-        } finally {
-            runCatching { r?.close() }
-        }
-    }
-
     override fun reset() {
         runCatching { rec?.reset() }
         framesSinceReset = 0
@@ -803,41 +732,5 @@ class VoskWake(modelDir: File, private val wakeWords: List<String>) : WakeWord {
          */
         const val MAX_EDIT_ERRORS = 3
 
-        /**
-         * 同音字兜底表（归一化后的汉字 → 同音字集合），用于 buildFuzzy()。
-         *
-         * 只收常见字：唤醒词里每个字如果在此表中，就生成逐字精确同音正则；
-         * 有字不在表中时退化成「首字同音 + 中间任意 + 尾字同音」。
-         *
-         * ★ 表是按字收的，不是按词收的——「小猪佩奇」四个字都在表里就走逐字精确，
-         *   不在就退化成兜底。这样加新唤醒词时，只要给新字补一行映射即可。
-         */
-        val HOMOPHONES = mapOf(
-            // 常见首字（xiao）
-            '小' to "小晓笑校萧效消销宵肖想",
-            // 两字唤醒词尾字
-            '度' to "度渡肚杜读毒多夺朵",
-            '高' to "高搞告稿糕",
-            '爱' to "爱艾哎哀",
-            '艺' to "艺义亿易",
-            '明' to "明名鸣",
-            // 小猪佩奇
-            '猪' to "猪朱珠竹",
-            '佩' to "佩配培赔",
-            '奇' to "奇其琪骑",
-            '企' to "企起岂乞气",
-            '鹅' to "鹅额俄厄",
-            // 其他常用字
-            '宝' to "宝保饱堡",
-            '贝' to "贝备背被倍",
-            '天' to "天添田甜",
-            '使' to "使始史矢",
-            '乐' to "乐勒乐",
-            '尼' to "尼泥你拟",
-            '马' to "马玛码妈麻",
-            '叮' to "叮盯钉丁",
-            '当' to "当档党荡",
-            '猫' to "猫毛矛茅"
-        )
     }
 }

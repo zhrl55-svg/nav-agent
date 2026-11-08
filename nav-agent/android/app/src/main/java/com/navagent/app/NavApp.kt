@@ -272,8 +272,7 @@ class NavApp : Application() {
                 "idle=${Prefs.idleTimeoutMs} echo=${Prefs.echoGuardMs} " +
                 "radius=${Prefs.nearbyRadius} log=${Prefs.fileLog} " +
                 "vad=${Prefs.vadSilenceMs} gate=${Prefs.noiseGate} " +
-                "duplex=${Prefs.fullDuplex} shadow=${Prefs.asrShadow} " +
-                "fallback=${Prefs.asrFallbackVosk}"
+                "duplex=${Prefs.fullDuplex} echoGuard=${Prefs.echoGuardEnabled}"
         )
     }
 

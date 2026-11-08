@@ -60,13 +60,16 @@ object Prefs {
     private const val K_VOICEPRINT_BARGE = "voiceprint_barge_in"
     private const val K_VOICEPRINT_BARGE_TH = "voiceprint_barge_threshold"
 
-    /** 实验选项：VAD 断句、噪声门、全双工、ASR 降级对比。全部默认关闭/保守值 */
+    /** 实验选项：VAD 断句、噪声门、全双工、回声保护开关。全部默认关闭/保守值 */
     private const val K_VAD_SILENCE = "vad_silence_ms"
     private const val K_NOISE_GATE = "noise_gate_on"
     private const val K_NOISE_GATE_DB = "noise_gate_db"
-    private const val K_FULL_DUPLEX = "full_duplex_on"
-    private const val K_ASR_FALLBACK_VOSK = "asr_fallback_vosk"
-    private const val K_ASR_SHADOW = "asr_shadow"
+    // ★ 2026-11-07 22:50 改名：旧 key 里存着 true（做实验时开的）。真机实测
+    //   全双工让 VAD 在播报期间持续累积 TTS 音频，切句往往发生在播报结束后，
+    //   护栏按「非重叠」放行，回音被识别成播报原文送进 LLM，形成自问自答。
+    //   改 key 让旧值失效、默认关；想再试必须手动重新打开。
+    private const val K_FULL_DUPLEX = "full_duplex_v2"
+    private const val K_ECHO_GUARD_ON = "echo_guard_on"
     private const val K_TTS_VOICE = "tts_voice"
     private const val K_TTS_CLOUD_MODEL = "tts_cloud_model"
     private const val K_TTS_RATE = "tts_rate"
@@ -227,6 +230,11 @@ object Prefs {
     //
     // 2026-11-07，借鉴桌面 D:/AI 语音链路。凡是会改变拾音/识别行为的，
     // 一律默认关（或保持原来的值），真机验过再决定要不要开。
+    //
+    // 2026-11-07 晚：删掉「断网本地识别兜底」和「ASR 双跑对比」——
+    // 真机 18 句 shadow 实测 Vosk 小模型约 2/3 有错字，长句基本碎，
+    // 「导航去水勘院」被转成「去 是 可以」，断网时拿它兜底会误触发导航。
+    // 相关代码不再保留，别再按旧文档找。
 
     /**
      * VAD 断句：停顿多久算「说完了」。
@@ -264,19 +272,15 @@ object Prefs {
         set(v) = sp.edit().putBoolean(K_FULL_DUPLEX, v).apply()
 
     /**
-     * 云端 ASR 失败时用内存里的 Vosk 小模型兜底。
+     * 播报结束后的回声保护总开关。
      *
-     * ★ 默认关：小模型长句容易出碎片，乱转写触发导航是安全问题。
-     *   先开 asrShadow 跑一段看准确率再决定。
+     * 默认开（保持原有行为）：播报刚结束的外放残响会被 VAD 当成用户说话，
+     * 送 ASR 后常识别出「即将左转」这类播报碎片。关掉后可以紧跟着插话，
+     * 代价是车内混响大时容易自激。时长仍由 [echoGuardMs] 控制。
      */
-    var asrFallbackVosk: Boolean
-        get() = sp.getBoolean(K_ASR_FALLBACK_VOSK, false)
-        set(v) = sp.edit().putBoolean(K_ASR_FALLBACK_VOSK, v).apply()
-
-    /** shadow 模式：本地 Vosk 与云端并排打日志，链路仍走云端。默认关 */
-    var asrShadow: Boolean
-        get() = sp.getBoolean(K_ASR_SHADOW, false)
-        set(v) = sp.edit().putBoolean(K_ASR_SHADOW, v).apply()
+    var echoGuardEnabled: Boolean
+        get() = sp.getBoolean(K_ECHO_GUARD_ON, true)
+        set(v) = sp.edit().putBoolean(K_ECHO_GUARD_ON, v).apply()
 
     // ------------------------------------------------------------ 对话
 

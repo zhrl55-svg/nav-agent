@@ -333,13 +333,17 @@ class SettingsActivity : AppCompatActivity() {
             ) { Prefs.ttsRate = it; applied() }
         }
 
+        rowSwitch(
+            "播报后回声保护", Prefs.echoGuardEnabled,
+            "播报结束后短时屏蔽拾音，防止把自己的播报听成用户说话；关掉可紧跟插话，但车内混响大时容易自激"
+        ) { Prefs.echoGuardEnabled = it; applied() }
         row(
-            "回声保护",
+            "回声保护时长",
             humanDuration(Prefs.echoGuardMs),
-            "只屏蔽播报结束后的回声尾巴，不影响播报中用语音打断"
+            "只在上面开关打开时生效；只屏蔽播报结束后的回声尾巴，不影响播报中用语音打断"
         ) {
             choose(
-                "回声保护", listOf(
+                "回声保护时长", listOf(
                     "0.6 秒" to 600L,
                     "1.0 秒" to 1_000L,
                     "1.5 秒（推荐）" to 1_500L,
@@ -606,16 +610,8 @@ class SettingsActivity : AppCompatActivity() {
         }
         rowSwitch(
             "全双工（实验）", Prefs.fullDuplex,
-            "播报中仍可插话。需开启打断检测并已注册声纹；外放自激风险高，默认关"
+            "实验性：播报中仍切句。真机实测会录进 TTS 回音造成自问自答，默认关，不建议开"
         ) { Prefs.fullDuplex = it; applied() }
-        rowSwitch(
-            "断网本地识别兜底", Prefs.asrFallbackVosk,
-            "云端 ASR 失败时用唤醒用的 Vosk 小模型转写；长句准确率有限，先跑双跑对比"
-        ) { Prefs.asrFallbackVosk = it; applied() }
-        rowSwitch(
-            "ASR 双跑对比", Prefs.asrShadow,
-            "本地 Vosk 与云端结果并排写进日志，链路仍走云端（D:/AI 的 shadow 模式）"
-        ) { Prefs.asrShadow = it; applied() }
         row(
             "ASR 延迟", app.voiceEngineProvider?.invoke()?.asrStats() ?: "服务未启动",
             "p50 / p90 / 成功失败次数，用来看连接复用的效果", chevron = false

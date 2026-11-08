@@ -32,21 +32,46 @@ class MinimaxTts(private val context: Context) : CloudTts {
     @Volatile
     private var currentFile: File? = null
 
+    /**
+     * 播放代数：stop() 一递增，所有在途的合成结果立即作废。
+     *
+     * ★ 2026-11-07 修「打断只暂停一下，AI 又接着播」：speak() 的合成跑在后台
+     *   线程，原来的 stop() 只是 post 一个 stopInternal()，既不取消合成线程、
+     *   也不做校验，于是打断时那条正在合成的语音几百毫秒后照样 play()。
+     */
+    @Volatile
+    private var playGen = 0
+
     override fun speak(text: String, onDone: () -> Unit, onError: (String) -> Unit) {
+        val gen = ++playGen
         Thread {
             val t0 = System.currentTimeMillis()
             val bytes = synth(text)
             if (bytes == null || bytes.isEmpty()) {
+                if (gen != playGen) return@Thread
                 Dbg.log("MiniMax TTS 合成失败")
                 main.post { onError("合成失败") }
                 return@Thread
             }
+            if (gen != playGen) {
+                Dbg.log("MiniMax TTS 合成结果作废 gen=$gen current=$playGen ${bytes.size}B")
+                return@Thread
+            }
             Dbg.log("MiniMax TTS ${bytes.size}B ${System.currentTimeMillis() - t0}ms")
-            main.post { play(bytes, onDone, onError) }
+            main.post {
+                // stop() 可能在这条 post 排队期间发生，播放前再查一次
+                if (gen == playGen) {
+                    play(bytes, onDone, onError)
+                } else {
+                    Dbg.log("MiniMax TTS 播放前作废 gen=$gen current=$playGen")
+                }
+            }
         }.apply { isDaemon = true; name = "mm-tts" }.start()
     }
 
     override fun stop() {
+        // ★ 同步递增：不管合成线程跑到哪一步，回来都会发现代数变了
+        playGen++
         main.post { stopInternal() }
     }
 
