@@ -665,23 +665,7 @@ class MnnLlm(
         val explicit = EXPLICIT_SEARCH.containsMatchIn(t)
         val news = isNewsRequest(t) && !DETAIL_QUESTION.containsMatchIn(t)
         val realtime = REALTIME_WORDS.containsMatchIn(t)
-
-        // ★ 2026-11-09：分类器补漏。
-        //   规则只能覆盖「带关键词」的说法；「张掖最近有什么新鲜事」「这阵子有啥新消息」
-        //   这类全靠语义，正则穷举不完，交给 2MB 的判别器（几十微秒，纯 Kotlin）。
-        //   只在规则全没命中时才问它 —— 规则命中就按规则的来，模型只负责「加」不负责「减」。
-        // ★ 知识类问题不交给分类器：「张掖在哪里」实测 p=0.98 会触发搜索，
-        //   而搜回来只有索引页（「只搜到索引页…其中一条是《张掖市》」），
-        //   比模型自己答「张掖位于甘肃省」还差。这类静态知识不该联网。
-        val staticKnowledge = Regex("在哪里|是哪|是什么|为什么|怎么形成|多远|多高|多大|谁|介绍|区别")
-            .containsMatchIn(t)
-        var byModel = false
-        if (!explicit && !news && !realtime && !staticKnowledge) {
-            val p = IntentGate.pSearch(t)
-            byModel = p >= IntentGate.THRESHOLD
-            if (p >= 0.5f) Dbg.log("意图门 p=${"%.2f".format(p)} → ${if (byModel) "搜索" else "不搜"}「$t」")
-        }
-        if (!explicit && !news && !realtime && !byModel) return null
+        if (!explicit && !news && !realtime) return null
 
         val query = buildQuery(t, news)
         val timeRange = timeRangeOf(t)

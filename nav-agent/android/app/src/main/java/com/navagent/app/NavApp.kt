@@ -256,7 +256,6 @@ class NavApp : Application() {
             memory = memory
         )
 
-        IntentGate.load(this)
         prewarm()
         initVoiceprint()
         runLocalProbe()
