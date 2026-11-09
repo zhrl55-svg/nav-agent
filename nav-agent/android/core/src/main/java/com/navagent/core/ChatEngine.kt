@@ -46,6 +46,14 @@ class ChatEngine(
      *   prompt 必须跟着工具一起变。
      */
     private val webSearchAvailable: () -> Boolean = { true },
+    /**
+     * 是否把「现在是 X 年 X 月 X 日」写进 system prompt。
+     *
+     * ★ 2026-11-09 加。云端模型能正确使用时间；0.6B 会把它当答案复读 ——
+     *   实测问「我今天有点累」，它回「我今天有点累，现在的日期是2026年11月9日…」；
+     *   问「你叫什么名字」，回「2026年11月9日星期一」。本地档关掉这条。
+     */
+    private val injectTime: () -> Boolean = { true },
     /** 明确的本地动作意图可由宿主直接执行，避免不支持工具调用的模型只给文字承诺。 */
     private val interceptAction: (String, List<ChatMessage>) -> String? = { _, _ -> null },
     /**
@@ -390,7 +398,7 @@ class ChatEngine(
         append("你是「${assistantName()}」，一个在车里陪用户说话的语音助手。")
         // ★ 必须注入当前时间。模型只知道自己训练到哪天，不知道"今天"是几号，
         //   问日期、问"明天天气"、说"周六去哪"全都会瞎编。这条不加必然出错。
-        nowText()?.let { append("现在是 ").append(it).append("。") }
+        if (injectTime()) nowText()?.let { append("现在是 ").append(it).append("。") }
         append("用户正在开车，你的回答会被朗读出来，所以：")
         append("1) 口语化，短，一般不超过两句话；不要用列表、不要用 Markdown、不要念表情符号。")
         // ★ 2026-11-05 新增（1b）：把「实时信息必须搜」的信号提前。

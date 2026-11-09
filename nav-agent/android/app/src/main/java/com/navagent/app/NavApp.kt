@@ -244,6 +244,9 @@ class NavApp : Application() {
             onFailure = { msg -> dispatchNotice(msg) },
             // 接本地接口时不给 Tavily（本地服务自带检索），prompt 也要跟着改口
             webSearchAvailable = { Prefs.webSearchEnabled() },
+            // 实测关掉时间注入并不能改善「复读日期」——污染源是历史里上一轮的错误回答，
+            // 不是 system prompt。关掉反而让「现在几点」答不出来，所以保持注入。
+            injectTime = { true },
             interceptAction = ::interceptNavigation,
             // 模型开始念「1、2、3，要哪个」→ 打开选择窗口。
             // 用户这时说「第二个」才能打断播报并当作选择提交（见 VoiceEngine）
@@ -253,6 +256,7 @@ class NavApp : Application() {
             memory = memory
         )
 
+        IntentGate.load(this)
         prewarm()
         initVoiceprint()
         runLocalProbe()

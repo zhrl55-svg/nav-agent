@@ -1,0 +1,9 @@
+{
+  "labels": [
+    "other",
+    "search"
+  ],
+  "buckets": 32768,
+  "dim": 32,
+  "hash": "fnv1a"
+}
