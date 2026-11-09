@@ -340,7 +340,9 @@ class MapSettingsActivity : AppCompatActivity() {
     }
 
     private fun voiceEngineLabel(): String = when (Prefs.ttsEngine) {
-        "" -> "系统默认"
+        "" -> "跟随系统"
+        com.navagent.core.VoiceGuide.HUAWEI_ENGINE -> "华为智慧引擎"
+        com.navagent.core.VoiceGuide.IFLYTEK_ENGINE -> "讯飞"
         com.navagent.core.VoiceGuide.CLOUD_ENGINE -> "云端合成"
         else -> Prefs.ttsEngine.substringAfterLast('.')
     }

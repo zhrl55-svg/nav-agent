@@ -583,6 +583,21 @@ class VoiceGuide(
         /** 特殊「引擎包名」：走 [cloudTts] 云端合成，不是真的 TTS 引擎 */
         const val CLOUD_ENGINE = "cloud"
 
+        /**
+         * 华为智慧引擎（Petal / HwAIEngine）。
+         *
+         * ★ 2026-11-08：这台机器的 `settings get secure tts_default_synth` 返回
+         *   `com.svox.pico`，而**那个包根本没装**（`pm list packages` 查不到）。
+         *   走 `TextToSpeech(context, listener)` 时系统拿这个不存在的包去解析，
+         *   最后靠 TextToSpeechManager 兜底才落到 hiai —— 能用，但纯属运气：
+         *   哪天华为改兜底策略，播报就整条哑掉，而且不报错。
+         *   所以显式指定，别赌系统兜底。
+         */
+        const val HUAWEI_ENGINE = "com.huawei.hiai"
+
+        /** 讯飞语音（音色更"人味"，长句断句比华为松） */
+        const val IFLYTEK_ENGINE = "com.iflytek.speechsuite"
+
         /** 打断后重试 drain 的间隔 */
         const val DRAIN_RETRY_MS = 250L
 
