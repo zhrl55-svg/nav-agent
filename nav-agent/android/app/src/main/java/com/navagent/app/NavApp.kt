@@ -243,7 +243,9 @@ class NavApp : Application() {
             // 不伪装成 AI 的对话气泡 —— 这条不会进对话历史。
             onFailure = { msg -> dispatchNotice(msg) },
             // 接本地接口时不给 Tavily（本地服务自带检索），prompt 也要跟着改口
-            webSearchAvailable = { Prefs.webSearchEnabled() },
+            // ★ 2026-11-09：本地档（进程内 MNN）根本没有工具，告诉它有 web_search
+            //   只会让它对闲聊也回「我查一下」。搜索由宿主规则直接执行，不经过模型。
+            webSearchAvailable = { Prefs.chatEngine != "local" && Prefs.webSearchEnabled() },
             // 实测关掉时间注入并不能改善「复读日期」——污染源是历史里上一轮的错误回答，
             // 不是 system prompt。关掉反而让「现在几点」答不出来，所以保持注入。
             injectTime = { true },
