@@ -47,6 +47,31 @@ class MnnLocalLlm(private val context: Context) {
 
     fun modelDir(): File = File(context.filesDir, "models/mnn-llm")
 
+    /**
+     * 当前模型是否带「思考模式」，需要在 prompt 里加 /no_think 关掉。
+     *
+     * ★ Qwen3 的 jinja 模板里有 `enable_thinking`，但 native 侧不套 jinja，
+     *   于是默认思考：实测一句自我介绍要写 150+ token，23 秒才出结果。
+     *   在用户消息末尾加 `/no_think` 是官方软开关，实测有效（23 秒 → 0.6 秒）。
+     *   空 think 块无效：模型会继续在推理通道里写，只是没打 <think> 标签。
+     */
+    /**
+     * 当前模型是否支持 Qwen3 的 `<tool_call>` 协议。
+     *
+     * 判断依据是 llm_config 的 jinja 模板里有没有 `<tool_call>` ——
+     * Qwen3 系列有，Pocket-0.3B 没有。有模板不代表一定会用，
+     * 但至少协议是通的；0.3B 那种硬塞只会吐乱码。
+     */
+    val supportsToolCalls: Boolean
+        get() = runCatching {
+            File(modelDir(), "llm_config.json").readText().contains("<tool_call>")
+        }.getOrDefault(false)
+
+    val wantsNoThink: Boolean
+        get() = runCatching {
+            File(modelDir(), "llm_config.json").readText().contains("enable_thinking")
+        }.getOrDefault(false)
+
     /** 模型文件是否齐（不加载） */
     fun modelPresent(): Boolean {
         val d = modelDir()
@@ -175,7 +200,10 @@ class MnnLocalLlm(private val context: Context) {
             // 自检时显式套上 Qwen 的 chat 模板。
             // 如果 native 自己不套模板，裸 prompt 会在第一个 token 后立刻遇到
             // 停止条件（实测输出只有「我」一个字）。
-            val templated = "<|im_start|>user\n用一句中文介绍你自己。<|im_end|>\n<|im_start|>assistant\n"
+            // 带思考模式的模型（Qwen3）加 /no_think，否则一句自我介绍要 23 秒
+            val noThink = if (wantsNoThink) "/no_think" else ""
+            val templated = "<|im_start|>user\n用一句中文介绍你自己。$noThink<|im_end|>\n" +
+                "<|im_start|>assistant\n"
             val out = generate(templated)
             Dbg.log("本地LLM 自检完成: ${if (out.isNullOrBlank()) "无输出" else "「$out」"}")
             // 冷机那一次会被 ASR/KWS/声纹的模型加载抢 CPU，等 12 秒再跑一次取稳态值

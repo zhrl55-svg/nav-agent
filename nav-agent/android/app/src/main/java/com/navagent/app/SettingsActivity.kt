@@ -134,7 +134,7 @@ class SettingsActivity : AppCompatActivity() {
         rowSwitch(
             "唤醒应答",
             Prefs.wakeAckVoice,
-            "唤醒后说一句「嗨，我在呢」。你有紧接着的指令时它不会出声，不会盖住你说话"
+            "唤醒后应一声「哎」。你有紧接着的指令时它不会出声，不会盖住你说话"
         ) { Prefs.wakeAckVoice = it; applied() }
 
         rowSwitch("唤醒提示音", Prefs.wakeBeep, "「唤醒应答」关掉、或 TTS 起不来时，退回「嘀」一声") {
@@ -382,15 +382,26 @@ class SettingsActivity : AppCompatActivity() {
             "换引擎会重建合成器，正在播的那句会断"
         ) {
             choose(
+                // ★ 2026-11-08：「系统默认」不再叫「华为智慧引擎」—— 两者不是一回事。
+                //   这台机器的 tts_default_synth 指向没安装的 com.svox.pico，
+                //   「跟随系统」只靠华为兜底才落到 hiai，纯属运气。所以显式列出华为。
                 "播报引擎", listOf(
-                    "系统默认（华为智慧引擎）" to "",
-                    "讯飞语音" to "com.iflytek.speechsuite",
-                    "MiniMax 云端（音色好，需联网）" to "cloud"
+                    "华为智慧引擎（推荐）" to com.navagent.core.VoiceGuide.HUAWEI_ENGINE,
+                    "讯飞语音" to com.navagent.core.VoiceGuide.IFLYTEK_ENGINE,
+                    "跟随系统默认" to "",
+                    "MiniMax 云端（音色好，需联网）" to com.navagent.core.VoiceGuide.CLOUD_ENGINE
                 ), Prefs.ttsEngine
             ) { pkg ->
                 Prefs.ttsEngine = pkg
                 app.voice.setEngine(pkg)
-                toast(if (pkg.isEmpty()) "已切回系统引擎" else "已切到讯飞，下次开口就能听出来")
+                toast(
+                    when (pkg) {
+                        com.navagent.core.VoiceGuide.HUAWEI_ENGINE -> "已切到华为智慧引擎"
+                        com.navagent.core.VoiceGuide.IFLYTEK_ENGINE -> "已切到讯飞，下次开口就能听出来"
+                        com.navagent.core.VoiceGuide.CLOUD_ENGINE -> "已切到云端合成，需要联网"
+                        else -> "已改为跟随系统默认引擎"
+                    }
+                )
                 render()
                 // TTS 初始化是异步的，等一会儿再刷一次，让这里显示真实连上的引擎
                 // （引擎起不来会自动回退，回退结果只有 onInit 之后才知道）
@@ -504,7 +515,10 @@ class SettingsActivity : AppCompatActivity() {
                 chevron = false
             ) {}
         } else {
-            row("服务商", providerLabel(), "换一家会同时改接口地址和模型名，之后可以再手动改") {
+            // ★ 2026-11-09：用户反馈「云端两个配置容易混」。
+            //   原来这里只显示「Minis 本地网关」，看不出实际请求打到哪里。
+            //   现在把生效的地址和模型直接写在摘要里，缺 Key 也标出来。
+            row("服务商", providerSummary(), "换一家会同时改接口地址和模型名，之后可以再手动改") {
                 choose(
                     "对话大脑服务商", listOf(
                         "Minis 本地网关（默认）" to Prefs.PROVIDER_MINIS,
@@ -589,6 +603,18 @@ class SettingsActivity : AppCompatActivity() {
             }
         }
 
+        // 本地模型的工具调用：默认关。实测 Qwen3-0.6B 在 P40 上不按协议输出，
+        // 而且带工具后 prompt 从 258 → 725 token，首字 0.2s → 7~18s。
+        if (Prefs.chatEngine == "local") {
+            rowSwitch(
+                "本地工具调用", Prefs.localToolsEnabled,
+                "只有支持工具协议的本地模型（Qwen3 系）才生效；实测 0.6B 调不动且首字涨到 7s+，默认关"
+            ) {
+                Prefs.localToolsEnabled = it
+                applied()
+            }
+        }
+
         row("回复长度", humanTokens(Prefs.maxTokens), "单条回复最多多少 token") {
             choose(
                 "回复长度", listOf(
@@ -600,12 +626,16 @@ class SettingsActivity : AppCompatActivity() {
             ) { Prefs.maxTokens = it; applied() }
         }
 
-        row("上下文轮数", "${Prefs.historyTurns} 轮", "每次携带多少轮最近对话；本地长期偏好不受这个数字影响") {
+        row(
+            "上下文轮数", "${Prefs.historyTurns} 轮",
+            "每次携带多少轮最近对话。云端照此执行；本地最多 8 轮，且每轮都会增加首字延迟"
+        ) {
             choose(
                 "上下文轮数", listOf(
+                    "2 轮（最快）" to 2,
+                    "3 轮" to 3,
                     "4 轮" to 4,
-                    "8 轮（推荐）" to 8,
-                    "16 轮" to 16
+                    "8 轮（推荐）" to 8
                 ), Prefs.historyTurns
             ) { Prefs.historyTurns = it; applied() }
         }
@@ -1277,6 +1307,16 @@ class SettingsActivity : AppCompatActivity() {
 
     // ---------------------------------------------------------------- 对话大脑
 
+    /** 服务商 + 实际生效的地址和模型，避免「选了一家、打的是另一家」 */
+    private fun providerSummary(): String {
+        val base = Prefs.chatBaseRaw.ifBlank {
+            if (Prefs.chatProvider == Prefs.PROVIDER_MINIMAX) Prefs.voiceBaseRaw.ifBlank { "api.minimaxi.com" }
+            else Prefs.MINIS_BASE_URL
+        }
+        val keyState = if (Prefs.chatKeyRaw.isBlank()) "无 Key" else "已配 Key"
+        return "${providerLabel()} · ${base.replace("https://", "")} · ${Prefs.chatModel} · $keyState"
+    }
+
     private fun providerLabel(): String = when (Prefs.chatProvider) {
         Prefs.PROVIDER_MINIS -> "Minis 本地网关（默认）"
         Prefs.PROVIDER_LOCAL -> if (Prefs.chatEndpointIsLocal()) "本地 / 局域网" else "自定义地址"
@@ -1449,9 +1489,9 @@ class SettingsActivity : AppCompatActivity() {
     private fun engineLabel(): String {
         val actual = app.voice.activeEngine
         val name = when (actual) {
-            "com.iflytek.speechsuite" -> "讯飞"
-            "com.huawei.hiai" -> "华为（系统）"
-            "cloud" -> "MiniMax 云端"
+            com.navagent.core.VoiceGuide.IFLYTEK_ENGINE -> "讯飞"
+            com.navagent.core.VoiceGuide.HUAWEI_ENGINE -> "华为智慧引擎"
+            com.navagent.core.VoiceGuide.CLOUD_ENGINE -> "MiniMax 云端"
             "" -> "初始化中…"
             else -> actual
         }

@@ -34,6 +34,16 @@ object Prefs {
     /** 唤醒应答：唤醒后用人声说一句，替代嘀声 */
     private const val K_WAKE_ACK = "wake_ack_voice"
 
+    /**
+     * 本地模型是否启用工具调用（当前只接 web_search）。
+     *
+     * ★ 默认关。实测 Qwen3-0.6B 在 P40 上：带工具后 prompt 从 258 → 725 token，
+     *   首字从 0.2s 涨到 7–18s，而模型仍然不按协议输出 JSON，一次都没调成。
+     *   接线是通的（工具块、解析、执行都验证过），是模型能力和成本不划算。
+     *   留着这个开关，换更强的本地模型时可以再试。
+     */
+    private const val K_LOCAL_TOOLS = "local_tools_enabled"
+
     /** 对话后端：auto / cloud / local，见 [LlmRouter] */
     private const val K_CHAT_ENGINE = "chat_engine"
 
@@ -65,6 +75,9 @@ object Prefs {
     private const val K_IDLE_TIMEOUT = "idle_timeout_ms"
     private const val K_ECHO_GUARD = "echo_guard_ms"
     private const val K_TTS_ENGINE = "tts_engine"
+
+    /** 「TTS 引擎改成显式华为」的迁移标记，只跑一次 */
+    private const val K_TTS_ENGINE_MIGRATED = "tts_engine_explicit_hiai"
     private const val K_BARGE_IN = "barge_in"
     private const val K_BARGE_IN_OWNER = "barge_in_owner_voice"
     private const val K_BARGE_WORDS = "barge_stop_words"
@@ -143,6 +156,7 @@ object Prefs {
         if (::sp.isInitialized) return
         sp = ctx.applicationContext.getSharedPreferences(FILE, Context.MODE_PRIVATE)
         migrateLegacyMinisProvider()
+        migrateTtsEngineToHuawei()
     }
 
     /**
@@ -158,6 +172,22 @@ object Prefs {
         val editor = sp.edit().putBoolean(K_MINIS_PROVIDER_MIGRATED, true)
         if (provider == PROVIDER_LOCAL && base == MINIS_BASE_URL && model == MINIS_CHAT_MODEL) {
             editor.putString(K_CHAT_PROVIDER, PROVIDER_MINIS)
+        }
+        editor.apply()
+    }
+
+    /**
+     * 把历史遗留的「空串 = 跟随系统」升级成显式华为引擎。
+     *
+     * 只认「从没被显式改过」这一种情况：老版本的默认值就是空串，
+     * 所以空串几乎必然等价于「没选过」。用户后来手动选了「跟随系统」时，
+     * 迁移标记已经写进去了，不会再被改。
+     */
+    private fun migrateTtsEngineToHuawei() {
+        if (sp.getBoolean(K_TTS_ENGINE_MIGRATED, false)) return
+        val editor = sp.edit().putBoolean(K_TTS_ENGINE_MIGRATED, true)
+        if (!sp.contains(K_TTS_ENGINE) || sp.getString(K_TTS_ENGINE, "").orEmpty().isBlank()) {
+            editor.putString(K_TTS_ENGINE, com.navagent.core.VoiceGuide.HUAWEI_ENGINE)
         }
         editor.apply()
     }
@@ -193,7 +223,7 @@ object Prefs {
      * 对话后端：`cloud`（MiniMax，工具全可用）/ `local`（进程内 0.3B，纯聊天）。
      * 默认 cloud —— 新装机和回滚都是旧行为。
      */
-    /** 唤醒应答：true=说「嗨，我在呢」，false=只嘀一声 */
+    /** 唤醒应答：true=说一声「哎」，false=只嘀一声 */
     var wakeAckVoice: Boolean
         get() = sp.getBoolean(K_WAKE_ACK, true)
         set(v) = sp.edit().putBoolean(K_WAKE_ACK, v).apply()
@@ -205,6 +235,11 @@ object Prefs {
      *   不再等于「导航不好使」，自动切换的代价小到可以接受。
      *   想要固定行为就在设置里锁 cloud 或 local。
      */
+    /** 本地工具调用：默认关，见 [K_LOCAL_TOOLS] 的说明 */
+    var localToolsEnabled: Boolean
+        get() = sp.getBoolean(K_LOCAL_TOOLS, false)
+        set(v) = sp.edit().putBoolean(K_LOCAL_TOOLS, v).apply()
+
     var chatEngine: String
         get() = sp.getString(K_CHAT_ENGINE, "auto").orEmpty().ifBlank { "auto" }
         set(v) = sp.edit().putString(K_CHAT_ENGINE, v.trim()).apply()
@@ -652,13 +687,23 @@ object Prefs {
         set(v) = sp.edit().putFloat(K_VOICEPRINT_BARGE_TH, v.coerceIn(0.15f, 0.6f)).apply()
 
     /**
-     * TTS 引擎包名。空串 = 系统默认。
+     * TTS 引擎包名。
      *
-     * 这台华为上默认是 `com.huawei.hiai`，另一个可用的是 `com.iflytek.speechsuite`。
+     * - `com.huawei.hiai`      华为智慧引擎（**默认**）
+     * - `com.iflytek.speechsuite` 讯飞
+     * - `cloud`                MiniMax 云端合成
+     * - `""`                   跟随系统默认
+     *
+     * ★ 2026-11-08 默认从「跟随系统」改成显式 hiai。原因见
+     *   [com.navagent.core.VoiceGuide.HUAWEI_ENGINE] 的注释：这台机器的
+     *   `tts_default_synth` 指向一个没安装的 com.svox.pico，跟随系统只是靠华为
+     *   兜底才没出事。显式指定才可预测。
+     *
      * 改完要 `VoiceGuide.setEngine()` 重建实例才生效。
      */
     var ttsEngine: String
-        get() = sp.getString(K_TTS_ENGINE, "").orEmpty()
+        get() = sp.getString(K_TTS_ENGINE, com.navagent.core.VoiceGuide.HUAWEI_ENGINE)
+            .orEmpty()
         set(v) = sp.edit().putString(K_TTS_ENGINE, v.trim()).apply()
 
     /** 云端合成的音色 id（MiniMax voice_id） */

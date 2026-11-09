@@ -223,7 +223,12 @@ class OpenAiLlm(
             put(JSONObject().put("role", "system").put("content", system))
             // 只带最近 N 轮，控制 token；开车闲聊不需要长上下文。
             // N 在设置页可调：对话模型记性差就调大，嫌慢就调小。
-            history.takeLast(Prefs.historyTurns * 2).forEach {
+            // ★ takeLast(N*2) 有可能从一条 assistant 开始（历史长度是奇数时），
+            //   那种「开头就是 assistant」的消息列表有些服务商会直接 400 或让模型错乱。
+            //   丢到第一条 user 为止，保证窗口以用户提问开头。
+            val window = history.takeLast(Prefs.historyTurns.coerceAtLeast(1) * 2)
+            val aligned = if (window.firstOrNull()?.role == ChatMessage.Role.ASSISTANT) window.drop(1) else window
+            aligned.forEach {
                 put(
                     JSONObject()
                         .put("role", if (it.role == ChatMessage.Role.USER) "user" else "assistant")

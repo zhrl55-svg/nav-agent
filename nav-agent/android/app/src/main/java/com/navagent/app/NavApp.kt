@@ -172,35 +172,43 @@ class NavApp : Application() {
         )
         navigationTool = navTool
 
+        // 工具清单只建一次：云端全用，本地只用 web_search（见 MnnLlm.activeTools）
+        // 天气工具留一个引用：本地档没有工具层，规则命中时直接调它
+        val weather = WeatherTool { nav?.currentCity }
+        weatherTool = weather
+
+        val nearby = NearbyTool(
+            context = this,
+            location = { nav?.currentLocation() },
+            route = { nav?.remainingRoutePoints() },
+            radius = { Prefs.nearbyRadius },
+            onResult = {
+                // 模型搜完之后用户只说「去这家」，navigate 工具能拿它兜底
+                lastNearby = it
+                lastNearbyAt = System.currentTimeMillis()
+            }
+        )
+        nearbyToolRef = nearby
+
+        val toolList = listOf(
+            navTool,
+            weather,
+            nearby,
+            WebSearchTool { Prefs.tavilyKey },
+            // 需要 Context：WebView 兜底要在本机浏览器内核里渲染页面
+            WebExtractTool(this) { Prefs.tavilyKey }
+        )
+
         chat = ChatEngine(
             // 模型原生 Function Calling 优先；明确的出发指令另有本地兜底，
             // 避免不支持工具调用的本地模型只说「好的」却不执行。
             // ★ 2026-11-08：两档路由。cloud = MiniMax（工具全可用，默认）；
-            //   local = 进程内 MNN 0.3B（纯聊天，无 Function Calling）。
-            //   本地模型走同一个进程，不依赖 MNN Chat 那套 HTTP 服务。
+            //   local = 进程内 MNN（Qwen3 支持 <tool_call>，0.3B 不支持会自动跳过）。
             llm = LlmRouter(
                 context = this,
-                cloud = OpenAiLlm(
-                    tools = listOf(
-                    navTool,
-                    WeatherTool { nav?.currentCity },
-                    NearbyTool(
-                        context = this,
-                        location = { nav?.currentLocation() },
-                        route = { nav?.remainingRoutePoints() },
-                        radius = { Prefs.nearbyRadius },
-                        onResult = {
-                            // 模型搜完之后用户只说「去这家」，navigate 工具能拿它兜底
-                            lastNearby = it
-                            lastNearbyAt = System.currentTimeMillis()
-                        }
-                    ),
-                    WebSearchTool { Prefs.tavilyKey },
-                    // 需要 Context：WebView 兜底要在本机浏览器内核里渲染页面
-                    WebExtractTool(this) { Prefs.tavilyKey }
-                    )
-                ),
-                local = MnnLlm(MnnLocalLlm.get(this)),
+                cloud = OpenAiLlm(tools = toolList),
+                // 本地也把工具传进去：Qwen3 模板支持 <tool_call>，0.3B 不支持会自动跳过
+                local = MnnLlm(MnnLocalLlm.get(this), toolList),
                 // 自动档换后端必须让用户知道，不能静默降级
                 onModeChanged = { cloudMode ->
                     android.os.Handler(android.os.Looper.getMainLooper()).post {
@@ -572,8 +580,111 @@ class NavApp : Application() {
      * 本地兜底：OpenAI 兼容接口声明了 tools，但部分模型仍只返回文字。
      * 对明确的导航命令，或对「要不要去 X」的肯定答复，直接复用同一个导航工具执行。
      */
+    /**
+     * 把「附近的加油站：\n- 中石化，350米\n- …」压成一句能念的话。
+     *
+     * 工具返回是给模型看的列表，逐条念要十几秒；开车只要「有几家、最近哪家」。
+     */
+    private fun compactNearby(keyword: String, raw: String): String {
+        val items = raw.lines().map { it.trim() }
+            .filter { it.startsWith("- ") }
+            .map { it.removePrefix("- ") }
+            .take(3)
+        if (items.isEmpty()) return raw.replace("\n", "；").take(80)
+        val head = if (raw.contains("沿途")) "沿途找到${items.size}个$keyword：" else "附近找到${items.size}个$keyword："
+        return head + items.joinToString("；")
+    }
+
+    /** 天气工具实例：规则层直接调，不走模型 */
+    private var weatherTool: WeatherTool? = null
+
+    /** 周边查询工具（高德 POI）：本地档没有工具层，规则命中时直接调 */
+    private var nearbyToolRef: NearbyTool? = null
+
     private fun interceptNavigation(text: String, history: List<com.navagent.core.ChatMessage>): String? {
         val normalized = text.trim().lowercase()
+
+        // ★ 2026-11-09：休眠/别打扰也走规则。
+        //   本地档没有工具能力，说「你休息吧」只会得到一句聊天话术，人还在听。
+        //   放在最前面：用户要静音，优先级高于一切。
+        //   只认明确指向助手本人的说法，避免「找个服务区休息」被误判。
+        if (Regex("(你|你先|你先去)?(休息吧|休息一下|睡吧|休眠|退下)|(别|不要|不用)打扰|(别|不要)烦我|安静点")
+                .containsMatchIn(normalized) &&
+            !Regex("(服务区|导航|去|到|找)").containsMatchIn(normalized)
+        ) {
+            Dbg.log("休眠（规则命中）")
+            runCatching { toolSleep() }
+            return "好，我先休息。要找我喊「${Prefs.aiName}」。"
+        }
+
+        // ★ 2026-11-09：周边查询也走规则（高德 POI）。
+        //   本地模型调不了 search_nearby，问「附近有加油站吗」只会瞎答。
+        //   带「导航/去/到/带我」的是导航意图，交给后面的导航规则，别抢。
+        val nearbyHit = Regex("附近|周边|周围|旁边|跟前|最近的|哪有").containsMatchIn(normalized) ||
+            Regex("沿途|顺路|路上").containsMatchIn(normalized)
+        if (nearbyHit && !Regex("(导航|带我|前往|开到)|^(去|到|回)").containsMatchIn(normalized)) {
+            val scope = if (Regex("沿途|顺路|路上").containsMatchIn(normalized)) "route" else "current"
+            val keyword = text
+                .replace(Regex("(附近|周边|周围|旁边|跟前|最近的|哪有|沿途|顺路|路上)"), "")
+                .replace(Regex("(有没有|有|帮我|找|搜|查|看看|一下|的|吗|呢|啊|呀)"), "")
+                .trim(' ', '，', '。', '？', '！', ',', '?', '!')
+            if (keyword.isNotBlank()) {
+                val out = runCatching {
+                    nearbyToolRef?.execute(
+                        org.json.JSONObject().put("keyword", keyword).put("scope", scope).toString()
+                    )
+                }.getOrNull()
+                if (!out.isNullOrBlank()) {
+                    Dbg.log("周边查询（规则命中）keyword=$keyword scope=$scope chars=${out.length}")
+                    return compactNearby(keyword, out)
+                }
+            }
+        }
+
+        // ★ 2026-11-09：天气也走规则。
+        //   本地模型不知道天气，问它就答「我还不了解」；云端靠模型调 get_weather，
+        //   本地没工具层，所以这里直接调工具把结果念出来。
+        // 开头就是「去/到」的当导航意图，别被「天气广场」这种地名骗走
+        if (!Regex("^(去|到|回)|(导航|带我|前往|开到)").containsMatchIn(normalized) &&
+            Regex("天气|气温|多少度|下雨|有雨|雨吗|下雪|带伞|冷不冷|热不热|穿什么").containsMatchIn(normalized)
+        ) {
+            val city = Regex("([\\u4e00-\\u9fa5]{2,8}?)的?天气").findAll(text)
+                .map { it.groupValues[1] }
+                .lastOrNull()
+                ?.replace(Regex("^(今天|明天|后天|现在|那|请问|查一下|查查|看看|帮我)+"), "")
+                ?.replace(Regex("(今天|明天|后天|现在)$"), "")
+                ?.trim()
+            fun query(c: String?): String? {
+                val args = if (c.isNullOrBlank()) "{}" else org.json.JSONObject().put("city", c).toString()
+                return runCatching { weatherTool?.execute(args) }.getOrNull()
+            }
+            var out = query(city)
+            // ★ 高德对「景泰县」查不到、对「景泰」有数据（日志 11:41 实测）。
+            //   带行政区后缀查空时，去掉后缀再试一次。
+            if (out != null && out.contains("查不到") && city != null &&
+                Regex("(县|市|区|旗|盟|自治县|自治州)$").containsMatchIn(city)
+            ) {
+                val bare = city.replace(Regex("(自治县|自治州|县|市|区|旗|盟)$"), "")
+                if (bare.isNotBlank() && bare != city) {
+                    val retry = query(bare)
+                    if (retry != null && !retry.contains("查不到")) {
+                        Dbg.log("天气：$city 查不到，改用 $bare 成功")
+                        out = retry
+                    }
+                }
+            }
+            if (!out.isNullOrBlank()) {
+                // 工具返回的是给模型看的：实况 + 未来 4 天，直接念要十几秒。
+                // 只留「实况 + 今天」，并去掉「（xx 更新）」这种括注。
+                val compact = out.lines().map { it.trim() }.filter { it.isNotEmpty() }
+                    .take(2)
+                    .joinToString("；")
+                    .replace(Regex("（[^）]*）"), "")
+                    .trim()
+                Dbg.log("天气（规则命中）city=${city ?: "当前城市"} chars=${compact.length}")
+                return compact.ifBlank { out }
+            }
+        }
 
         // ★ 2026-11-08：停止/结束导航也走规则。
         //   原来只有模型能调 action=stop，本地档没有工具能力 ——
@@ -921,6 +1032,13 @@ class NavApp : Application() {
                 )
             }
             destination = cleanDest
+            // ★ 2026-11-09：从聊天页发起导航时，人还停在聊天页，得手动点「导航」才看得到路线。
+            //   算路成功后把导航页提到前台（SINGLE_TOP + REORDER_TO_FRONT，不会重建页面）。
+            //   已经在导航页时这个调用等于空操作。
+            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                // 用户要求「隐藏聊天页」而不是销毁：把它压到导航页后面，返回键还能回来
+                if (!ChatActivity.hideIfOpen()) runCatching { openNavPage() }
+            }
             val prefix =
                 if (attempt.status == NavigationAttempt.Status.REROUTED) "已改道去" else "已开始导航去"
             NavigationToolResult(
@@ -1176,8 +1294,19 @@ class NavApp : Application() {
 
     /** 首页「导航」按钮：导航页若仍在任务栈就直接带回前台，否则新建地图页。 */
     fun openNavPage() {
+        // ★ 2026-11-09：加了 CLEAR_TOP。
+        //   只加 REORDER_TO_FRONT 时，聊天页压在导航页上面，实测不会跳 ——
+        //   用户说「导航没有跳转」，日志里导航确实启动了（HUD 已恢复），
+        //   只是画面还停在聊天页。CLEAR_TOP + SINGLE_TOP 会把聊天页结束掉，
+        //   把导航页带回前台；已经在导航页时等于空操作。
         val intent = Intent(this, NavActivity::class.java)
-            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+            .addFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK or
+                    Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                    Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                    Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
+            )
+        Dbg.log("打开导航页（CLEAR_TOP）")
         startActivity(intent)
     }
 

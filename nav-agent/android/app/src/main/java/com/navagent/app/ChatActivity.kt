@@ -51,6 +51,7 @@ class ChatActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        current = java.lang.ref.WeakReference(this)
         setContentView(R.layout.activity_chat)
 
         recycler = findViewById(R.id.messages)
@@ -207,7 +208,9 @@ class ChatActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
                 adapter.items[adapter.itemCount - 1] = last.copy(text = last.text + text)
                 adapter.notifyItemChanged(adapter.itemCount - 1)
             } else {
-                adapter.items += ChatMessage(ChatMessage.Role.ASSISTANT, text)
+                // 模型首块常常就是 "\n" 或 "\n\n"：直接建气泡会先看到一行空白
+                if (text.isBlank()) return@runOnUiThread
+                adapter.items += ChatMessage(ChatMessage.Role.ASSISTANT, text.trimStart())
                 adapter.streaming = true
                 adapter.notifyItemInserted(adapter.itemCount - 1)
             }
@@ -350,8 +353,43 @@ class ChatActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
     /** TTS 播报状态订阅的注销函数 */
     private var speakingListener: (() -> Unit)? = null
 
-    private companion object {
-        const val EXTRA_SAY = "say"
+    // 不能是 private：NavApp 要用 finishIfOpen() 把聊天页关掉切回地图
+    companion object {
+        private const val EXTRA_SAY = "say"
+
+        /**
+         * 当前活着的聊天页。
+         *
+         * ★ 2026-11-09：导航开始后要把画面切回地图。
+         *   试过 startActivity(NavActivity + CLEAR_TOP/REORDER_TO_FRONT)，日志显示调用了，
+         *   但画面不动 —— 从 Application context 起 Activity 时这些 flag 不一定按预期生效。
+         *   直接 finish 聊天页最确定：导航页就在它下面，结束掉自然露出来。
+         */
+        @Volatile
+        var current: java.lang.ref.WeakReference<ChatActivity>? = null
+
+        /**
+         * 把聊天页藏到导航页后面（不销毁）。
+         *
+         * ★ 2026-11-09 用户要求：切回导航时「隐藏聊天页」，不要销毁。
+         *   关键是**用自己的 Context 起 Activity**：从 Application 起时
+         *   REORDER_TO_FRONT / CLEAR_TOP 实测不生效（日志调了、画面不动）。
+         *   用 Activity 自己的 Context，导航页会被提到前面，聊天页留在栈里，
+         *   按返回键还能回到对话。
+         */
+        fun hideIfOpen(): Boolean {
+            val a = current?.get() ?: return false
+            return runCatching {
+                a.startActivity(
+                    android.content.Intent(a, NavActivity::class.java)
+                        .addFlags(
+                            android.content.Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or
+                                android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP
+                        )
+                )
+                true
+            }.getOrDefault(false)
+        }
     }
 
     // ---------------------------------------------------------------- 列表

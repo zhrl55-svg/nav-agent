@@ -688,3 +688,47 @@ decode     78 t/s    (59 token / 753ms)
 ```
 
 冷启动第一句约 2.1 秒（模型加载 1.8 秒 + 首字 1.9 秒），之后稳定在 1.4–1.6 秒。
+
+## 本地对话模型换成 Qwen3-0.6B 自导 4bit（2026-11-09）
+
+原来 Mnn-Pocket-0.3B 速度好（78 t/s）但太弱：复读用户的话、回答敷衍。
+试过 MiniCPM4-0.5B / Hunyuan-0.5B / ERNIE-0.3B / 官方 Qwen3-0.6B-MNN，
+在麒麟 990 上 decode 全部只有 4.5–10 t/s，一次回答 5–38 秒，全部淘汰。
+
+根因不是「模型大」，是**量化位宽 + 运行时版本**：
+
+```
+0.3B 的 llm_config: quant_bit=4
+官方 Qwen3-0.6B-MNN: quant_bit=8  → 451MB、7.6 t/s
+```
+
+于是用同一份 MNN 源码（3.6.x）自己重新导出 4bit：451MB → 321MB。
+完整命令、坑和产物见 `D:/workbuddy/2026-11-08-09-32-35/qwen3-0.6b-mnn-4bit/README.md`。
+
+### 工程侧改动
+
+- `jniLibs/arm64-v8a/libMNN.so` → 换成同版本源码交叉编译的 5MB 版本
+  （**必须一起换**：旧运行时加载新权重会在 `MNN::Transformer::Llm::load()` 里 SIGSEGV）
+- `MnnLocalLlm.wantsNoThink` → 读 `llm_config.json` 是否含 `enable_thinking`
+- `MnnLlm.buildPrompt` → 对带思考模式的模型，在最后一条用户消息末尾加 `/no_think`
+  （0.3B 不加，回滚模型时不用改代码）
+
+### 实测（P40 / 麒麟 990）
+
+| | 官方 8bit | 自导 4bit + /no_think | 原 0.3B |
+|---|---|---|---|
+| 首字（稳态） | 1236ms | 218ms | 155ms |
+| decode | 7.6 t/s | 57 t/s | 90 t/s |
+| 一句自我介绍 | 23.5s | 607ms | 962ms |
+| 真实对话 | — | 2533ms「我在车上哦～」 | 1597ms「已确认路线，交通信息更新中」 |
+
+**decode 提速 7.5 倍**，且 Qwen3 中文分词更省（同句 23 token vs 0.3B 的 69 token），
+短回答反而更快；质量也从「敷衍/复读」变成自然得体。
+
+### ★ 关于「崩溃是不是手机杀进程」
+
+不是。两次都在 `mnn-selftest` 线程上 `SIGSEGV / SEGV_ACCERR`，
+栈顶 `__memcpy → libMNN.so → MNN::Transformer::Llm::load()`。
+当时可用内存 2.2GB，events 日志里没有 lmk/am_kill。
+把导出降级成 `--disable_transformer_c4`（迁就旧运行时）**照样崩**，
+所以正解是换运行时，不是改导出参数。

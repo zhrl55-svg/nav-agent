@@ -1541,7 +1541,8 @@ class VoiceEngine(private val context: Context) {
         const val WAKE_BEEP_MS = 90
 
         /** 唤醒应答的台词。改这句只影响「嘀声被替换掉」的那条反馈 */
-        const val WAKE_ACK_TEXT = "嗨"
+        // 2026-11-09 用户要求：唤醒应答改成「哎」—— 比「嗨」更像被叫到时的应答
+        const val WAKE_ACK_TEXT = "哎"
 
         /**
          * 唤醒后等多久再应答。
