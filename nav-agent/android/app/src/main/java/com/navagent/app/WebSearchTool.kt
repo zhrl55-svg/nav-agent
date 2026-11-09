@@ -113,13 +113,20 @@ class WebSearchTool(private val apiKey: () -> String) : LlmTool {
         val payload = JSONObject()
             .put("query", query)
             .put("topic", topic)
-            .put("search_depth", "advanced")
+            // ★ 2026-11-09 实测（PC 直连 API，同一查询同一时间）：
+            //   advanced 6.1s / basic 2.3s，**返回内容完全一样**（逐条比对 content 长度相同）。
+            //   原来的注释说 basic 只回几十字，那是旧版 Tavily 的行为，现在不成立了。
+            //   手机上这个差异更明显：advanced 8.1s → basic 约 3s。
+            .put("search_depth", "basic")
             .put("max_results", if (isNews) 6 else 5)
             // 新闻不要 Tavily 的自动摘要：中文查询它常回英文，模型还会照着念
             .put("include_answer", !isNews)
             .put("include_published_date", true)
-            // ★ 拿真正文：content 有时只是几十字摘要，raw_content 才是网页正文
-            .put("include_raw_content", "markdown")
+            // ★ 2026-11-09：不再要 raw_content。
+            //   实测它才是耗时大头：带 raw_content 时 basic 也要 5.2s（要逐篇抓页面），
+            //   去掉后 2.3s。而 content 本身每条就有 1000~2400 字，够模型总结；
+            //   真需要正文时还有 web_extract 这一步单独读。
+            .put("include_raw_content", false)
             // ★ 排除境外敏感媒体。实测搜「国内新闻 今天」返回新唐人电视台的
             //   「古宁大头捷 77 年」「反共战场」—— 模型按 prompt 不该展开这类内容，
             //   结果直接卡死输出 0 字。在工具层就把这些源挡掉，别让模型看见。
@@ -145,9 +152,10 @@ class WebSearchTool(private val apiKey: () -> String) : LlmTool {
             val t0 = System.currentTimeMillis()
             conn = (URL(ENDPOINT).openConnection() as HttpURLConnection).apply {
                 requestMethod = "POST"
-                connectTimeout = 8_000
-                // 新闻用 advanced，服务端要抓正文，给足时间
-                readTimeout = if (isNews) 22_000 else 15_000
+                connectTimeout = 6_000
+                // 不再抓 raw_content 后服务端 2~3 秒就回；给 10/8 秒足够，
+                // 卡住就到点降级到国内引擎，不要拖住整轮对话
+                readTimeout = if (isNews) 10_000 else 8_000
                 doOutput = true
                 setRequestProperty("Content-Type", "application/json")
                 setRequestProperty("Authorization", "Bearer $key")
