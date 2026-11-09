@@ -195,6 +195,7 @@ class ChatActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
 
     override fun onUser(text: String) {
         runOnUiThread {
+            adapter.streaming = false
             adapter.items += ChatMessage(ChatMessage.Role.USER, text)
             adapter.notifyItemInserted(adapter.itemCount - 1)
             scrollToBottom()
@@ -220,12 +221,18 @@ class ChatActivity : AppCompatActivity(), NavApp.ChatUi, NavApp.VoiceUi {
 
     override fun onAssistantDone(full: String) {
         runOnUiThread {
-            adapter.streaming = false
-            if (adapter.itemCount > 0) {
-                val i = adapter.itemCount - 1
-                adapter.items[i] = adapter.items[i].copy(text = full)
-                adapter.notifyItemChanged(i)
+            val lastIndex = adapter.items.lastIndex
+            val last = adapter.items.lastOrNull()
+            if (adapter.streaming && last?.role == ChatMessage.Role.ASSISTANT) {
+                adapter.items[lastIndex] = last.copy(text = full)
+                adapter.notifyItemChanged(lastIndex)
+            } else if (full.isNotBlank()) {
+                // 思考模式会关闭增量回调，规则搜索也可能直接返回；这两种情况都没有
+                // 预先创建助手气泡，必须追加新消息，不能覆盖最后一条用户消息。
+                adapter.items += ChatMessage(ChatMessage.Role.ASSISTANT, full)
+                adapter.notifyItemInserted(adapter.itemCount - 1)
             }
+            adapter.streaming = false
             scrollToBottom()
         }
     }

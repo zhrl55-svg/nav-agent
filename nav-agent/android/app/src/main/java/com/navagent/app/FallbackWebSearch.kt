@@ -65,16 +65,104 @@ object FallbackWebSearch {
     fun search(query: String, limit: Int = 6): Result? {
         val q = query.trim()
         if (q.isEmpty()) return null
+        val keywords = queryKeywords(q)
+        val collected = LinkedHashMap<String, Item>()
+        var selectedEngine = ""
         for (engine in ENGINES) {
             val items = runCatching { engine.fetch(q, limit) }
                 .getOrElse {
                     Dbg.log("降级搜索 ${engine.name} 异常：${it.message}")
                     emptyList()
                 }
-            Dbg.log("降级搜索 ${engine.name} → ${items.size} 条")
-            if (items.isNotEmpty()) return Result(engine.name, items)
+            val relevant = items.filter { isUseful(it, keywords) }
+            Dbg.log("降级搜索 ${engine.name} → ${items.size} 条，可用 ${relevant.size}")
+            if (relevant.isNotEmpty()) {
+                if (selectedEngine.isEmpty()) selectedEngine = engine.name
+                relevant.forEach { collected.putIfAbsent(it.title.lowercase(), it) }
+            }
+            // ★ 2026-11-09：够数还不够，得**有摘要**才能提前收工。
+            //   实测搜狗只回标题（h3 里没有摘要块），拿到 3 条标题就走，
+            //   端侧念出来只剩「查到一条：张掖限行 时间规定2026」——
+            //   用户问「限行吗」，听到的是一个标题，等于没答。
+            //   多跑一个百度（摘要来自 c-abstract）能让回答有内容；
+            //   云端那边也不吃亏：有摘要模型才不用再花一次 web_extract。
+            //
+            // ★ 2026-11-09 二次调整：**拿到权威源就立刻收工**，没有才继续问下一家。
+            //   实测「兰州限行」：搜狗给的是本地宝/头条（对题），必应给的是
+            //   「兰州旅游十大景点」（完全跑题）—— 以前谁先够数用谁，
+            //   等于让相关性最差的引擎决定答案。
+            val trustedCount = collected.values.count { trustRank(it.url) >= TRUST_OFFICIAL }
+            if (trustedCount >= minOf(2, limit)) break
+            val hasSnippet = collected.values.any { it.snippet.isNotBlank() }
+            if (collected.size >= minOf(3, limit) && hasSnippet) break
         }
-        return null
+        if (collected.isEmpty()) return null
+        // 权威源排前面，其余保持引擎返回顺序（引擎自己已经按相关度排过）
+        val ordered = collected.values.sortedByDescending { trustRank(it.url) }.take(limit)
+        return Result(selectedEngine, ordered)
+    }
+
+    private const val TRUST_OFFICIAL = 2
+    private const val TRUST_LOCAL = 1
+
+    /**
+     * 来源可信度：2=官方/权威媒体，1=本地信息站，0=普通网页。
+     *
+     * ★ 为什么必须排序：本地政策类问题（限行、社保、落户）搜索结果里
+     *   混着大量内容农场 —— 它们给每个城市套一份「XX年限行规定」模板，
+     *   内容还互相抄。端侧是「直出」模式，排第一的就会被原样念出来。
+     *   实测张掖根本没有限行规定，搜出来的却是「张掖限行时间规定2026」。
+     */
+    private fun trustRank(url: String): Int {
+        if (url.isBlank()) return 0
+        val host = runCatching { java.net.URL(url).host.lowercase().removePrefix("www.") }.getOrNull()
+            ?: return 0
+        return when {
+            OFFICIAL_HOSTS.any { host == it || host.endsWith(".$it") } -> TRUST_OFFICIAL
+            LOCAL_INFO_HOSTS.any { host == it || host.endsWith(".$it") } -> TRUST_LOCAL
+            else -> 0
+        }
+    }
+
+    /** 政府站 + 央媒。`gov.cn` 覆盖全部地方政府站 */
+    private val OFFICIAL_HOSTS = listOf(
+        "gov.cn", "people.com.cn", "news.cn", "xinhuanet.com",
+        "cctv.com", "chinanews.com.cn", "gmw.cn", "ce.cn", "china.com.cn",
+        "thepaper.cn", "chinadaily.com.cn"
+    )
+
+    /** 本地生活信息站：非官方，但限行/办事这类本地信息通常比农场页准且每天更新 */
+    private val LOCAL_INFO_HOSTS = listOf("bendibao.com", "jiuwu.com", "dianhua.cn")
+
+    /** 去掉新闻/时间等泛词后，要求标题或摘要至少命中一个查询关键词。 */
+    private fun queryKeywords(query: String): List<String> {
+        val normalized = query.lowercase().replace(Regex("\\s+"), "")
+        val core = normalized.replace(
+            Regex("今天|今日|现在|目前|最新|最近|新闻|要闻|消息|查一下|查下|查询|搜索|搜一下|搜下|帮我|网上|关于|有关|价格|多少|呢|的"),
+            ""
+        )
+        val source = core.ifBlank { normalized }
+        return if (source.any { it.code in 0x4E00..0x9FFF }) {
+            if (source.length < 2) listOf(source) else source.windowed(2).distinct()
+        } else {
+            Regex("[a-z0-9]{3,}").findAll(source).map { it.value }.toList()
+        }
+    }
+
+    private fun isUseful(item: Item, keywords: List<String>): Boolean {
+        val title = item.title.trim()
+        if (title.length < 5 || title.matches(GENERIC_RESULT_TITLE)) return false
+        if (title.contains(Regex("重磅.{0,8}(消息|宣布)|身份已变|舆论迅速轰动|全网炸锅|惊呆了|不看后悔|惊天大反转|紧急释放.{0,8}消息"))) return false
+        if (title.contains(Regex("大家还在搜|相关搜索|搜索结果|网页导航|频道首页|栏目首页|新闻滚动新闻|滚动新闻首页|网站第一品牌|新闻网站|新闻门户|门户首页|新闻首页|频道主页|公共数据开放平台|数据开放平台|数据平台首页"))) return false
+        if (title.contains(Regex("的意思|是什么意思|的解释|怎么造句|造句|词语释义"))) return false
+        if (title.contains(Regex("简介.{0,8}联系方式|联系方式.{0,8}最新分享|个人主页|个人资料"))) return false
+        if (title.contains(Regex("百度百科|维基百科|百科词条|百科全书"))) return false
+        val text = (title + " " + item.snippet).lowercase().replace(Regex("\\s+"), "")
+        // 短查询只会产生一个关键词；较长查询至少命中两个相邻字片段，
+        // 避免「阿里巴巴」仅因“关于”之类的泛词命中百科或栏目页。
+        val requiredHits = minOf(2, keywords.size)
+        val hits = keywords.count { it.length >= 2 && it in text }
+        return requiredHits > 0 && hits >= requiredHits
     }
 
     // ------------------------------------------------------------------ 引擎
@@ -202,6 +290,9 @@ object FallbackWebSearch {
      * DuckDuckGo 不在列：设备上 DNS 被污染，实测不可用。
      */
     private val ENGINES = listOf(Sogou, Baidu, Bing)
+    private val GENERIC_RESULT_TITLE = Regex(
+        "^(国际新闻|国内新闻|新闻|要闻|国际|国内|财经|新闻频道|国际频道|国内频道)(\\s*(?:[-|｜].*|的意思.*|是什么意思.*|的解释.*|造句.*))?$"
+    )
 
     // ------------------------------------------------------------------ HTTP
 
@@ -267,20 +358,31 @@ object FallbackWebSearch {
      */
     fun render(result: Result, query: String): String {
         if (result.items.isEmpty()) return ""
+        // ★ 2026-11-09：政策类问题如果一条权威源都没有，在**第一条正文里**加一句限定。
+        //   放在这里而不是标题行的原因：端侧是直出模式，标题行不会被念，
+        //   只有 `- ` 行和它下面缩进的那行会被念出来。
+        //   实测张掖本地没有限行规定，搜到的却是满屏「XX年限行时间规定」的农场页。
+        val weakSource = POLICY_LIKE.containsMatchIn(query) &&
+            trustRank(result.items.first().url) == 0
         return buildString {
             append("备用搜索结果（来源：").append(result.engine).append("）\n")
             append("以下是「").append(query).append("」的备用搜索结果。")
             append("这些结果没有精确的发布时间，只有网页标题和摘要：\n")
-            result.items.forEach {
-                append("- ").append(it.title)
-                if (it.url.isNotBlank()) append("（").append(it.url.take(120)).append("）")
+            result.items.forEachIndexed { index, item ->
+                append("- ").append(item.title)
+                if (item.url.isNotBlank()) append("（").append(item.url.take(120)).append("）")
                 append("\n")
-                if (it.snippet.isNotBlank()) {
-                    append("  ").append(it.snippet.take(300)).append("\n")
+                val body = buildString {
+                    if (weakSource && index == 0) append("网上非官方说法，仅供参考：")
+                    if (item.snippet.isNotBlank()) append(item.snippet.take(300))
                 }
+                if (body.isNotBlank()) append("  ").append(body).append("\n")
             }
-            append("\n注意：这是备用搜索的结果，可能不够权威也可能不够新。")
-            append("请如实说明信息来源有限，不要把它当成已核实的实时信息。")
+            // 备用来源的可信度和时效性要求属于 system prompt；不要把指令附在
+            // 搜索正文后面，否则小模型可能把它当成新闻内容复述给用户。
         }.trim()
     }
+
+    /** 这类问题一旦引用错源，用户会按错误规则行动，必须加限定 */
+    private val POLICY_LIKE = Regex("限行|政策|规定|社保|公积金|补贴|摇号|落户|年检|驾照|违章|收费|标准")
 }

@@ -172,7 +172,8 @@ class NavApp : Application() {
         )
         navigationTool = navTool
 
-        // 工具清单只建一次：云端全用，本地只用 web_search（见 MnnLlm.activeTools）
+        // 工具清单只建一次：云端全用；本地只按名字取 web_search / web_extract，
+        // 不把工具协议交给模型（见 MnnLlm.planSearch）
         // 天气工具留一个引用：本地档没有工具层，规则命中时直接调它
         val weather = WeatherTool { nav?.currentCity }
         weatherTool = weather
@@ -184,8 +185,14 @@ class NavApp : Application() {
             radius = { Prefs.nearbyRadius },
             onResult = {
                 // 模型搜完之后用户只说「去这家」，navigate 工具能拿它兜底
-                lastNearby = it
+                lastNearby = it.firstOrNull()
                 lastNearbyAt = System.currentTimeMillis()
+                nearbyChoicePois = it.take(3)
+                nearbyChoiceAt = lastNearbyAt
+                // 新的周边结果开启新选择上下文，不能沿用旧的导航候选。
+                clearPendingPois()
+                markChoiceList(nearbyChoicePois.size)
+                Dbg.log("周边选择列表更新 items=${nearbyChoicePois.size}")
             }
         )
         nearbyToolRef = nearby
@@ -203,11 +210,12 @@ class NavApp : Application() {
             // 模型原生 Function Calling 优先；明确的出发指令另有本地兜底，
             // 避免不支持工具调用的本地模型只说「好的」却不执行。
             // ★ 2026-11-08：两档路由。cloud = MiniMax（工具全可用，默认）；
-            //   local = 进程内 MNN（Qwen3 支持 <tool_call>，0.3B 不支持会自动跳过）。
+            //   local = 进程内 MNN。★ 2026-11-09：端侧不再走 <tool_call>，
+            //   搜索由 MnnLlm 的规则层直接执行（0.6B 实测一次都没按协议调过）。
             llm = LlmRouter(
                 context = this,
                 cloud = OpenAiLlm(tools = toolList),
-                // 本地也把工具传进去：Qwen3 模板支持 <tool_call>，0.3B 不支持会自动跳过
+                // 工具只用来按名字取 web_search / web_extract，不出现在 prompt 里
                 local = MnnLlm(MnnLocalLlm.get(this), toolList),
                 // 自动档换后端必须让用户知道，不能静默降级
                 onModeChanged = { cloudMode ->
@@ -247,6 +255,39 @@ class NavApp : Application() {
 
         prewarm()
         initVoiceprint()
+        runLocalProbe()
+    }
+
+    /**
+     * 端侧对话批量探针（local_probe 打开时启动一次）。
+     *
+     * 直接喂文本给 [chat]，跳过 ASR —— 测的是「规则 + 搜索 + 模型 + 播报」这一段。
+     * 每题之间隔 7 秒：搜索最坏 12 秒，等短了会串轮次。
+     */
+    private fun runLocalProbe() {
+        if (!Prefs.localProbe) return
+        Thread {
+            Thread.sleep(12_000)   // 等本地模型加载 + 语音服务起
+            val questions = listOf(
+                "搜一下今天的新闻",
+                "张掖最近有什么新鲜事",
+                "今天的油价多少",
+                "今天张掖的天气",
+                "附近有加油站吗",
+                "导航去张掖西站",
+                "你叫什么名字",
+                "我今天有点累",
+                "张掖在哪里",
+                "张掖最近发生什么了",
+                "92号汽油多少钱"
+            )
+            questions.forEachIndexed { i, q ->
+                Dbg.log("PROBE ${i + 1}/${questions.size} 提问：$q")
+                runCatching { chat.send(q) }
+                Thread.sleep(7_000)
+            }
+            Dbg.log("PROBE 全部结束")
+        }.apply { isDaemon = true; name = "local-probe" }.start()
     }
 
     /**
@@ -563,6 +604,7 @@ class NavApp : Application() {
         lastSubmitAtMs = now
         Dbg.log("submit chars=${t.length}")
         // 用户开口了，上一轮的「选择列表」到此结束
+        choiceTurnArmed = choiceModeActive()
         clearChoiceMode()
         // 先让界面把"用户说了什么"显示出来，再进大脑
         chatObservers.forEach { it.onUser(t) }
@@ -573,6 +615,9 @@ class NavApp : Application() {
 
     private var lastSubmitText = ""
     private var lastSubmitAtMs = 0L
+    /** 本轮输入是否紧跟在一个仍有效的编号列表之后；只消费一次。 */
+    @Volatile
+    private var choiceTurnArmed = false
 
     // ------------------------------------------------------------ 导航工具
 
@@ -601,8 +646,28 @@ class NavApp : Application() {
     /** 周边查询工具（高德 POI）：本地档没有工具层，规则命中时直接调 */
     private var nearbyToolRef: NearbyTool? = null
 
+    /** 把口语说法和 ASR 常见残词归一到高德能理解的 POI 关键词。 */
+    private fun nearbyPoiKeyword(text: String): String? {
+        val t = text.lowercase()
+        return when {
+            Regex("停车场|停车位|停车").containsMatchIn(t) -> "停车场"
+            Regex("加油站|加油").containsMatchIn(t) -> "加油站"
+            Regex("充电桩|充电站|充电").containsMatchIn(t) -> "充电站"
+            Regex("奶茶店|奶茶").containsMatchIn(t) -> "奶茶店"
+            Regex("小吃店|小吃").containsMatchIn(t) -> "小吃店"
+            Regex("咖啡厅|咖啡馆|咖啡").containsMatchIn(t) -> "咖啡厅"
+            Regex("药店|药房").containsMatchIn(t) -> "药店"
+            Regex("银行|取款机|atm").containsMatchIn(t) -> "银行"
+            Regex("超市|便利店").containsMatchIn(t) -> if (t.contains("便利店")) "便利店" else "超市"
+            Regex("餐馆|餐厅|饭店|吃饭的地方|吃饭|美食").containsMatchIn(t) -> "餐馆"
+            else -> null
+        }
+    }
+
     private fun interceptNavigation(text: String, history: List<com.navagent.core.ChatMessage>): String? {
         val normalized = text.trim().lowercase()
+        val canChooseFromPreviousList = choiceTurnArmed
+        choiceTurnArmed = false
 
         // ★ 2026-11-09：休眠/别打扰也走规则。
         //   本地档没有工具能力，说「你休息吧」只会得到一句聊天话术，人还在听。
@@ -617,18 +682,45 @@ class NavApp : Application() {
             return "好，我先休息。要找我喊「${Prefs.aiName}」。"
         }
 
+        // ★ 2026-11-09：日期 / 星期 / 几点也走规则。
+        //   端侧模型不知道自己训练到哪天 —— 实测问「今天是几号」答「2024年11月3日」，
+        //   而且思考模式要等 14 秒。这种问题本来就有确定答案，不该交给模型去猜。
+        //   只在短句上生效，避免「新闻联播几点开始」这种被抢走。
+        if (normalized.length <= 14 &&
+            Regex("几号|几月几号|星期几|周几|礼拜几|几点|日期|什么日子").containsMatchIn(normalized) &&
+            !Regex("新闻|天气|导航|油价|限行|门票|开门|关门").containsMatchIn(normalized)
+        ) {
+            val now = java.time.LocalDateTime.now()
+            val week = now.format(
+                java.time.format.DateTimeFormatter.ofPattern("EEEE", java.util.Locale.CHINA)
+            )
+            val asksClock = Regex("几点|时间").containsMatchIn(normalized) &&
+                !Regex("几号|日期|星期|周几|礼拜").containsMatchIn(normalized)
+            Dbg.log("日期/时间（规则命中）raw=${text.take(20)}")
+            return if (asksClock) {
+                "现在是 ${now.hour}点${now.minute}分。"
+            } else {
+                "今天是${now.monthValue}月${now.dayOfMonth}日，$week。"
+            }
+        }
+
         // ★ 2026-11-09：周边查询也走规则（高德 POI）。
         //   本地模型调不了 search_nearby，问「附近有加油站吗」只会瞎答。
         //   带「导航/去/到/带我」的是导航意图，交给后面的导航规则，别抢。
+        val poiKeyword = nearbyPoiKeyword(normalized)
+        val searchAction = Regex("搜索|查询|查找|搜一下|搜搜|搜|查一下|查查|找一下|找").containsMatchIn(normalized)
         val nearbyHit = Regex("附近|周边|周围|旁边|跟前|最近的|哪有").containsMatchIn(normalized) ||
-            Regex("沿途|顺路|路上").containsMatchIn(normalized)
+            Regex("沿途|顺路|路上").containsMatchIn(normalized) ||
+            (poiKeyword != null && searchAction)
         if (nearbyHit && !Regex("(导航|带我|前往|开到)|^(去|到|回)").containsMatchIn(normalized)) {
             val scope = if (Regex("沿途|顺路|路上").containsMatchIn(normalized)) "route" else "current"
-            val keyword = text
-                .replace(Regex("(附近|周边|周围|旁边|跟前|最近的|哪有|沿途|顺路|路上)"), "")
-                .replace(Regex("(有没有|有|帮我|找|搜|查|看看|一下|的|吗|呢|啊|呀)"), "")
+            val keyword = poiKeyword ?: text
+                .replace(Regex("(当前位置|当前|目的地|附近|周边|周围|旁边|跟前|最近的|哪有|沿途|顺路|路上)"), "")
+                .replace(Regex("(搜索一下|查询一下|查找一下|搜一下|搜搜|查一下|查查|找一下|查询|搜索|帮我|给我|请问|有没有|有|找|搜|查|看看|一下|在|的|吗|呢|啊|呀|吧|你)"), "")
                 .trim(' ', '，', '。', '？', '！', ',', '?', '!')
             if (keyword.isNotBlank()) {
+                // 进入新的周边搜索时，旧的导航候选不再代表用户眼前听到的列表。
+                if (pendingPois.isNotEmpty()) clearPendingPois()
                 val out = runCatching {
                     nearbyToolRef?.execute(
                         org.json.JSONObject().put("keyword", keyword).put("scope", scope).toString()
@@ -648,12 +740,15 @@ class NavApp : Application() {
         if (!Regex("^(去|到|回)|(导航|带我|前往|开到)").containsMatchIn(normalized) &&
             Regex("天气|气温|多少度|下雨|有雨|雨吗|下雪|带伞|冷不冷|热不热|穿什么").containsMatchIn(normalized)
         ) {
-            val city = Regex("([\\u4e00-\\u9fa5]{2,8}?)的?天气").findAll(text)
-                .map { it.groupValues[1] }
-                .lastOrNull()
-                ?.replace(Regex("^(今天|明天|后天|现在|那|请问|查一下|查查|看看|帮我)+"), "")
-                ?.replace(Regex("(今天|明天|后天|现在)$"), "")
-                ?.trim()
+            val city = text.substringBefore("天气")
+                .replace(Regex("我想了解|我想知道|帮我查询|帮我|请问|告诉我|查一下|查查|查询一下|查询|看看|今天|今日|明天|后天|现在|当前|本地|当地|的"), "")
+                .trim(' ', '，', ',', '。', '？', '?', '！', '!')
+                .takeIf { candidate ->
+                    candidate.length in 2..8 &&
+                        candidate.all { it in '\u4e00'..'\u9fa5' } &&
+                        !Regex("查询|天气|气温|下雨|有雨|下雪").containsMatchIn(candidate)
+                }
+            Dbg.log("天气请求城市解析 explicit=${city ?: "<local>"} raw=${text.take(24)}")
             fun query(c: String?): String? {
                 val args = if (c.isNullOrBlank()) "{}" else org.json.JSONObject().put("city", c).toString()
                 return runCatching { weatherTool?.execute(args) }.getOrNull()
@@ -719,6 +814,22 @@ class NavApp : Application() {
         //   本地 0.3B 不会做这两件事，所以这里自己解析「第2个 / 最后一个」并直接导航。
         //   只在 chat_engine=local 时启用，云端仍走模型，避免两套逻辑打架。
         if (Prefs.chatEngine == "local") {
+            // 序号必须属于紧邻上一轮、实际播报过的列表。优先用最近周边搜索
+            // （紧凑播报只念前三项），否则才用导航候选列表。
+            if (canChooseFromPreviousList) {
+                val nearbyChoices = freshNearbyChoices()
+                val choices = nearbyChoices.ifEmpty { pendingPois }
+                val idx = pickCandidateIndex(normalized, choices.size)
+                val poi = choices.getOrNull(idx ?: -1)
+                if (poi != null) {
+                    if (nearbyChoices.isNotEmpty()) {
+                        nearbyChoicePois = emptyList()
+                        Dbg.log("离线周边候选选择 #${(idx ?: 0) + 1} → ${poi.name}")
+                    }
+                    val r = navigationTool?.navigateSelectedPoi(poi)
+                    if (r != null) return r.userText ?: r.text
+                }
+            }
             // ① 候选续选：用户把地名又说了一遍（「去张掖西站」）也当成确认。
             //    ★ 2026-11-08 实测踩到：上一步列了 5 个候选，用户重复说了一遍地名，
             //      但这里只认「第2个」和数字，认不出地名 → 交给 0.3B → 它把地名复读一遍，
@@ -740,7 +851,7 @@ class NavApp : Application() {
                 }
             }
             // ② 序号选择
-            val idx = pickCandidateIndex(normalized)
+            val idx = if (canChooseFromPreviousList) pickCandidateIndex(normalized, pendingPois.size) else null
             if (idx != null) {
                 val poi = pendingPois.getOrNull(idx)
                 if (poi != null) {
@@ -874,12 +985,12 @@ class NavApp : Application() {
      * 本地模型连候选列表都看不懂，必须靠这个把序号翻译成下标。
      * 返回 null 表示这句话不是在选候选。
      */
-    private fun pickCandidateIndex(text: String): Int? {
-        if (pendingPois.isEmpty()) return null
+    private fun pickCandidateIndex(text: String, candidateCount: Int): Int? {
+        if (candidateCount <= 0) return null
         val t = text.trim()
         if (t.isEmpty()) return null
         // 「最后一个」「最后那个」
-        if (Regex("^(就)?(最后|末尾|后面那个)").containsMatchIn(t)) return pendingPois.size - 1
+        if (Regex("^(就)?(最后|末尾|后面那个)").containsMatchIn(t)) return candidateCount - 1
         // 「第2个」「第二个」「第 3 个」
         Regex("第\\s*([0-9一二三四五六七八九十]+)\\s*个?").find(t)?.let { m ->
             chineseNumber(m.groupValues[1])?.let { return it - 1 }
@@ -1261,6 +1372,24 @@ class NavApp : Application() {
     /** 最近一次周边搜索结果，用户说「去」时导航到它 */
     @Volatile
     private var lastNearby: AmapSdkGeocoder.Poi? = null
+
+    /** 最近一次周边查询中实际会被紧凑播报的前三项，供用户说序号时确认。 */
+    @Volatile
+    private var nearbyChoicePois: List<AmapSdkGeocoder.Poi> = emptyList()
+
+    @Volatile
+    private var nearbyChoiceAt = 0L
+
+    private fun freshNearbyChoices(): List<AmapSdkGeocoder.Poi> {
+        val choices = nearbyChoicePois
+        if (choices.isEmpty()) return emptyList()
+        if (System.currentTimeMillis() - nearbyChoiceAt > NEARBY_TTL_MS) {
+            nearbyChoicePois = emptyList()
+            Dbg.log("周边候选已过期，丢弃")
+            return emptyList()
+        }
+        return choices
+    }
 
     /** 上次周边搜索的时间。开车时几分钟就开出好几公里，旧结果不能再拿来导航 */
     @Volatile

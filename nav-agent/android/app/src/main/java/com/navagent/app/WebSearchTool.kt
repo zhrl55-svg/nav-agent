@@ -44,8 +44,11 @@ class WebSearchTool(private val apiKey: () -> String) : LlmTool {
             "**问新闻、最近发生的事，topic 必须传 news**；查资料、规定、营业时间这类用 general。" +
             "新闻按时间范围传 time_range：今天或最近两三天用 day，这周用 week，这个月用 month，" +
             "说不清就不传（默认一周内）。只传 general 会搜到旧文章。\n" +
-            "搜索词要具体，写「地名 + 主题」（如「张掖 供暖」「兰州 牛肉面 营业时间」），" +
-            "别用「近期事件」这种泛词。\n" +
+        "新闻搜索词要保留用户说的地区、人物或事件，并包含新闻主题；" +
+        "例如「国内新闻」传「国内 新闻」，「今天国际新闻」传「国际 新闻」，" +
+        "不能把查询缩成单个「国内」「国际」或「新闻」；不要把搜索栏目页当成具体报道。" +
+        "通用搜索写「地名 + 主题」（如「张掖 供暖」「兰州 牛肉面 营业时间」），" +
+        "别用「近期事件」这种泛词。\n" +
             "**一次搜索结果不够时可以再搜一次**（换关键词或放宽时间范围），最多搜两次；" +
             "也可以同时发两个不同关键词的搜索，比一轮一个更快。\n" +
             "不要用它查本地店铺（加油站/餐厅/停车场用 search_nearby），也不要查天气（用 get_weather）。"
@@ -240,9 +243,14 @@ class WebSearchTool(private val apiKey: () -> String) : LlmTool {
             val title = if (rawTitle.contains('\uFFFD') || rawTitle.count { it.code in 0xE000..0xF8FF } > 2) {
                 hostOf(r.optString("url"))
             } else rawTitle
+            val url = r.optString("url")
+            if (isHomepageResult(title, url, content)) {
+                Dbg.log("新闻搜索过滤入口页 title=${title.take(30)}")
+                return@mapNotNull null
+            }
             Item(
                 title = title.take(90),
-                url = r.optString("url"),
+                url = url,
                 published = parseDate(r.optString("published_date")),
                 dateText = r.optString("published_date"),
                 content = content
@@ -400,6 +408,7 @@ class WebSearchTool(private val apiKey: () -> String) : LlmTool {
      */
     private fun isNavNoise(content: String): Boolean {
         if (content.length < MIN_NEWS_CONTENT) return false
+        if (content.contains(Regex("跳转到主要内容|Skip to main content|网站首页|频道首页|新闻门户"))) return true
         val nonEmpty = content.lines().filter { it.isNotBlank() }
         if (nonEmpty.isEmpty()) return true
         val hits = NAV_MARKERS.count { content.contains(it) }
@@ -410,6 +419,17 @@ class WebSearchTool(private val apiKey: () -> String) : LlmTool {
         if (hits > 0 && shortRatio) return true
         // 一行长句都没有 → 纯菜单
         return nonEmpty.none { it.length >= LONG_LINE_CHARS }
+    }
+
+    /** 排除搜索引擎把站点首页/数据平台当成一篇新闻的情况。 */
+    private fun isHomepageResult(title: String, url: String, content: String): Boolean {
+        if (title.contains(Regex("公共数据开放平台|数据开放平台|新闻门户首页|新闻频道首页|新闻网站首页|网站首页|频道首页|栏目首页|新闻中心首页"))) {
+            return true
+        }
+        val path = runCatching { URL(url).path.trim('/') }.getOrDefault("")
+        val rootPage = path.isBlank() || path.matches(Regex("(?i)(index|default)(\\.(html?|shtml|php))?"))
+        return (rootPage && title.contains(Regex("首页|门户|开放平台|数据平台|新闻中心"))) ||
+            Regex("^(?:跳转到主要内容|Skip to main content)").containsMatchIn(content)
     }
     /**
      * 清洗正文。

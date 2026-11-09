@@ -180,6 +180,9 @@ class NavigationTool(
 
     override fun execute(argumentsJson: String): String = executeDetailed(argumentsJson).text
 
+    /** 用户明确从刚播报的周边结果里选中 POI 时，直接使用该项的坐标导航。 */
+    fun navigateSelectedPoi(poi: AmapSdkGeocoder.Poi): NavigationToolResult = navigateToPoi(poi)
+
     /**
      * 结构化执行入口。本地确定性兜底靠 status 判断是否真的开始导航，
      * 不再从中文结果里猜「已开始 / 搜到候选 / 失败」。

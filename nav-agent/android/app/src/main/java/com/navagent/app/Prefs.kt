@@ -35,14 +35,21 @@ object Prefs {
     private const val K_WAKE_ACK = "wake_ack_voice"
 
     /**
-     * 本地模型是否启用工具调用（当前只接 web_search）。
+     * ★ 2026-11-09 删掉 `local_tools_enabled`。
      *
-     * ★ 默认关。实测 Qwen3-0.6B 在 P40 上：带工具后 prompt 从 258 → 725 token，
-     *   首字从 0.2s 涨到 7–18s，而模型仍然不按协议输出 JSON，一次都没调成。
-     *   接线是通的（工具块、解析、执行都验证过），是模型能力和成本不划算。
-     *   留着这个开关，换更强的本地模型时可以再试。
+     * 它只有定义和 setter，全工程没有一处读；同时 [toolsEnabled] 又串着端侧搜索，
+     * 用户按「本地模型不会工具调用」的提示关掉工具开关，搜索会跟着一起死。
+     * 现在搜索只认 [webSearchEnabled]，工具开关只影响云端 Function Calling。
      */
-    private const val K_LOCAL_TOOLS = "local_tools_enabled"
+    private const val K_LOCAL_THINKING = "local_thinking_enabled"
+
+    /**
+     * 端侧对话批量探针（调试用）。
+     *
+     * 打开后启动时自动按顺序问一组问题，答案和耗时写进 nav.log。
+     * adb 没法给输入框打中文，这是唯一能系统性测端侧链路（规则 + 搜索 + 模型）的办法。
+     */
+    private const val K_LOCAL_PROBE = "local_probe"
 
     /** 对话后端：auto / cloud / local，见 [LlmRouter] */
     private const val K_CHAT_ENGINE = "chat_engine"
@@ -235,10 +242,18 @@ object Prefs {
      *   不再等于「导航不好使」，自动切换的代价小到可以接受。
      *   想要固定行为就在设置里锁 cloud 或 local。
      */
-    /** 本地工具调用：默认关，见 [K_LOCAL_TOOLS] 的说明 */
-    var localToolsEnabled: Boolean
-        get() = sp.getBoolean(K_LOCAL_TOOLS, false)
-        set(v) = sp.edit().putBoolean(K_LOCAL_TOOLS, v).apply()
+    /** Qwen3 端侧思考模式。默认开启用于当前实测，可在设置中关闭以降低延迟。 */
+    var localThinkingEnabled: Boolean
+        // ★ 2026-11-09 实测：开着思考时一句「你叫什么名字」要 9 秒，
+        //   而且思考内容会被 looksLikeInternalReasoning 判为内部推理丢掉，
+        //   用户听到的是「我还没整理好答案，换个问法试试」。默认关。
+        get() = sp.getBoolean(K_LOCAL_THINKING, false)
+        set(v) = sp.edit().putBoolean(K_LOCAL_THINKING, v).apply()
+
+    /** 批量探针开关，见 [K_LOCAL_PROBE] */
+    var localProbe: Boolean
+        get() = sp.getBoolean(K_LOCAL_PROBE, false)
+        set(v) = sp.edit().putBoolean(K_LOCAL_PROBE, v).apply()
 
     var chatEngine: String
         get() = sp.getString(K_CHAT_ENGINE, "auto").orEmpty().ifBlank { "auto" }

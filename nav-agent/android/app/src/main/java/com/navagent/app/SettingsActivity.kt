@@ -595,22 +595,22 @@ class SettingsActivity : AppCompatActivity() {
 
             rowSwitch(
                 "工具调用", Prefs.toolsEnabled,
-                "导航、搜索、天气都靠它。关掉会退化成纯聊天"
+                "云端模型靠它调用导航 / 搜索 / 天气。端侧由规则执行，关掉不影响端侧"
             ) {
                 Prefs.toolsEnabled = it
                 applied()
-                if (!it) toast("已关闭：只能聊天，导航和搜索都用不了")
+                if (!it) toast("已关闭：云端模型不再调用工具")
             }
         }
 
-        // 本地模型的工具调用：默认关。实测 Qwen3-0.6B 在 P40 上不按协议输出，
-        // 而且带工具后 prompt 从 258 → 725 token，首字 0.2s → 7~18s。
+        // 端侧搜索不经过模型生成工具调用；模型工具 JSON 会在流式过程中被 TTS 念出来。
         if (Prefs.chatEngine == "local") {
+            row("端侧搜索", "搜索结果直出", "搜索由规则触发并直接播报来源信息，避免小模型改写或念出工具协议", chevron = false) {}
             rowSwitch(
-                "本地工具调用", Prefs.localToolsEnabled,
-                "只有支持工具协议的本地模型（Qwen3 系）才生效；实测 0.6B 调不动且首字涨到 7s+，默认关"
+                "端侧思考模式", Prefs.localThinkingEnabled,
+                "开启 Qwen3 思考模式；回复会更慢，测试后可在这里关闭"
             ) {
-                Prefs.localToolsEnabled = it
+                Prefs.localThinkingEnabled = it
                 applied()
             }
         }

@@ -91,6 +91,20 @@ class ChatEngine(
         Thread(r, "chat-engine").apply { isDaemon = true }
     }
 
+    /**
+     * 确定性动作（导航 / 天气 / 周边 / 休眠）专用线程。
+     *
+     * ★ 2026-11-09 加。原来拦截和对话共用 [worker]，而 [worker] 是单线程：
+     *   端侧一轮联网搜索要 8~20 秒，这段时间里用户喊「导航去张掖西站」只能排在
+     *   搜索后面 —— 车都到路口了路线还没算。动作层必须能抢占对话。
+     *
+     *   动作用独立**单**线程：动作之间仍按顺序执行（「导航去 A」→「停止导航」
+     *   不能颠倒），只是不再等对话。
+     */
+    private val actionWorker = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "chat-action").apply { isDaemon = true }
+    }
+
     /** reset() 时递增；旧请求晚到的结果不能写回新一轮对话。 */
     private var generation = 0L
 
@@ -122,15 +136,42 @@ class ChatEngine(
     fun send(text: String): Boolean {
         val utterance = text.trim()
         if (utterance.isEmpty()) return false
+        // ★ 先进动作线程判断：命中了就直接执行，不排队等对话。
+        //   没命中才进对话队列 —— 顺序和以前一致，只是动作不再被长请求堵住。
+        actionWorker.execute { route(utterance) }
+        return true
+    }
+
+    /**
+     * 先试确定性动作，命中就执行并播报；没命中才交给模型。
+     *
+     * 动作回复都很短（「好，正在导航」），而且必须**立刻**出声，所以这里不等 TTS 队列、
+     * 也不看上一轮是否被打断（[muted] 只作用于被打断的那一轮对话）。
+     */
+    private fun route(utterance: String) {
+        val hit = runCatching { interceptAction(utterance, snapshot()) }.getOrNull()
+        if (!hit.isNullOrBlank()) {
+            val runGeneration = synchronized(lock) {
+                val message = ChatMessage(ChatMessage.Role.USER, utterance)
+                history += message
+                runCatching { memory.append(message) }
+                generation
+            }
+            if (!isCurrent(runGeneration)) return
+            appendAssistant(runGeneration, hit)
+            onDelta(hit)
+            onReply(hit)
+            runCatching { speak(hit) }
+            return
+        }
         synchronized(lock) {
             if (busy) {
                 if (pending.size >= MAX_PENDING) pending.removeFirst()
                 pending.addLast(utterance)
-                return true
+                return
             }
             busy = true
             worker.execute { process(utterance) }
-            return true
         }
     }
 
@@ -145,20 +186,6 @@ class ChatEngine(
             generation
         }
         try {
-            val intercepted = runCatching {
-                interceptAction(utterance, snapshot())
-            }.getOrNull()
-            if (!intercepted.isNullOrBlank()) {
-                if (isCurrent(runGeneration)) {
-                    appendAssistant(runGeneration, intercepted)
-                    onDelta(intercepted)
-                    onReply(intercepted)
-                    // 本地拦截的回复都很短（「好，正在导航」），不会是列表
-                    if (!muted) runCatching { speak(intercepted) }
-                }
-                return
-            }
-
             val sb = StringBuilder()
             // 边流边念：攒到一句话就立刻交给 TTS，别等整段生成完。
             // 实测模型出首字 1~3s、整段 3~5s，逐句播报能把"听到第一声"提前 2 秒。

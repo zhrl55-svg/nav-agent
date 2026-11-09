@@ -200,8 +200,8 @@ class MnnLocalLlm(private val context: Context) {
             // 自检时显式套上 Qwen 的 chat 模板。
             // 如果 native 自己不套模板，裸 prompt 会在第一个 token 后立刻遇到
             // 停止条件（实测输出只有「我」一个字）。
-            // 带思考模式的模型（Qwen3）加 /no_think，否则一句自我介绍要 23 秒
-            val noThink = if (wantsNoThink) "/no_think" else ""
+            // Qwen3 按设置决定是否抑制思考；自检输出不流式播报。
+            val noThink = if (wantsNoThink && !Prefs.localThinkingEnabled) "/no_think" else ""
             val templated = "<|im_start|>user\n用一句中文介绍你自己。$noThink<|im_end|>\n" +
                 "<|im_start|>assistant\n"
             val out = generate(templated)

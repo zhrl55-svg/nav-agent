@@ -37,7 +37,7 @@ class NearbyTool(
     private val route: () -> List<AmapSdkGeocoder.RoutePoint>? = { null },
     private val radius: () -> Int,
     /** 记住最近一次结果，用户接着说「去」时能直接导航过去 */
-    private val onResult: (AmapSdkGeocoder.Poi) -> Unit = {}
+    private val onResult: (List<AmapSdkGeocoder.Poi>) -> Unit = {}
 ) : LlmTool {
 
     override val name = "search_nearby"
@@ -85,7 +85,7 @@ class NearbyTool(
         }
 
         // 记下来，用户接着只说「去」也能走
-        onResult(list.first())
+        onResult(list)
 
         return buildString {
             append("附近的").append(keyword).append("：\n")
@@ -114,7 +114,7 @@ class NearbyTool(
             return "导航路线沿途${formatDistance(r)}内没找到${keyword}"
         }
 
-        onResult(list.first())
+        onResult(list)
         return buildString {
             append("导航路线沿途的").append(keyword)
                 .append("（路线两侧").append(formatDistance(r)).append("内）：\n")
